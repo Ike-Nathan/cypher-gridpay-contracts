@@ -13,6 +13,7 @@ use soroban_sdk::{
 pub mod storage;
 mod finality;
 mod archival;
+mod reconciliation;
 pub use archival::{ArchivalConfig, CompactArchivedPayment};
 pub use finality::{FinalityFlag, FinalityRiskConfig};
 
@@ -3851,6 +3852,19 @@ impl PaymentContract {
         })
         .publish(&env);
         Ok(())
+    }
+
+    /// Permissionless: reconciles a payment with its escrow's terminal state (#198).
+    /// Applies `Released -> Completed`, `ExpiredRefunded -> Refunded`,
+    /// `Cancelled -> Cancelled` once; `Disputed` mirrors an unresolved dispute.
+    /// Returns the payment's status after reconciliation.
+    pub fn sync_escrowed_payment_state(env: Env, payment_id: u64) -> Result<PaymentStatus, Error> {
+        reconciliation::sync_escrowed_payment_state(&env, payment_id)
+    }
+
+    /// Returns true once a payment's escrow outcome has been reconciled by sync (#198).
+    pub fn is_escrow_reconciled(env: Env, payment_id: u64) -> bool {
+        reconciliation::is_reconciled(&env, payment_id)
     }
 
     /// Retrieves the escrowed payment bridge record for a given payment.
