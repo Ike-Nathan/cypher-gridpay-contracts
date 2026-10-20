@@ -13544,6 +13544,9 @@ mod test_finality_delay;
 mod test_fixed_math_prop;
 
 #[cfg(test)]
+mod budget_bench;
+
+#[cfg(test)]
 mod test_fee_rebate;
 
 #[cfg(test)]

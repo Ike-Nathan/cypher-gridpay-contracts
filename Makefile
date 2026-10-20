@@ -4,6 +4,7 @@ all: test
 
 test: build
 	$(MAKE) -C core test
+	$(MAKE) -C core budget-bench
 	$(MAKE) -C orchestrator test
 
 # Refresh Soroban contract test snapshots after an SDK upgrade.
