@@ -45,6 +45,9 @@ pub enum ConfigKey {
     EvidenceDeadlineConfig,
     ThresholdVersion,
     ProposalApprovalVersion(String),
+    MinEscrowAmount,
+    KeeperBountyConfig,
+    DormantSettlement(u64),
 }
 
 #[derive(Clone)]
@@ -274,6 +277,12 @@ pub enum ActionError {
     /// Deposited collateral balance is insufficient for this operation. Resolution: fund additional collateral to escrow.
     InsufficientCollateral = 315,
     ArbitrationRequired = 316,
+    /// Keeper bounty feature is not enabled in the current stale threshold config. Resolution: enable keeper_bounty in StaleThresholdConfig.
+    KeeperBountyDisabled = 317,
+    /// Escrow is not in the DormantNoticePeriod state required for settlement. Resolution: call poke_stale_escrow first.
+    NotInDormantNoticePeriod = 318,
+    /// Dormant grace notice period has not yet elapsed. Resolution: wait for dormant_grace_notice_secs before settling.
+    DormantGraceNotElapsed = 319,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -320,7 +329,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            if code >= 300 && code <= 319 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
             if code >= 200 && code <= 230 {
@@ -362,6 +371,9 @@ pub enum EscrowStatus {
     Resolved,
     Cancelled,
     ExpiredRefunded,
+    /// Escrow has been flagged as stale by a keeper and is pending final dormant settlement.
+    /// During this grace window any buyer/seller action resets the escrow back to Locked.
+    DormantNoticePeriod,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -486,6 +498,17 @@ pub struct EscrowTemplate {
 pub struct StaleThresholdConfig {
     pub inactivity_seconds: u64,
     pub near_expiry_buffer_seconds: u64,
+    /// Keeper bounty expressed as basis points of the escrow amount (0-10000).
+    /// Set to 0 to disable keeper bounties entirely.
+    pub keeper_bounty_bps: u32,
+    /// Hard cap on the absolute keeper bounty in token base units.
+    /// The actual bounty is `min(amount * keeper_bounty_bps / 10000, max_keeper_bounty_cap)`.
+    /// Set to 0 to mean "no cap" (bounty is solely determined by keeper_bounty_bps).
+    pub max_keeper_bounty_cap: i128,
+    /// Seconds a keeper must wait after calling `poke_stale_escrow` before
+    /// `settle_dormant_escrow` is callable. During this window buyer/seller
+    /// activity resets the escrow back to Locked.
+    pub dormant_grace_notice_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -505,6 +528,36 @@ pub struct EscrowHealthReport {
     pub health: EscrowHealth,
     pub seconds_until_expiry: Option<i64>,
     pub last_activity: u64,
+}
+
+/// Emitted when a keeper flags a stale/expired escrow and starts the dormant notice window.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleEscrowFlagged {
+    pub escrow_id: u64,
+    pub keeper: Address,
+    pub dormant_deadline: u64,
+    pub flagged_at: u64,
+}
+
+/// Emitted when the dormant grace period elapses and a keeper settles the escrow.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DormantEscrowSettled {
+    pub escrow_id: u64,
+    pub keeper: Address,
+    pub keeper_bounty: i128,
+    pub settled_at: u64,
+    pub favor: AutoResolveFavor,
+}
+
+/// Per-escrow record of the dormant notice period: who poked it and when it becomes settleable.
+#[derive(Clone)]
+#[contracttype]
+pub struct DormantSettlementRecord {
+    pub keeper: Address,
+    pub dormant_deadline: u64,
+    pub flagged_at: u64,
 }
 
 #[derive(Clone)]
@@ -3942,6 +3995,8 @@ impl EscrowContract {
             EscrowStatus::Disputed => Err(Error::Escrow(EscrowError::InvalidStatus)),
             EscrowStatus::Resolved => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
             EscrowStatus::Cancelled => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::ExpiredRefunded => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::DormantNoticePeriod => Err(Error::Escrow(EscrowError::InvalidStatus)),
         }
     }
 
@@ -4122,10 +4177,22 @@ impl EscrowContract {
                 }
                 escrow.status = EscrowStatus::Resolved;
             }
+            EscrowStatus::DormantNoticePeriod => {
+                // Buyer/seller activity during dormant window cancels the keeper timer.
+                Self::cancel_dormant_notice(&env, escrow_id);
+                // Re-evaluate as if Locked (hold period check still applies).
+                let current_time = env.ledger().timestamp();
+                if current_time < escrow.hold_period_until {
+                    return Err(Error::Escrow(EscrowError::HoldPeriodActive));
+                }
+                // Reload after reset.
+                escrow = EscrowContract::get_escrow(&env, escrow_id);
+                escrow.status = EscrowStatus::Resolved;
+            }
             EscrowStatus::Disputed => {
                 return Err(Error::Escrow(EscrowError::InvalidStatus));
             }
-            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled | EscrowStatus::ExpiredRefunded => {
                 return Err(Error::Escrow(EscrowError::AlreadyProcessed))
             }
         }
@@ -4188,6 +4255,13 @@ impl EscrowContract {
         // and refunded (Resolved/Cancelled) escrows are terminal, and an
         // already-Disputed escrow cannot be re-opened. This check runs before
         // any collateral is pulled from the caller.
+        // A DormantNoticePeriod escrow is also disputeable; the act of disputing
+        // cancels the dormant timer and resets it to Locked first.
+        if escrow.status == EscrowStatus::DormantNoticePeriod {
+            Self::cancel_dormant_notice(&env, escrow_id);
+            // Reload escrow after cancellation (now Locked again).
+            escrow = EscrowContract::get_escrow(&env, escrow_id);
+        }
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
@@ -11345,6 +11419,288 @@ impl EscrowContract {
         {
             Some(config) => config,
             None => panic_with_error!(env, Error::Action(ActionError::StaleThresholdNotConfigured)),
+        }
+    }
+
+    /// Flags a stale or expired un-disputed escrow as dormant and starts the keeper grace window.
+    ///
+    /// The escrow must be in `Locked` status, must classify as `Stale` or `Expired` (not
+    /// `Disputed`), and the stale-threshold config must have `keeper_bounty_bps > 0`.
+    /// Transitions the escrow to `DormantNoticePeriod` and emits `StaleEscrowFlagged`.
+    ///
+    /// Any buyer/seller activity on the escrow during the grace window (e.g. calling
+    /// `dispute_escrow`, `release_escrow`, or `refund_expired_escrow`) resets the
+    /// escrow back to `Locked` and cancels the dormant settlement timer.
+    ///
+    /// # Arguments
+    /// * `env`       - Soroban environment.
+    /// * `escrow_id` - ID of the target escrow.
+    /// * `keeper`    - Address of the keeper initiating the poke; must sign.
+    ///
+    /// # Errors
+    /// * `StaleThresholdNotConfigured` \u2013 threshold config not set.
+    /// * `KeeperBountyDisabled`        \u2013 `keeper_bounty_bps == 0`.
+    /// * `EscrowError::NotFound`       \u2013 escrow does not exist.
+    /// * `EscrowError::InvalidStatus`  \u2013 escrow is disputed, already dormant, or terminal.
+    /// * `ActionError::NotReady`       \u2013 escrow is still `Healthy` or `NearExpiry`.
+    pub fn poke_stale_escrow(env: Env, escrow_id: u64, keeper: Address) -> Result<(), Error> {
+        keeper.require_auth();
+        Self::require_not_paused(&env, "poke_stale_escrow")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let config = Self::require_stale_threshold(&env);
+
+        if config.keeper_bounty_bps == 0 {
+            return Err(Error::Action(ActionError::KeeperBountyDisabled));
+        }
+
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+        let now = env.ledger().timestamp();
+
+        // Only Locked escrows qualify; terminal and already-dormant ones do not.
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Health must be Stale or Expired; Disputed, Healthy, NearExpiry do not qualify.
+        let health = Self::classify_health(&escrow, now, &config);
+        match health {
+            EscrowHealth::Stale | EscrowHealth::Expired => {}
+            EscrowHealth::Disputed => return Err(Error::Escrow(EscrowError::InvalidStatus)),
+            _ => return Err(Error::Action(ActionError::NotReady)),
+        }
+
+        // Transition to DormantNoticePeriod.
+        escrow.status = EscrowStatus::DormantNoticePeriod;
+        escrow.last_activity_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        let dormant_deadline = now + config.dormant_grace_notice_secs;
+
+        // Store the per-escrow dormant record for use by settle_dormant_escrow.
+        let record = DormantSettlementRecord {
+            keeper: keeper.clone(),
+            dormant_deadline,
+            flagged_at: now,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::DormantSettlement(escrow_id)), &record);
+
+        StaleEscrowFlagged {
+            escrow_id,
+            keeper,
+            dormant_deadline,
+            flagged_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Settles a dormant escrow after the grace notice period has elapsed and pays the keeper bounty.
+    ///
+    /// Can only be called once `dormant_grace_notice_secs` have passed since `poke_stale_escrow`.
+    /// The bounty is deducted strictly from the protocol fee share on this escrow (bounded by
+    /// `max_keeper_bounty_cap`) so that buyer/seller principal is always 100% intact. The
+    /// remainder is distributed according to `auto_resolve_in_favor_of`.
+    ///
+    /// # Arguments
+    /// * `env`       - Soroban environment.
+    /// * `escrow_id` - ID of the target escrow.
+    /// * `keeper`    - Keeper address that receives the bounty; must sign.
+    ///
+    /// # Returns
+    /// The bounty amount paid to the keeper on success.
+    ///
+    /// # Errors
+    /// * `StaleThresholdNotConfigured`  \u2013 threshold config not set.
+    /// * `KeeperBountyDisabled`         \u2013 `keeper_bounty_bps == 0`.
+    /// * `EscrowError::NotFound`        \u2013 escrow does not exist.
+    /// * `NotInDormantNoticePeriod`     \u2013 escrow is not in `DormantNoticePeriod`.
+    /// * `DormantGraceNotElapsed`       \u2013 grace window has not yet elapsed.
+    pub fn settle_dormant_escrow(env: Env, escrow_id: u64, keeper: Address) -> Result<i128, Error> {
+        keeper.require_auth();
+        Self::require_not_paused(&env, "settle_dormant_escrow")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let config = Self::require_stale_threshold(&env);
+
+        if config.keeper_bounty_bps == 0 {
+            return Err(Error::Action(ActionError::KeeperBountyDisabled));
+        }
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+        let now = env.ledger().timestamp();
+
+        // Must be in the dormant notice period.
+        if escrow.status != EscrowStatus::DormantNoticePeriod {
+            return Err(Error::Action(ActionError::NotInDormantNoticePeriod));
+        }
+
+        // Load the dormant settlement record.
+        let record: DormantSettlementRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::DormantSettlement(escrow_id)))
+            .unwrap_or(DormantSettlementRecord {
+                keeper: keeper.clone(),
+                dormant_deadline: now,
+                flagged_at: now,
+            });
+
+        // Grace period must have elapsed.
+        if now < record.dormant_deadline {
+            return Err(Error::Action(ActionError::DormantGraceNotElapsed));
+        }
+
+        // --- Bounty calculation ---
+        // Bounty is sourced from the protocol-fee share only, never from principal.
+        // fee_amount  = escrow.amount * fee_bps / 10000
+        // bounty_raw  = escrow.amount * keeper_bounty_bps / 10000
+        // bounty      = min(bounty_raw, fee_amount, max_keeper_bounty_cap if > 0)
+        let fee_amount = (escrow.amount * escrow.fee_bps) / 10_000_i128;
+        let bounty_raw = (escrow.amount * config.keeper_bounty_bps as i128) / 10_000_i128;
+
+        // Clamp bounty to available fee portion so principal is untouched.
+        let mut keeper_bounty = if bounty_raw > fee_amount { fee_amount } else { bounty_raw };
+
+        // Apply the hard cap when set (cap > 0).
+        if config.max_keeper_bounty_cap > 0 && keeper_bounty > config.max_keeper_bounty_cap {
+            keeper_bounty = config.max_keeper_bounty_cap;
+        }
+
+        let residual_fee = fee_amount - keeper_bounty;
+        // Buyer/seller principal is escrow.amount - fee_amount; always untouched.
+        let principal = escrow.amount - fee_amount;
+
+        // --- CEI: mark resolved before any transfer ---
+        let mut settled_escrow = escrow.clone();
+        settled_escrow.status = EscrowStatus::Resolved;
+        settled_escrow.last_activity_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &settled_escrow);
+
+        // Clean up the dormant record.
+        env.storage()
+            .instance()
+            .remove(&DataKey::Config(ConfigKey::DormantSettlement(escrow_id)));
+
+        // Accumulate residual fee to protocol if fee recipient is this contract.
+        let fee_config = Self::get_escrow_fee_config(env.clone());
+        if residual_fee > 0 && fee_config.fee_recipient == env.current_contract_address() {
+            let mut acc: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Participant(ParticipantKey::AccumulatedFees(
+                    escrow.token.clone(),
+                )))
+                .unwrap_or(0);
+            acc += residual_fee;
+            env.storage().instance().set(
+                &DataKey::Participant(ParticipantKey::AccumulatedFees(escrow.token.clone())),
+                &acc,
+            );
+        }
+
+        // --- Transfers ---
+        // 1. Pay keeper bounty.
+        if keeper_bounty > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &keeper, keeper_bounty)?;
+        }
+
+        // 2. Distribute principal per AutoResolveFavor (principal is always 100% intact).
+        let favor = escrow.auto_resolve_in_favor_of.clone();
+        match &favor {
+            AutoResolveFavor::Customer => {
+                if principal > 0 {
+                    Self::transfer_if_token_contract(
+                        &env,
+                        &escrow.token,
+                        &escrow.customer,
+                        principal,
+                    )?;
+                }
+            }
+            AutoResolveFavor::Merchant => {
+                if principal > 0 {
+                    Self::transfer_if_token_contract(
+                        &env,
+                        &escrow.token,
+                        &escrow.merchant,
+                        principal,
+                    )?;
+                }
+            }
+            AutoResolveFavor::SplitEqual => {
+                let half = principal / 2;
+                let remainder = principal - half;
+                if half > 0 {
+                    Self::transfer_if_token_contract(
+                        &env,
+                        &escrow.token,
+                        &escrow.customer,
+                        half,
+                    )?;
+                }
+                if remainder > 0 {
+                    Self::transfer_if_token_contract(
+                        &env,
+                        &escrow.token,
+                        &escrow.merchant,
+                        remainder,
+                    )?;
+                }
+            }
+        }
+
+        DormantEscrowSettled {
+            escrow_id,
+            keeper,
+            keeper_bounty,
+            settled_at: now,
+            favor,
+        }
+        .publish(&env);
+
+        Ok(keeper_bounty)
+    }
+
+    /// Resets a `DormantNoticePeriod` escrow back to `Locked` when a buyer or seller
+    /// performs any activity during the grace window, cancelling the pending settlement.
+    fn cancel_dormant_notice(env: &Env, escrow_id: u64) {
+        if let Some(mut escrow) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            if escrow.status == EscrowStatus::DormantNoticePeriod {
+                escrow.status = EscrowStatus::Locked;
+                escrow.last_activity_at = env.ledger().timestamp();
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::Config(ConfigKey::DormantSettlement(escrow_id)));
+            }
         }
     }
 
