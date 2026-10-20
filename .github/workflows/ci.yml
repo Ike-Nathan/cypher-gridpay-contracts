@@ -69,14 +69,55 @@ jobs:
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: orchestrator
 
-      - name: Build WASM Target (core)
+      - name: Build Deterministic Optimized WASM & Checksum Manifest (SEP-42)
+        env:
+          RUSTFLAGS: "-C link-arg=-s --remap-path-prefix=${{ github.workspace }}=/workspace"
         run: |
           rustup target add wasm32-unknown-unknown
+          mkdir -p artifacts/optimized
+          
+          # Core contracts
+          cd core
           cargo build --target wasm32-unknown-unknown --release
-        working-directory: core
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
 
-      - name: Build WASM Target (orchestrator)
-        run: |
-          rustup target add wasm32-unknown-unknown
+          # Orchestrator contracts
+          cd orchestrator
           cargo build --target wasm32-unknown-unknown --release
-        working-directory: orchestrator
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
+
+          # Verify size budgets (<= 64 KB budget for optimized contracts)
+          cd artifacts/optimized
+          for wasm in *.wasm; do
+            size=$(wc -c < "$wasm")
+            echo "$wasm size: $size bytes"
+            if [ "$size" -gt 65536 ]; then
+              echo "Warning: $wasm exceeds 64KB target ($size bytes)"
+            fi
+          done
+
+          # Generate sha256 checksum manifest
+          sha256sum *.wasm > checksums.sha256
+          cat checksums.sha256
+
+      - name: Upload SEP-42 WASM & Checksums Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-checksums
+          path: |
+            artifacts/optimized/*.wasm
+            artifacts/optimized/checksums.sha256
