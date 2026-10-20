@@ -12,6 +12,8 @@ use soroban_sdk::{
 
 pub mod storage;
 mod finality;
+mod archival;
+pub use archival::{ArchivalConfig, CompactArchivedPayment};
 pub use finality::{FinalityFlag, FinalityRiskConfig};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12961,6 +12963,31 @@ impl PaymentContract {
         env.storage()
             .instance()
             .get(&DataKey::Config(ConfigKey::FinalityConfig))
+    }
+
+    /// Sets the archival retention and refund windows (#197). Admin only.
+    pub fn configure_archival(
+        env: Env,
+        admin: Address,
+        config: ArchivalConfig,
+    ) -> Result<(), Error> {
+        archival::configure(&env, &admin, &config)
+    }
+
+    /// Compacts aged terminal payments into `CompactArchivedPayment` records (#197).
+    /// Returns the number compacted; ineligible ids are skipped. See `archival.rs`.
+    pub fn compact_settled_payments(env: Env, payment_ids: Vec<u64>) -> Result<u32, Error> {
+        archival::compact_settled_payments(&env, payment_ids)
+    }
+
+    /// Returns the compact archive record for a payment, if compacted.
+    pub fn get_archived_payment(env: Env, payment_id: u64) -> Option<CompactArchivedPayment> {
+        archival::get_archived(&env, payment_id)
+    }
+
+    /// Proves a full historical `Payment` against its on-chain `state_hash` (#197).
+    pub fn verify_archived_payment_blob(env: Env, payment_id: u64, full_payment: Payment) -> bool {
+        archival::verify_archived_payment_blob(&env, payment_id, full_payment)
     }
 
     /// Configures risk-tier finality scaling (#196). Admin only.
