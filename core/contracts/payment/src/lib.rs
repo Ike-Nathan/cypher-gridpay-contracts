@@ -11,6 +11,8 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+#[path = "../../escrow/src/fixed_math.rs"]
+pub mod fixed_math;
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -4326,7 +4328,7 @@ impl PaymentContract {
                 if forward_config.active {
                     // Calculate the forward amount based on forward_bps
                     let forward_amount =
-                        (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
+                        fixed_math::mul_div_floor_or_panic(env, merchant_amount, forward_config.forward_bps as i128, 10000);
 
                     // Transfer the forward amount from merchant to forward_to address
                     if forward_amount > 0 {
@@ -8421,7 +8423,7 @@ impl PaymentContract {
     ) -> i128 {
         let discount = PaymentContract::get_tier_discount_bps(tier);
         let effective_bps = fee_bps - (fee_bps * discount) / 10000 + risk_surcharge_bps;
-        let raw_fee = (amount * (effective_bps as i128)) / 10000;
+        let raw_fee = fixed_math::mul_div_ceil_or_panic(env, amount, effective_bps as i128, 10000);
 
         let fee = if min_fee > 0 && raw_fee < min_fee {
             min_fee
@@ -10701,7 +10703,7 @@ impl PaymentContract {
             return 0;
         }
 
-        (payment.amount * (rule.escrow_bps as i128)) / 10000i128
+        fixed_math::mul_div_floor_or_panic(env, payment.amount, rule.escrow_bps as i128, 10000)
     }
 
     pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
@@ -13537,6 +13539,9 @@ mod test_subscription_groups;
 
 #[cfg(test)]
 mod test_finality_delay;
+
+#[cfg(test)]
+mod test_fixed_math_prop;
 
 #[cfg(test)]
 mod test_fee_rebate;
