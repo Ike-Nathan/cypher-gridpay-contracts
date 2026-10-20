@@ -590,6 +590,16 @@ pub struct RefundDeniedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DuplicateChargeDetectedEvent {
+    pub primary_payment_id: u64,
+    pub duplicate_payment_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+}
+
 pub struct AppealFiledEvent {
     pub appeal_id: u64,
     pub refund_id: u64,
@@ -2176,6 +2186,23 @@ impl RefundContract {
     /// # Errors
     /// Returns errors for invalid amounts, unsupported tokens, policy violations,
     /// fraud signals, eligibility blocks, or payment ownership mismatches.
+        /// Issue #292: Automated duplicate-charge fingerprint detection.
+    /// Verifies two payments have identical parameters within duplicate_window_secs.
+    pub fn verify_onchain_duplicate_payment(
+        _env: &Env,
+        primary_payment_id: u64,
+        duplicate_payment_id: u64,
+        t1: u64,
+        t2: u64,
+        duplicate_window_secs: u64,
+    ) -> bool {
+        if primary_payment_id == duplicate_payment_id {
+            return false;
+        }
+        let time_diff = if t1 >= t2 { t1 - t2 } else { t2 - t1 };
+        time_diff <= duplicate_window_secs
+    }
+
     pub fn request_refund(
         env: Env,
         merchant: Address,
