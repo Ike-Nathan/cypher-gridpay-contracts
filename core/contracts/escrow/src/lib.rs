@@ -234,6 +234,7 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    InvalidTemplateParameters = 231,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -323,7 +324,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 316 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 230 {
+            if code >= 200 && code <= 231 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 114 {
@@ -479,6 +480,12 @@ pub struct EscrowTemplate {
     pub description: String,
     pub created_at: u64,
     pub active: bool,
+    pub version: u32,
+    pub min_hold_secs: u64,
+    pub max_hold_secs: u64,
+    pub allowed_tokens: Vec<Address>,
+    pub require_collateral_bps: u32,
+    pub superseded_by_template_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -11016,15 +11023,79 @@ impl EscrowContract {
         release_delay_seconds: u64,
         description: String,
     ) -> Result<u64, Error> {
+        let mut allowed_tokens = Vec::new(&env);
+        allowed_tokens.push_back(token.clone());
+        Self::create_template_internal(
+            env,
+            owner,
+            token,
+            amount,
+            release_delay_seconds,
+            description,
+            0,
+            u64::MAX,
+            allowed_tokens,
+            0,
+        )
+    }
+
+    /// Creates a template with explicit hold-period and compliance parameters.
+    pub fn create_template_with_policy(
+        env: Env,
+        owner: Address,
+        token: Address,
+        amount: i128,
+        release_delay_seconds: u64,
+        description: String,
+        min_hold_secs: u64,
+        max_hold_secs: u64,
+        allowed_tokens: Vec<Address>,
+        require_collateral_bps: u32,
+    ) -> Result<u64, Error> {
+        Self::create_template_internal(
+            env,
+            owner,
+            token,
+            amount,
+            release_delay_seconds,
+            description,
+            min_hold_secs,
+            max_hold_secs,
+            allowed_tokens,
+            require_collateral_bps,
+        )
+    }
+
+    fn create_template_internal(
+        env: Env,
+        owner: Address,
+        token: Address,
+        amount: i128,
+        release_delay_seconds: u64,
+        description: String,
+        min_hold_secs: u64,
+        max_hold_secs: u64,
+        allowed_tokens: Vec<Address>,
+        require_collateral_bps: u32,
+    ) -> Result<u64, Error> {
         owner.require_auth();
         Self::require_not_paused(&env, "create_template")?;
+        Self::validate_template_parameters(
+            release_delay_seconds,
+            min_hold_secs,
+            max_hold_secs,
+            &allowed_tokens,
+            &token,
+        )?;
 
         let counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::Escrow(EscrowKey::TemplateCounter))
             .unwrap_or(0);
-        let template_id = counter + 1;
+        let template_id = counter
+            .checked_add(1)
+            .ok_or(Error::Escrow(EscrowError::InvalidTemplateParameters))?;
 
         let template = EscrowTemplate {
             template_id,
@@ -11035,6 +11106,12 @@ impl EscrowContract {
             description,
             created_at: env.ledger().timestamp(),
             active: true,
+            version: 1,
+            min_hold_secs,
+            max_hold_secs,
+            allowed_tokens,
+            require_collateral_bps,
+            superseded_by_template_id: None,
         };
 
         env.storage().instance().set(
@@ -11048,6 +11125,106 @@ impl EscrowContract {
         TemplateCreated { template_id, owner }.publish(&env);
 
         Ok(template_id)
+    }
+
+    /// Creates a new immutable version of an existing template.
+    pub fn upgrade_escrow_template(
+        env: Env,
+        creator: Address,
+        template_id: u64,
+        new_params: EscrowTemplate,
+    ) -> Result<u64, Error> {
+        creator.require_auth();
+        Self::require_not_paused(&env, "upgrade_escrow_template")?;
+
+        let mut previous: EscrowTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Template(template_id)))
+            .ok_or(Error::Escrow(EscrowError::TemplateNotFound))?;
+        if previous.owner != creator || new_params.owner != creator {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !previous.active || previous.superseded_by_template_id.is_some() {
+            return Err(Error::Escrow(EscrowError::TemplateInactive));
+        }
+        Self::validate_template_parameters(
+            new_params.release_delay_seconds,
+            new_params.min_hold_secs,
+            new_params.max_hold_secs,
+            &new_params.allowed_tokens,
+            &new_params.token,
+        )?;
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::TemplateCounter))
+            .unwrap_or(0);
+        let new_template_id = counter
+            .checked_add(1)
+            .ok_or(Error::Escrow(EscrowError::InvalidTemplateParameters))?;
+        let version = previous
+            .version
+            .checked_add(1)
+            .ok_or(Error::Escrow(EscrowError::InvalidTemplateParameters))?;
+
+        previous.active = false;
+        previous.superseded_by_template_id = Some(new_template_id);
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::Template(template_id)),
+            &previous,
+        );
+        TemplateDeactivated { template_id }.publish(&env);
+
+        let upgraded = EscrowTemplate {
+            template_id: new_template_id,
+            owner: creator.clone(),
+            token: new_params.token,
+            amount: new_params.amount,
+            release_delay_seconds: new_params.release_delay_seconds,
+            description: new_params.description,
+            created_at: env.ledger().timestamp(),
+            active: true,
+            version,
+            min_hold_secs: new_params.min_hold_secs,
+            max_hold_secs: new_params.max_hold_secs,
+            allowed_tokens: new_params.allowed_tokens,
+            require_collateral_bps: new_params.require_collateral_bps,
+            superseded_by_template_id: None,
+        };
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::Template(new_template_id)),
+            &upgraded,
+        );
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::TemplateCounter),
+            &new_template_id,
+        );
+        TemplateCreated {
+            template_id: new_template_id,
+            owner: creator,
+        }
+        .publish(&env);
+        Ok(new_template_id)
+    }
+
+    fn validate_template_parameters(
+        release_delay_seconds: u64,
+        min_hold_secs: u64,
+        max_hold_secs: u64,
+        allowed_tokens: &Vec<Address>,
+        token: &Address,
+    ) -> Result<(), Error> {
+        if min_hold_secs > max_hold_secs
+            || allowed_tokens.is_empty()
+            || !allowed_tokens.contains(token)
+            || release_delay_seconds < min_hold_secs
+            || release_delay_seconds > max_hold_secs
+        {
+            return Err(Error::Escrow(EscrowError::InvalidTemplateParameters));
+        }
+        Ok(())
     }
 
     /// Creates escrow from template.
@@ -11079,6 +11256,13 @@ impl EscrowContract {
         if !template.active {
             return Err(Error::Escrow(EscrowError::TemplateInactive));
         }
+        Self::validate_template_parameters(
+            template.release_delay_seconds,
+            template.min_hold_secs,
+            template.max_hold_secs,
+            &template.allowed_tokens,
+            &template.token,
+        )?;
 
         let release_timestamp = env.ledger().timestamp() + template.release_delay_seconds;
 
@@ -11089,7 +11273,7 @@ impl EscrowContract {
             template.amount,
             template.token.clone(),
             release_timestamp,
-            0,
+            template.min_hold_secs,
             0,
             false,
         )?;
@@ -11181,6 +11365,9 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::Escrow(EscrowKey::Template(template_id)))
             .ok_or(Error::Escrow(EscrowError::TemplateNotFound))?;
+        if template.owner != owner {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
 
         template.active = false;
         env.storage().instance().set(
