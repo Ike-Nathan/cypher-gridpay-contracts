@@ -12,3 +12,6 @@
  */
 
 export * from "./generated/index.js";
+export * from "./events.js";
+export * from "./errors.js";
+export * from "./transactions.js";
