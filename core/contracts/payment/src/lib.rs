@@ -51,6 +51,7 @@ pub enum ConfigKey {
     SchemaVersion,
     AllowedTokens,
     MaxForwardDepth,
+    RelayerStipendBps,
 }
 
 #[derive(Clone)]
@@ -72,6 +73,9 @@ pub enum PaymentKey {
     LargePaymentCounter,
     Discount(u64),
     TotalPendingSettlement(Address), // Track total pending settlement amount per token
+    PrivatePaymentCommitment(u64),
+    PaymentFee(u64),
+    UsedPrivatePaymentCommitment(BytesN<32>),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -106,6 +110,9 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    RelayerStipend(Address, Address),
+    StreamingPaymentChannel(u64),
+    StreamingPaymentChannelCounter,
 }
 
 #[derive(Clone)]
@@ -1019,6 +1026,21 @@ pub struct PaymentChannel {
     pub customer_pk: BytesN<32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StreamingPaymentChannel {
+    pub channel_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub deposited: i128,
+    pub claimed: i128,
+    pub flow_rate_per_sec: i128,
+    pub start_ts: u64,
+    pub stop_ts: u64,
+    pub open: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct MeteredSubscription {
@@ -1298,6 +1320,12 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EphemeralInvoiceRoute {
+    pub ephemeral_invoice_commitment: BytesN<32>,
 }
 
 /// Issue #70: primitive-only cross-contract verification result consumed by the
@@ -2646,6 +2674,94 @@ impl PaymentContract {
             expiration_duration,
             metadata,
         )
+    }
+
+    /// Creates a payment without publishing the merchant vault at invoice creation.
+    /// The commitment is SHA-256 of the vault address XDR followed by a 32-byte secret XDR.
+    pub fn create_private_payment(
+        env: Env,
+        customer: Address,
+        ephemeral_invoice_commitment: BytesN<32>,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_private_payment")?;
+        customer.require_auth();
+        let commitment_key = DataKey::Payment(PaymentKey::UsedPrivatePaymentCommitment(
+            ephemeral_invoice_commitment.clone(),
+        ));
+        if env.storage().instance().has(&commitment_key) {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer,
+            env.current_contract_address(),
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata,
+        )?;
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::PrivatePaymentCommitment(payment_id)),
+            &EphemeralInvoiceRoute {
+                ephemeral_invoice_commitment,
+            },
+        );
+        env.storage().instance().set(&commitment_key, &true);
+        Ok(payment_id)
+    }
+
+    /// Reveals and settles a private payment for its committed merchant vault.
+    pub fn complete_private_payment(
+        env: Env,
+        vault: Address,
+        secret: BytesN<32>,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "complete_private_payment")?;
+        vault.require_auth();
+        Self::require_merchant_not_paused(&env, &vault)?;
+
+        let route: EphemeralInvoiceRoute = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        let mut reveal = vault.to_xdr(&env);
+        reveal.append(&secret.to_xdr(&env));
+        if env.crypto().sha256(&reveal) != route.ephemeral_invoice_commitment {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+
+        let payment_key = DataKey::Payment(PaymentKey::Data(payment_id));
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&payment_key)
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        payment.merchant = vault.clone();
+        env.storage().instance().set(&payment_key, &payment);
+        env.storage()
+            .instance()
+            .remove(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )));
+
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        if threshold > 0 && payment.amount > threshold {
+            return PaymentContract::propose_large_payment(env, vault, payment_id);
+        }
+
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &vault, payment_id)?;
+        Ok(())
     }
 
     /// Schedules a future payment by escrowing tokens until the scheduled time.
@@ -4064,6 +4180,16 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
         // Check if payment requires multi-sig approval
         let payment = PaymentContract::get_payment(&env, payment_id);
         let threshold = PaymentContract::get_large_payment_threshold(env.clone());
@@ -4113,10 +4239,22 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &admin, payment_id)?;
+        Ok(())
     }
 
     fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
         // Check if payment exists
         if !env
             .storage()
@@ -8283,6 +8421,99 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Sets the share of collected protocol fees reserved for completion relayers.
+    pub fn set_relayer_stipend_bps(
+        env: Env,
+        admin: Address,
+        relayer_stipend_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if relayer_stipend_bps > 10_000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::RelayerStipendBps),
+            &relayer_stipend_bps,
+        );
+        Ok(())
+    }
+
+    /// Returns a relayer's accrued stipend for a token.
+    pub fn get_relayer_stipend(env: Env, relayer: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::RelayerStipend(
+                relayer, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    /// Claims a relayer's accrued stipend in the token it was earned in.
+    pub fn claim_relayer_stipend(
+        env: Env,
+        relayer: Address,
+        token: Address,
+    ) -> Result<i128, Error> {
+        relayer.require_auth();
+        let key = DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), token.clone()));
+        let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return Err(Error::Feature(FeatureError::NothingToSweep));
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &relayer,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    fn accrue_relayer_stipend(env: &Env, relayer: &Address, payment_id: u64) -> Result<(), Error> {
+        let bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::RelayerStipendBps))
+            .unwrap_or(0);
+        if bps == 0 {
+            return Ok(());
+        }
+        let payment = PaymentContract::get_payment(env, payment_id);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PaymentFee(payment_id)))
+            .unwrap_or(0);
+        let stipend = fee.saturating_mul(bps as i128) / 10_000;
+        if stipend <= 0 {
+            return Ok(());
+        }
+        let balance_key =
+            DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), payment.token));
+        let accrued: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&balance_key, &accrued.saturating_add(stipend));
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::AccumulatedFees),
+            &accumulated.saturating_sub(stipend),
+        );
+        Ok(())
+    }
+
     /// Admin withdraws accumulated fees to the treasury address.
     pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         admin.require_auth();
@@ -8370,6 +8601,10 @@ impl PaymentContract {
         if fee <= 0 {
             return (amount, 0);
         }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::PaymentFee(payment_id)), &fee);
 
         let net_amount = amount.saturating_sub(fee);
 
@@ -11939,6 +12174,180 @@ impl PaymentContract {
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
     }
 
+    /// Opens a time-streaming channel funded by the customer.
+    pub fn open_streaming_channel(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        deposit: i128,
+        flow_rate_per_sec: i128,
+        start_ts: u64,
+        stop_ts: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "open_streaming_channel")?;
+        customer.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let now = env.ledger().timestamp();
+        if deposit <= 0 || flow_rate_per_sec <= 0 || start_ts < now || stop_ts <= start_ts {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if Self::is_zero_address(&env, &merchant) {
+            return Err(Error::Feature(FeatureError::InvalidCounterparty));
+        }
+        token::Client::new(&env, &token).transfer(
+            &customer,
+            &env.current_contract_address(),
+            &deposit,
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(
+                FeatureKey::StreamingPaymentChannelCounter,
+            ))
+            .unwrap_or(0);
+        let channel_id = counter + 1;
+        let channel = StreamingPaymentChannel {
+            channel_id,
+            customer,
+            merchant,
+            token,
+            deposited: deposit,
+            claimed: 0,
+            flow_rate_per_sec,
+            start_ts,
+            stop_ts,
+            open: true,
+        };
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannelCounter),
+            &channel_id,
+        );
+        Ok(channel_id)
+    }
+
+    /// Returns the unclaimed balance accrued by a streaming channel at the current ledger time.
+    pub fn get_streaming_claimable(env: Env, channel_id: u64) -> Result<i128, Error> {
+        let channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        Ok(Self::streaming_earned(&env, &channel).saturating_sub(channel.claimed))
+    }
+
+    /// Retrieves a streaming channel by its ID.
+    pub fn get_streaming_channel(
+        env: Env,
+        channel_id: u64,
+    ) -> Result<StreamingPaymentChannel, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))
+    }
+
+    /// Claims the currently accrued streaming balance for the merchant.
+    pub fn claim_streaming_channel(
+        env: Env,
+        merchant: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "claim_streaming_channel")?;
+        merchant.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if merchant != channel.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let amount = earned.saturating_sub(channel.claimed);
+        if amount <= 0 {
+            return Err(Error::Payment(PaymentError::NothingToSettle));
+        }
+        channel.claimed = earned;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        token::Client::new(&env, &channel.token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    /// Stops a stream and returns its unearned deposit to the customer.
+    pub fn close_streaming_channel(
+        env: Env,
+        customer: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "close_streaming_channel")?;
+        customer.require_auth();
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if customer != channel.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let newly_earned = earned.saturating_sub(channel.claimed);
+        let refund = channel.deposited.saturating_sub(earned);
+        channel.claimed = earned;
+        channel.open = false;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+        if newly_earned > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &newly_earned);
+        }
+        if refund > 0 {
+            token_client.transfer(&contract_address, &customer, &refund);
+        }
+        Ok(refund)
+    }
+
+    /// Returns the cumulative amount vested by the channel's linear time schedule.
+    fn streaming_earned(env: &Env, channel: &StreamingPaymentChannel) -> i128 {
+        let now = env.ledger().timestamp().min(channel.stop_ts);
+        let elapsed = now.saturating_sub(channel.start_ts) as i128;
+        channel
+            .flow_rate_per_sec
+            .saturating_mul(elapsed)
+            .min(channel.deposited)
+    }
+
     fn extract_public_key(env: &Env, address: &Address) -> BytesN<32> {
         let xdr = address.to_xdr(env);
         // ScVal XDR layout: [0,0,0,18](ScvAddress) [0,0,0,0](Account) [0,0,0,0](Ed25519) [32 bytes PK]
@@ -13515,6 +13924,15 @@ mod test_metadata;
 
 #[cfg(test)]
 mod test_payment_channel;
+
+#[cfg(test)]
+mod test_private_payment;
+
+#[cfg(test)]
+mod test_relayer_stipend;
+
+#[cfg(test)]
+mod test_streaming_channel;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
