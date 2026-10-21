@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod timelock_tests {
     use crate::*;
-    use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
-use crate::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, Bytes, Env,
+    };
 
     fn setup_test(env: &Env) -> (EscrowContractClient, Address) {
         env.mock_all_auths();
@@ -12,6 +14,48 @@ use crate::*;
         let admin = Address::generate(env);
         client.initialize(&admin);
         (client, admin)
+    }
+
+    fn setup_vesting(env: &Env, amount: i128) -> (EscrowContractClient, Address, Address, Address) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+
+        let grantor = Address::generate(env);
+        let beneficiary = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(grantor.clone());
+        let token_admin = token::StellarAssetClient::new(env, &token_address);
+        token_admin.mint(&contract_id, &amount);
+
+        let escrow_id = client.create_vesting_escrow(
+            &grantor,
+            &beneficiary,
+            &amount,
+            &token_address,
+            &110,
+            &200,
+            &Vec::new(env),
+        );
+        client.set_vesting_curve_config(&VestingAccelerationConfig {
+            schedule_id: escrow_id,
+            milestone_bps: 0,
+            max_acceleration_bps: 10_000,
+            total_accelerated_bps: 0,
+            start_ts: 100,
+            cliff_duration_secs: 10,
+            cliff_unlock_bps: 2_000,
+            linear_duration_secs: 90,
+            single_trigger_accel_bps: 2_500,
+            double_trigger_accel_bps: 7_500,
+            trigger_one_confirmed: false,
+            trigger_two_confirmed: false,
+        });
+
+        (client, grantor, beneficiary, token_address)
     }
 
     #[test]
@@ -61,7 +105,10 @@ use crate::*;
         // Try to execute immediately - should fail with TimelockNotElapsed since the
         // security delay (timelock) has not yet elapsed
         let result = client.try_execute_queued_action(&action_id);
-        assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::TimelockNotElapsed))));
+        assert_eq!(
+            result,
+            Err(Ok(Error::Escrow(EscrowError::TimelockNotElapsed)))
+        );
     }
 
     #[test]
@@ -128,5 +175,54 @@ use crate::*;
 
         let result = client.try_set_timelock_config(&admin, &config);
         assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
+    }
+
+    #[test]
+    fn test_vesting_cliff_boundary() {
+        let env = Env::default();
+        let (client, _, _, _) = setup_vesting(&env, 10_000);
+
+        assert_eq!(client.compute_vested_amount(&1, &109), 0);
+        assert_eq!(client.compute_vested_amount(&1, &110), 2_000);
+    }
+
+    #[test]
+    fn test_vesting_linear_interpolation() {
+        let env = Env::default();
+        let (client, _, _, _) = setup_vesting(&env, 10_000);
+
+        assert_eq!(client.compute_vested_amount(&1, &155), 6_000);
+    }
+
+    #[test]
+    fn test_double_trigger_acceleration_requires_both_parties() {
+        let env = Env::default();
+        let (client, grantor, beneficiary, _) = setup_vesting(&env, 10_000);
+
+        client.confirm_vesting_trigger(&1, &1, &grantor);
+        assert_eq!(client.compute_vested_amount(&1, &110), 4_000);
+        client.confirm_vesting_trigger(&1, &2, &beneficiary);
+        assert_eq!(client.compute_vested_amount(&1, &110), 8_000);
+    }
+
+    #[test]
+    fn test_mid_stream_revocation_splits_vested_and_unvested_balances() {
+        let env = Env::default();
+        let (client, grantor, beneficiary, token_address) = setup_vesting(&env, 10_000);
+        let token_client = token::Client::new(&env, &token_address);
+        let contract_address = client.address.clone();
+
+        env.ledger().set_timestamp(110);
+        assert_eq!(client.claim_vested_escrow_tokens(&1, &beneficiary), 2_000);
+        env.ledger().set_timestamp(155);
+        client.revoke_unvested_escrow(&1, &grantor);
+
+        assert_eq!(token_client.balance(&beneficiary), 6_000);
+        assert_eq!(token_client.balance(&grantor), 4_000);
+        assert_eq!(token_client.balance(&contract_address), 0);
+        assert_eq!(
+            client.try_claim_vested_escrow_tokens(&1, &beneficiary),
+            Err(Ok(Error::Escrow(EscrowError::AlreadyProcessed)))
+        );
     }
 }

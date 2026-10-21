@@ -76,6 +76,7 @@ pub enum EscrowKey {
     SubAccountCounter(u64),
     EscrowHierarchy(u64),
     ReleaseMultisig(u64),
+    VestingRevoked(u64),
 }
 
 #[derive(Clone)]
@@ -466,6 +467,14 @@ pub struct VestingAccelerationConfig {
     pub milestone_bps: u32,
     pub max_acceleration_bps: u32,
     pub total_accelerated_bps: u32,
+    pub start_ts: u64,
+    pub cliff_duration_secs: u64,
+    pub cliff_unlock_bps: u32,
+    pub linear_duration_secs: u64,
+    pub single_trigger_accel_bps: u32,
+    pub double_trigger_accel_bps: u32,
+    pub trigger_one_confirmed: bool,
+    pub trigger_two_confirmed: bool,
 }
 
 #[derive(Clone)]
@@ -6817,6 +6826,10 @@ impl EscrowContract {
     }
 
     fn get_base_vested_amount(env: &Env, escrow_id: u64) -> i128 {
+        Self::get_base_vested_amount_at(env, escrow_id, env.ledger().timestamp())
+    }
+
+    fn get_base_vested_amount_at(env: &Env, escrow_id: u64, at_timestamp: u64) -> i128 {
         let vesting_schedule =
             match env
                 .storage()
@@ -6828,15 +6841,13 @@ impl EscrowContract {
                 None => return 0,
             };
 
-        let current_timestamp = env.ledger().timestamp();
-
         // Before cliff - nothing is vested
-        if current_timestamp < vesting_schedule.cliff_timestamp {
+        if at_timestamp < vesting_schedule.cliff_timestamp {
             return 0;
         }
 
         // After end - everything is vested
-        if current_timestamp >= vesting_schedule.end_timestamp {
+        if at_timestamp >= vesting_schedule.end_timestamp {
             return vesting_schedule.total_amount;
         }
 
@@ -6844,7 +6855,7 @@ impl EscrowContract {
         if !vesting_schedule.milestones.is_empty() {
             let mut vested_amount: i128 = 0;
             for milestone in vesting_schedule.milestones.iter() {
-                if current_timestamp >= milestone.unlock_timestamp {
+                if at_timestamp >= milestone.unlock_timestamp {
                     vested_amount = vested_amount.saturating_add(milestone.amount);
                 }
             }
@@ -6854,7 +6865,7 @@ impl EscrowContract {
             let total_duration = vesting_schedule
                 .end_timestamp
                 .saturating_sub(vesting_schedule.cliff_timestamp);
-            let elapsed = current_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
+            let elapsed = at_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
 
             if total_duration == 0 {
                 return 0;
@@ -6863,6 +6874,106 @@ impl EscrowContract {
             let vested_portion = (elapsed as i128).saturating_mul(vesting_schedule.total_amount);
             vested_portion / total_duration as i128
         }
+    }
+
+    fn compute_vested_amount_at(
+        env: &Env,
+        escrow_id: u64,
+        at_timestamp: u64,
+    ) -> Result<i128, Error> {
+        let vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        let config = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&DataKey::Escrow(
+                EscrowKey::VestingAccelerationConfig(escrow_id),
+            ));
+
+        let legacy_base = Self::get_base_vested_amount_at(env, escrow_id, at_timestamp);
+        let base_vested = if let Some(config) = config.as_ref() {
+            let cliff_timestamp = config.start_ts.saturating_add(config.cliff_duration_secs);
+            let curve_vested = if at_timestamp < cliff_timestamp {
+                0
+            } else if at_timestamp >= cliff_timestamp.saturating_add(config.linear_duration_secs) {
+                vesting_schedule.total_amount
+            } else {
+                let cliff_amount = vesting_schedule
+                    .total_amount
+                    .saturating_mul(config.cliff_unlock_bps as i128)
+                    / 10_000;
+                let elapsed = at_timestamp.saturating_sub(cliff_timestamp) as i128;
+                let linear_amount = vesting_schedule
+                    .total_amount
+                    .saturating_sub(cliff_amount)
+                    .saturating_mul(elapsed)
+                    / config.linear_duration_secs as i128;
+                cliff_amount.saturating_add(linear_amount)
+            };
+            if at_timestamp < cliff_timestamp {
+                0
+            } else if vesting_schedule.milestones.is_empty() {
+                curve_vested
+            } else {
+                legacy_base.max(curve_vested)
+            }
+        } else {
+            legacy_base
+        }
+        .min(vesting_schedule.total_amount);
+
+        let legacy_acceleration_bps = config
+            .as_ref()
+            .map(|config| {
+                config
+                    .total_accelerated_bps
+                    .min(config.max_acceleration_bps)
+            })
+            .unwrap_or(0);
+        let legacy_acceleration = vesting_schedule
+            .total_amount
+            .saturating_sub(base_vested)
+            .saturating_mul(legacy_acceleration_bps as i128)
+            / 10_000;
+        let vested_after_legacy_acceleration = base_vested.saturating_add(legacy_acceleration);
+
+        let trigger_acceleration = config
+            .as_ref()
+            .map(|config| {
+                let acceleration_bps =
+                    if config.trigger_one_confirmed && config.trigger_two_confirmed {
+                        config.double_trigger_accel_bps
+                    } else if config.trigger_one_confirmed || config.trigger_two_confirmed {
+                        config.single_trigger_accel_bps
+                    } else {
+                        0
+                    };
+                vesting_schedule
+                    .total_amount
+                    .saturating_sub(vested_after_legacy_acceleration)
+                    .saturating_mul(acceleration_bps as i128)
+                    / 10_000
+            })
+            .unwrap_or(0);
+
+        Ok(vested_after_legacy_acceleration
+            .saturating_add(trigger_acceleration)
+            .min(vesting_schedule.total_amount))
+    }
+
+    /// Calculates the total amount vested at the requested timestamp.
+    pub fn compute_vested_amount(
+        env: Env,
+        escrow_id: u64,
+        at_timestamp: u64,
+    ) -> Result<i128, Error> {
+        Self::compute_vested_amount_at(&env, escrow_id, at_timestamp)
     }
 
     /// Returns vested amount.
@@ -6877,25 +6988,10 @@ impl EscrowContract {
     /// # Panics
     /// Panics if required state is missing.
     pub fn get_vested_amount(env: Env, escrow_id: u64) -> i128 {
-        let vesting_schedule =
-            match env
-                .storage()
-                .instance()
-                .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
-                    escrow_id,
-                ))) {
-                Some(schedule) => schedule,
-                None => return 0,
-            };
-
-        let base_vested = Self::get_base_vested_amount(&env, escrow_id);
-        let accelerated_amount = Self::calculate_accelerated_amount(env.clone(), escrow_id);
-        let total_vested = base_vested.saturating_add(accelerated_amount);
-
-        if total_vested > vesting_schedule.total_amount {
-            vesting_schedule.total_amount
-        } else {
-            total_vested
+        match Self::compute_vested_amount_at(&env, escrow_id, env.ledger().timestamp()) {
+            Ok(amount) => amount,
+            Err(Error::Escrow(EscrowError::NotFound)) => 0,
+            Err(_) => panic!("unexpected error computing vested amount"),
         }
     }
 
@@ -6935,29 +7031,187 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::InvalidVestingSchedule));
         }
 
-        if env
+        if max_acceleration_bps > 10_000 {
+            return Err(Error::Escrow(EscrowError::InvalidVestingSchedule));
+        }
+
+        let vesting_schedule = env
             .storage()
             .instance()
             .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
                 schedule_id,
             )))
-            .is_none()
-        {
-            return Err(Error::Escrow(EscrowError::NotFound));
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if vesting_schedule.released_amount > 0 {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
         }
 
-        let acceleration_config = VestingAccelerationConfig {
-            schedule_id,
-            milestone_bps,
-            max_acceleration_bps,
+        let key = DataKey::Escrow(EscrowKey::VestingAccelerationConfig(schedule_id));
+        let mut acceleration_config = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&key)
+            .unwrap_or(VestingAccelerationConfig {
+                schedule_id,
+                milestone_bps: 0,
+                max_acceleration_bps: 10_000,
+                total_accelerated_bps: 0,
+                start_ts: vesting_schedule.start_timestamp,
+                cliff_duration_secs: vesting_schedule
+                    .cliff_timestamp
+                    .saturating_sub(vesting_schedule.start_timestamp),
+                cliff_unlock_bps: 0,
+                linear_duration_secs: vesting_schedule
+                    .end_timestamp
+                    .saturating_sub(vesting_schedule.cliff_timestamp),
+                single_trigger_accel_bps: 0,
+                double_trigger_accel_bps: 0,
+                trigger_one_confirmed: false,
+                trigger_two_confirmed: false,
+            });
+        if acceleration_config.trigger_one_confirmed
+            || acceleration_config.trigger_two_confirmed
+            || acceleration_config.total_accelerated_bps > 0
+        {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+        acceleration_config.milestone_bps = milestone_bps;
+        acceleration_config.max_acceleration_bps = max_acceleration_bps;
+        acceleration_config.total_accelerated_bps = 0;
+
+        env.storage().instance().set(&key, &acceleration_config);
+
+        Ok(())
+    }
+
+    /// Configures the cliff, linear stream, and trigger acceleration for a vesting schedule.
+    pub fn set_vesting_curve_config(
+        env: Env,
+        curve_config: VestingAccelerationConfig,
+    ) -> Result<(), Error> {
+        let escrow_id = curve_config.schedule_id;
+        let escrow = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        escrow.customer.require_auth();
+        Self::require_not_paused(&env, "set_vesting_curve_config")?;
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if vesting_schedule.released_amount > 0
+            || env
+                .storage()
+                .instance()
+                .has(&DataKey::Escrow(EscrowKey::VestingRevoked(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        let curve_end = curve_config
+            .start_ts
+            .checked_add(curve_config.cliff_duration_secs)
+            .and_then(|cliff| cliff.checked_add(curve_config.linear_duration_secs));
+        if curve_config.cliff_unlock_bps > 10_000
+            || curve_config.single_trigger_accel_bps > 10_000
+            || curve_config.double_trigger_accel_bps > 10_000
+            || curve_config.linear_duration_secs == 0
+            || curve_end.is_none()
+            || (curve_config.double_trigger_accel_bps > 0 && escrow.customer == escrow.merchant)
+        {
+            return Err(Error::Escrow(EscrowError::InvalidVestingSchedule));
+        }
+
+        let key = DataKey::Escrow(EscrowKey::VestingAccelerationConfig(escrow_id));
+        let existing_config = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&key);
+        if existing_config.as_ref().is_some_and(|config| {
+            config.trigger_one_confirmed
+                || config.trigger_two_confirmed
+                || config.total_accelerated_bps > 0
+        }) {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+        let mut acceleration_config = existing_config.unwrap_or(VestingAccelerationConfig {
+            schedule_id: escrow_id,
+            milestone_bps: 0,
+            max_acceleration_bps: 10_000,
             total_accelerated_bps: 0,
-        };
+            start_ts: curve_config.start_ts,
+            cliff_duration_secs: curve_config.cliff_duration_secs,
+            cliff_unlock_bps: curve_config.cliff_unlock_bps,
+            linear_duration_secs: curve_config.linear_duration_secs,
+            single_trigger_accel_bps: curve_config.single_trigger_accel_bps,
+            double_trigger_accel_bps: curve_config.double_trigger_accel_bps,
+            trigger_one_confirmed: false,
+            trigger_two_confirmed: false,
+        });
 
+        acceleration_config.start_ts = curve_config.start_ts;
+        acceleration_config.cliff_duration_secs = curve_config.cliff_duration_secs;
+        acceleration_config.cliff_unlock_bps = curve_config.cliff_unlock_bps;
+        acceleration_config.linear_duration_secs = curve_config.linear_duration_secs;
+        acceleration_config.single_trigger_accel_bps = curve_config.single_trigger_accel_bps;
+        acceleration_config.double_trigger_accel_bps = curve_config.double_trigger_accel_bps;
+        acceleration_config.trigger_one_confirmed = false;
+        acceleration_config.trigger_two_confirmed = false;
+        vesting_schedule.start_timestamp = curve_config.start_ts;
+
+        env.storage().instance().set(&key, &acceleration_config);
         env.storage().instance().set(
-            &DataKey::Escrow(EscrowKey::VestingAccelerationConfig(schedule_id)),
-            &acceleration_config,
+            &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
+            &vesting_schedule,
         );
+        Ok(())
+    }
 
+    /// Confirms one of the two vesting acceleration events.
+    pub fn confirm_vesting_trigger(
+        env: Env,
+        escrow_id: u64,
+        trigger_number: u32,
+        party: Address,
+    ) -> Result<(), Error> {
+        party.require_auth();
+        Self::require_not_paused(&env, "confirm_vesting_trigger")?;
+
+        let escrow = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        let key = DataKey::Escrow(EscrowKey::VestingAccelerationConfig(escrow_id));
+        let mut config = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&key)
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        match trigger_number {
+            1 if party == escrow.customer => {
+                if config.trigger_one_confirmed {
+                    return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+                }
+                config.trigger_one_confirmed = true;
+            }
+            2 if party == escrow.merchant => {
+                if config.trigger_two_confirmed {
+                    return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+                }
+                config.trigger_two_confirmed = true;
+            }
+            _ => return Err(Error::Basic(BasicError::Unauthorized)),
+        }
+
+        env.storage().instance().set(&key, &config);
         Ok(())
     }
 
@@ -7142,6 +7396,13 @@ impl EscrowContract {
     pub fn release_vested_amount(env: Env, admin: Address, escrow_id: u64) -> Result<i128, Error> {
         admin.require_auth();
         Self::require_not_paused(&env, "release_vested_amount")?;
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::VestingRevoked(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
 
         // Check if escrow exists
         if !env
@@ -7170,7 +7431,7 @@ impl EscrowContract {
         }
 
         // Calculate vested amount
-        let vested_amount = EscrowContract::get_vested_amount(env.clone(), escrow_id);
+        let vested_amount = Self::compute_vested_amount_at(&env, escrow_id, current_timestamp)?;
         let releasable_amount = vested_amount.saturating_sub(vesting_schedule.released_amount);
 
         if releasable_amount == 0 {
@@ -7230,6 +7491,109 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(releasable_amount)
+    }
+
+    /// Transfers newly vested tokens to the escrow beneficiary.
+    pub fn claim_vested_escrow_tokens(
+        env: Env,
+        escrow_id: u64,
+        beneficiary: Address,
+    ) -> Result<i128, Error> {
+        beneficiary.require_auth();
+        Self::require_not_paused(&env, "claim_vested_escrow_tokens")?;
+
+        let escrow = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if beneficiary != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::VestingRevoked(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        let mut schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        let vested_amount =
+            Self::compute_vested_amount_at(&env, escrow_id, env.ledger().timestamp())?;
+        let claim_amount = vested_amount.saturating_sub(schedule.released_amount);
+        if claim_amount == 0 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        schedule.released_amount = schedule.released_amount.saturating_add(claim_amount);
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
+            &schedule,
+        );
+        Self::transfer_if_token_contract(&env, &escrow.token, &beneficiary, claim_amount)?;
+        Ok(claim_amount)
+    }
+
+    /// Pays the accrued vested balance to the beneficiary and refunds only the
+    /// unvested balance to the original depositor.
+    pub fn revoke_unvested_escrow(env: Env, escrow_id: u64, grantor: Address) -> Result<(), Error> {
+        grantor.require_auth();
+        Self::require_not_paused(&env, "revoke_unvested_escrow")?;
+
+        let escrow = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if grantor != escrow.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let revoked_key = DataKey::Escrow(EscrowKey::VestingRevoked(escrow_id));
+        if env.storage().instance().has(&revoked_key) {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        let mut schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        let computed_vested_amount =
+            Self::compute_vested_amount_at(&env, escrow_id, env.ledger().timestamp())?;
+        let vested_amount = computed_vested_amount
+            .max(schedule.released_amount)
+            .min(schedule.total_amount);
+        let vested_unclaimed = vested_amount.saturating_sub(schedule.released_amount);
+        let unvested_refund = schedule.total_amount.saturating_sub(vested_amount);
+
+        schedule.released_amount = schedule.total_amount;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
+            &schedule,
+        );
+        env.storage().instance().set(&revoked_key, &true);
+
+        if vested_unclaimed > 0 {
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                vested_unclaimed,
+            )?;
+        }
+        if unvested_refund > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &grantor, unvested_refund)?;
+        }
+        Ok(())
     }
 
     /// Admin approves a specific milestone, enabling it to be released.
