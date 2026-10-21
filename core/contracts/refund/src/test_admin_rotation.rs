@@ -3,7 +3,7 @@
 // Issue #389: two-step admin rotation for the refund contract.
 
 use super::*;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::Env;
 
 #[test]
@@ -21,6 +21,12 @@ fn test_propose_and_accept_admin_rotates_admin() {
 
     client.propose_admin(&admin, &new_admin);
     assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    assert_eq!(
+        client.try_accept_admin(&new_admin),
+        Err(Ok(Error::Ext(ExtError::AdminRotationDelayNotElapsed)))
+    );
+    env.ledger().set_timestamp(ADMIN_ROTATION_DELAY_SECS);
 
     client.accept_admin(&new_admin);
     assert_eq!(client.get_pending_admin(), None);
@@ -97,6 +103,7 @@ fn test_compromised_admin_key_cannot_be_used_after_rotation() {
     client.initialize(&compromised_admin);
 
     client.propose_admin(&compromised_admin, &safe_admin);
+    env.ledger().set_timestamp(ADMIN_ROTATION_DELAY_SECS);
     client.accept_admin(&safe_admin);
 
     // The old (compromised) admin address can no longer perform admin actions.
@@ -130,6 +137,7 @@ fn test_pending_admin_has_no_power_until_accepted() {
         Err(Ok(Error::Core(CoreError::Unauthorized)))
     );
 
+    env.ledger().set_timestamp(ADMIN_ROTATION_DELAY_SECS);
     client.accept_admin(&proposed);
     client.set_payment_rejection_cooldown(&proposed, &7_200);
     assert_eq!(
@@ -198,6 +206,7 @@ fn test_reproposing_replaces_mistyped_admin() {
         client.try_accept_admin(&typo),
         Err(Ok(Error::Ext(ExtError::NotPendingAdmin)))
     );
+    env.ledger().set_timestamp(ADMIN_ROTATION_DELAY_SECS);
     client.accept_admin(&intended);
     client.set_payment_rejection_cooldown(&intended, &60);
 }
