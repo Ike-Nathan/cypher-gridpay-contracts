@@ -45,6 +45,8 @@ pub enum ConfigKey {
     EvidenceDeadlineConfig,
     ThresholdVersion,
     ProposalApprovalVersion(String),
+    /// Address of the authorized dispute oracle that may submit rubric evaluations.
+    DisputeOracle,
 }
 
 #[derive(Clone)]
@@ -118,6 +120,10 @@ pub enum DisputeKey {
     AppealRecord(u64, u64),
     LiquidationConfig,
     LiquidationHistory(u64),
+    /// Stores `DisputeRubricEvaluation` for a given escrow ID.
+    RubricEvaluation(u64),
+    /// Stores the fast-track confidence threshold in basis points (u32).
+    FastTrackThresholdBps,
 }
 
 #[derive(Clone)]
@@ -274,6 +280,18 @@ pub enum ActionError {
     /// Deposited collateral balance is insufficient for this operation. Resolution: fund additional collateral to escrow.
     InsufficientCollateral = 315,
     ArbitrationRequired = 316,
+    /// Rubric recommendation has been vetoed by a party; escalates to full arbitration. Resolution: proceed via standard resolve_dispute.
+    RecommendationVetoed = 317,
+    /// Rubric recommendation has already been finalized or does not exist. Resolution: check escrow status.
+    RecommendationNotPending = 318,
+    /// Caller is not the authorized dispute oracle for this recommendation. Resolution: call from the oracle address that signed the rubric.
+    NotDisputeOracle = 319,
+    /// The rubric basis-points split does not sum to 10,000. Resolution: ensure recommended_buyer_bps + recommended_seller_bps == 10_000.
+    InvalidRubricSplit = 320,
+    /// The challenge window has not yet closed; call finalize_recommended_resolution after challenge_window_ends_at. Resolution: wait for challenge window to pass.
+    ChallengeWindowOpen = 321,
+    /// The recommendation confidence is below the fast-track threshold; cannot auto-finalize. Resolution: use resolve_dispute for manual arbitration.
+    ConfidenceBelowFastTrack = 322,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -320,7 +338,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            if code >= 300 && code <= 322 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
             if code >= 200 && code <= 230 {
@@ -902,6 +920,75 @@ pub struct DisputeRecommendation {
     pub merchant_score: i128,
     pub recommendation: DisputeOutcome,
     pub confidence_bps: u32,
+}
+
+/// Rubric-weighted evaluation submitted by an authorized dispute oracle.
+///
+/// The oracle fills in per-dimension scores and a `confidence_bps` figure.
+/// A `rubric_hash` (SHA-256 / keccak of the off-chain rubric document) ties
+/// the on-chain record to the full off-chain reasoning. A short challenge
+/// window lets either party veto the recommendation; once the window closes
+/// and `confidence_bps >= fast_track_threshold_bps`, any caller can finalize.
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeRubricEvaluation {
+    /// Identifies the disputed escrow.
+    pub escrow_id: u64,
+    /// Fraction of escrow amount recommended for the buyer (customer), in bps (0–10 000).
+    pub recommended_buyer_bps: u32,
+    /// Fraction of escrow amount recommended for the seller (merchant), in bps (0–10 000).
+    /// Invariant: `recommended_buyer_bps + recommended_seller_bps == 10_000`.
+    pub recommended_seller_bps: u32,
+    /// AI/oracle confidence in the recommendation, in bps (0–10 000).
+    pub confidence_bps: u32,
+    /// SHA-256 / keccak hash of the off-chain rubric document (delivery proof score,
+    /// timeliness score, counterparty-reputation score, etc.).
+    pub rubric_hash: BytesN<32>,
+    /// The oracle address that signed and submitted this evaluation.
+    pub oracle_signer: Address,
+    /// Unix timestamp after which a veto is no longer possible and
+    /// `finalize_recommended_resolution` may be called.
+    pub challenge_window_ends_at: u64,
+    /// `true` once the recommendation has been finalized (funds distributed).
+    pub finalized: bool,
+    /// `true` if buyer (customer) vetoed the recommendation during the window.
+    pub buyer_vetoed: bool,
+    /// `true` if seller (merchant) vetoed the recommendation during the window.
+    pub seller_vetoed: bool,
+}
+
+// ── Events for DisputeRubricEvaluation ──────────────────────────────────────
+
+/// Emitted when an oracle submits a rubric-weighted dispute recommendation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRubricSubmitted {
+    pub escrow_id: u64,
+    pub oracle_signer: Address,
+    pub recommended_buyer_bps: u32,
+    pub recommended_seller_bps: u32,
+    pub confidence_bps: u32,
+    pub challenge_window_ends_at: u64,
+}
+
+/// Emitted when a party vetoes a rubric recommendation (escalates to arbitration).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRubricVetoed {
+    pub escrow_id: u64,
+    pub vetoed_by: Address,
+    pub vetoed_at: u64,
+}
+
+/// Emitted when the challenge window closes and the rubric recommendation is
+/// automatically finalized (funds distributed proportionally).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRubricFinalized {
+    pub escrow_id: u64,
+    pub buyer_amount: i128,
+    pub seller_amount: i128,
+    pub finalized_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5452,6 +5539,346 @@ impl EscrowContract {
             confidence_bps,
         }
     }
+
+
+    // ── Issue #218: Rubric-weighted AI/Oracle dispute recommendation ─────────
+
+    /// Registers the authorized dispute oracle address and the fast-track
+    /// confidence threshold.  Only an admin may call this.
+    ///
+    /// # Arguments
+    /// * `env`                      - Soroban environment.
+    /// * `admin`                    - An active admin address.
+    /// * `oracle`                   - The oracle address that will be permitted
+    ///   to call `submit_dispute_recommendation`.
+    /// * `fast_track_threshold_bps` - Minimum `confidence_bps` required for
+    ///   permissionless finalization (e.g. `9_000` = 90 %).
+    ///
+    /// # Errors
+    /// Returns `BasicError::NotAnAdmin` if the caller is not an admin.
+    pub fn set_dispute_oracle(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        fast_track_threshold_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_dispute_oracle")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::DisputeOracle), &oracle);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::FastTrackThresholdBps),
+            &fast_track_threshold_bps,
+        );
+        Ok(())
+    }
+
+    /// Submits a rubric-weighted oracle recommendation for a disputed escrow.
+    ///
+    /// The caller must be the configured dispute oracle (set via
+    /// `set_dispute_oracle`).  The escrow must be in `Disputed` status.
+    ///
+    /// # Arguments
+    /// * `env`                      - Soroban environment.
+    /// * `oracle`                   - Oracle address (must match the registered oracle).
+    /// * `escrow_id`                - Disputed escrow.
+    /// * `recommended_buyer_bps`    - Fraction of escrow amount for the buyer,
+    ///   in basis points (0–10 000).
+    /// * `recommended_seller_bps`   - Fraction of escrow amount for the seller,
+    ///   in basis points (0–10 000).
+    ///   Invariant: `recommended_buyer_bps + recommended_seller_bps == 10_000`.
+    /// * `confidence_bps`           - Oracle confidence score (0–10 000).
+    /// * `rubric_hash`              - Hash of the off-chain rubric document.
+    /// * `challenge_window_seconds` - Duration (seconds) of the veto window.
+    ///
+    /// # Errors
+    /// * `NotDisputeOracle`         — caller is not the registered oracle.
+    /// * `NotDisputed`              — escrow is not in `Disputed` status.
+    /// * `InvalidRubricSplit`       — bps do not sum to 10 000.
+    /// * `RecommendationNotPending` — a pending evaluation already exists.
+    pub fn submit_dispute_recommendation(
+        env: Env,
+        oracle: Address,
+        escrow_id: u64,
+        recommended_buyer_bps: u32,
+        recommended_seller_bps: u32,
+        confidence_bps: u32,
+        rubric_hash: BytesN<32>,
+        challenge_window_seconds: u64,
+    ) -> Result<(), Error> {
+        oracle.require_auth();
+        Self::require_not_paused(&env, "submit_dispute_recommendation")?;
+
+        // Verify caller is the registered dispute oracle.
+        let registered_oracle: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::DisputeOracle));
+        match registered_oracle {
+            Some(ref addr) if *addr == oracle => {}
+            _ => return Err(Error::Action(ActionError::NotDisputeOracle)),
+        }
+
+        // Escrow must exist and be in Disputed status.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::NotDisputed));
+        }
+
+        // Enforce bps invariant.
+        if recommended_buyer_bps
+            .checked_add(recommended_seller_bps)
+            .unwrap_or(u32::MAX)
+            != 10_000
+        {
+            return Err(Error::Action(ActionError::InvalidRubricSplit));
+        }
+
+        // Reject a second submission when a non-finalized, non-vetoed evaluation exists.
+        let existing: Option<DisputeRubricEvaluation> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)));
+        if let Some(ref eval) = existing {
+            if !eval.finalized && !eval.buyer_vetoed && !eval.seller_vetoed {
+                return Err(Error::Action(ActionError::RecommendationNotPending));
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let challenge_window_ends_at = now.saturating_add(challenge_window_seconds);
+
+        let evaluation = DisputeRubricEvaluation {
+            escrow_id,
+            recommended_buyer_bps,
+            recommended_seller_bps,
+            confidence_bps,
+            rubric_hash,
+            oracle_signer: oracle.clone(),
+            challenge_window_ends_at,
+            finalized: false,
+            buyer_vetoed: false,
+            seller_vetoed: false,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)),
+            &evaluation,
+        );
+
+        DisputeRubricSubmitted {
+            escrow_id,
+            oracle_signer: oracle,
+            recommended_buyer_bps,
+            recommended_seller_bps,
+            confidence_bps,
+            challenge_window_ends_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Allows the buyer (customer) or seller (merchant) to veto an oracle
+    /// rubric recommendation during the challenge window, escalating the
+    /// dispute to full human / multi-party arbitration.
+    ///
+    /// # Arguments
+    /// * `env`       - Soroban environment.
+    /// * `caller`    - The buyer or seller who wishes to veto.
+    /// * `escrow_id` - The disputed escrow.
+    ///
+    /// # Errors
+    /// * `NotFound`                 - Escrow not found.
+    /// * `Unauthorized`             - Caller is neither buyer nor seller.
+    /// * `RecommendationNotPending` - No active evaluation exists.
+    /// * `RecommendationVetoed`     - Challenge window has already closed or
+    ///   the evaluation was already finalized / vetoed.
+    pub fn reject_dispute_recommendation(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "reject_dispute_recommendation")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let mut eval: DisputeRubricEvaluation = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)))
+            .ok_or(Error::Action(ActionError::RecommendationNotPending))?;
+
+        // Cannot veto once finalized.
+        if eval.finalized {
+            return Err(Error::Action(ActionError::RecommendationVetoed));
+        }
+        // Cannot veto after the challenge window has closed.
+        let now = env.ledger().timestamp();
+        if now >= eval.challenge_window_ends_at {
+            return Err(Error::Action(ActionError::RecommendationVetoed));
+        }
+
+        // Record the veto on the correct side.
+        if caller == escrow.customer {
+            eval.buyer_vetoed = true;
+        } else {
+            eval.seller_vetoed = true;
+        }
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)),
+            &eval,
+        );
+
+        DisputeRubricVetoed {
+            escrow_id,
+            vetoed_by: caller,
+            vetoed_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Permissionlessly finalizes a rubric recommendation once both conditions
+    /// are met:
+    ///
+    /// 1. The challenge window (`challenge_window_ends_at`) has passed without
+    ///    either party vetoing.
+    /// 2. The evaluation's `confidence_bps >= fast_track_threshold_bps`.
+    ///
+    /// Funds are distributed proportionally according to
+    /// `recommended_buyer_bps` / `recommended_seller_bps`.
+    ///
+    /// # Arguments
+    /// * `env`       - Soroban environment.
+    /// * `escrow_id` - The disputed escrow to finalize.
+    ///
+    /// # Errors
+    /// * `NotFound`                 - Escrow not found.
+    /// * `RecommendationNotPending` - No evaluation stored for this escrow.
+    /// * `RecommendationVetoed`     - A party vetoed; use standard arbitration.
+    /// * `ChallengeWindowOpen`      - Challenge window has not yet elapsed.
+    /// * `ConfidenceBelowFastTrack` - Confidence is below the fast-track threshold.
+    pub fn finalize_recommended_resolution(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "finalize_recommended_resolution")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let mut eval: DisputeRubricEvaluation = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)))
+            .ok_or(Error::Action(ActionError::RecommendationNotPending))?;
+
+        // A vetoed evaluation must go through standard arbitration.
+        if eval.buyer_vetoed || eval.seller_vetoed {
+            return Err(Error::Action(ActionError::RecommendationVetoed));
+        }
+        // An already-finalized evaluation cannot be executed twice.
+        if eval.finalized {
+            return Err(Error::Action(ActionError::RecommendationNotPending));
+        }
+
+        let now = env.ledger().timestamp();
+        // Challenge window must have closed.
+        if now < eval.challenge_window_ends_at {
+            return Err(Error::Action(ActionError::ChallengeWindowOpen));
+        }
+
+        // Confidence must meet or exceed the fast-track threshold.
+        let threshold_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::FastTrackThresholdBps))
+            .unwrap_or(9_000u32);
+        if eval.confidence_bps < threshold_bps {
+            return Err(Error::Action(ActionError::ConfidenceBelowFastTrack));
+        }
+
+        // ── CEI: mark finalized + update escrow status before any transfer ──
+        eval.finalized = true;
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::RubricEvaluation(escrow_id)),
+            &eval,
+        );
+        Self::dequeue_escalation(&env, escrow_id);
+
+        // Split (integer truncation; any dust goes to seller).
+        let total = escrow.amount;
+        let buyer_amount = total * eval.recommended_buyer_bps as i128 / 10_000i128;
+        let seller_amount = total - buyer_amount;
+
+        // Status: if buyer gets 0 the whole amount went to seller → Released.
+        escrow.status = if buyer_amount == 0 {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Resolved
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        // ── Token transfers ───────────────────────────────────────────────
+        if buyer_amount > 0 {
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.customer,
+                buyer_amount,
+            )?;
+        }
+        if seller_amount > 0 {
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                seller_amount,
+            )?;
+        }
+
+        DisputeRubricFinalized {
+            escrow_id,
+            buyer_amount,
+            seller_amount,
+            finalized_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
 
     /// Files a record or claim for an escrow.
     ///
