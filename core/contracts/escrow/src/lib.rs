@@ -379,12 +379,47 @@ pub struct EscalationConfig {
     pub favor: AutoResolveFavor,
 }
 
+/// Duration bracket for tiered escrow fees.
+///
+/// Escrows active longer than `min_duration_seconds` are charged `fee_bps`
+/// instead of the base rate.  Brackets are evaluated in ascending order of
+/// `min_duration_seconds`; the highest bracket that the escrow's elapsed
+/// lifetime satisfies wins.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowFeeDurationBracket {
+    /// Lower-bound (inclusive) on escrow duration in seconds for this tier.
+    pub min_duration_seconds: u64,
+    /// Fee in basis points applied to escrows in this duration bracket.
+    pub fee_bps: i128,
+}
+
+/// Issue #1: Duration- and dispute-aware tiered fee configuration.
+///
+/// Fee ladder:
+/// 1. Base `fee_bps` applies when no duration bracket matches.
+/// 2. `duration_brackets` (sorted ascending by `min_duration_seconds`) let
+///    long-lived agreements carry a higher per-basis-point rate than short
+///    clean settlements.
+/// 3. `dispute_surcharge_bps` is added on top of whichever rate is selected
+///    above whenever the escrow passed through a `Disputed` phase
+///    (`dispute_started_at > 0`).
 #[derive(Clone)]
 #[contracttype]
 pub struct EscrowFeeConfig {
+    /// Flat base fee in basis points (0–10 000).  Used when no
+    /// `duration_brackets` tier matches.
     pub fee_bps: i128,
+    /// Recipient of collected fees.
     pub fee_recipient: Address,
+    /// Whether fee collection is active at all.
     pub enabled: bool,
+    /// Additional fee in basis points charged for escrows that went through
+    /// dispute resolution.  Added on top of the bracket/base rate.
+    pub dispute_surcharge_bps: i128,
+    /// Optional duration-based tiers.  Each entry defines a floor duration;
+    /// the highest matching floor wins.  An empty `Vec` means no tiering.
+    pub duration_brackets: Vec<EscrowFeeDurationBracket>,
 }
 
 #[contractevent]
@@ -1828,7 +1863,41 @@ impl EscrowContract {
                 fee_bps: 0,
                 fee_recipient: env.current_contract_address(),
                 enabled: false,
+                dispute_surcharge_bps: 0,
+                duration_brackets: Vec::new(&env),
             })
+    }
+
+    /// Issue #1: Compute the effective fee basis points for an escrow release.
+    ///
+    /// Algorithm:
+    /// 1. Start with the base `fee_bps` from the stored `EscrowFeeConfig`.
+    /// 2. Walk `duration_brackets` (ascending `min_duration_seconds`).  The
+    ///    last bracket whose `min_duration_seconds` is ≤ the escrow's
+    ///    actual lifetime wins and replaces the base rate.
+    /// 3. If the escrow went through dispute (`dispute_started_at > 0`) add
+    ///    `dispute_surcharge_bps` on top.
+    /// 4. Cap the result at 10 000 bps (100 %).
+    fn compute_escrow_fee_bps(env: &Env, escrow: &Escrow, now: u64) -> i128 {
+        let config = Self::get_escrow_fee_config(env.clone());
+        if !config.enabled {
+            return 0;
+        }
+        let duration_secs = now.saturating_sub(escrow.created_at);
+        // Start with the base rate stored on the escrow (snapshot at creation).
+        let mut effective_bps = escrow.fee_bps;
+        // Walk brackets in ascending order; the last one that qualifies wins.
+        for bracket in config.duration_brackets.iter() {
+            if duration_secs >= bracket.min_duration_seconds {
+                effective_bps = bracket.fee_bps;
+            }
+        }
+        // Dispute surcharge.
+        if escrow.dispute_started_at > 0 {
+            effective_bps = effective_bps.saturating_add(config.dispute_surcharge_bps);
+        }
+        // Safety cap at 100 %.
+        effective_bps.min(10_000)
     }
 
     /// Returns accumulated escrow fees.
@@ -3980,7 +4049,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let fee_amount = (escrow.amount
+            * Self::compute_escrow_fee_bps(&env, &escrow, current_time))
+            / 10000;
         let merchant_amount = escrow.amount - fee_amount;
         let fee_config = Self::get_escrow_fee_config(env.clone());
 
@@ -7607,7 +7678,9 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-                let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+                let fee_amount = (escrow.amount
+                    * EscrowContract::compute_escrow_fee_bps(env, &escrow, env.ledger().timestamp()))
+                    / 10000;
                 let merchant_amount = escrow.amount - fee_amount;
                 let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
 
@@ -9905,7 +9978,9 @@ impl EscrowContract {
                 .instance()
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-            let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+            let fee_amount = (escrow.amount
+                * Self::compute_escrow_fee_bps(&env, &escrow, env.ledger().timestamp()))
+                / 10000;
             let merchant_amount = escrow.amount - fee_amount;
             let fee_config = Self::get_escrow_fee_config(env.clone());
 
