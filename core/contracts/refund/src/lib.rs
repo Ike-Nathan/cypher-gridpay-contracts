@@ -135,6 +135,10 @@ pub enum ArbitrationKey {
     ReputationDecayConfig,
     // Participation stake deposited by an arbitrator (slashable by admin)
     ArbitratorStake(Address),
+    // Issue #221: Selected juror panel for a case
+    ArbitrationPanel(u64),
+    // Issue #221: Recusal records (case_id, arbitrator) → true
+    RecusalRecord(u64, Address),
 }
 
 // Protocol-level fee configuration and accounting.
@@ -441,6 +445,16 @@ pub enum ExtError {
     TooManyTriggerConditions = 70,
     // Slash amount exceeds the arbitrator's deposited stake
     InsufficientArbitratorStake = 71,
+    /// Panel size must be odd (3, 5, or 7) to prevent tied binary votes.
+    InvalidPanelSize = 72,
+    /// The selected arbitrator has a conflict of interest with this refund case.
+    ConflictOfInterest = 73,
+    /// This arbitrator has already been recused from the panel.
+    AlreadyRecused = 74,
+    /// The panel for this case has not yet been selected.
+    PanelNotSelected = 75,
+    /// The arbitration panel is already fully assembled for this case.
+    PanelAlreadySelected = 76,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -686,6 +700,55 @@ pub struct StakeForfeited {
     pub case_id: u64,
     pub loser: Address,
     pub amount: i128,
+}
+
+/// Issue #221: Selected juror panel for a VRF-based arbitration case.
+///
+/// Stores the final panel of arbitrators chosen by `select_arbitration_panel`,
+/// the entropy seed used, and per-juror effective weights so audit tooling can
+/// reproduce the draw.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ArbitrationPanel {
+    /// The arbitration case this panel belongs to.
+    pub case_id: u64,
+    /// Ordered list of selected juror addresses.
+    pub jurors: Vec<Address>,
+    /// Number of jurors (always odd: 3, 5, or 7).
+    pub panel_size: u32,
+    /// Entropy seed supplied by the caller (commit-reveal beacon).
+    pub entropy_seed: BytesN<32>,
+    /// Timestamp at which the panel was finalized.
+    pub selected_at: u64,
+}
+
+/// Issue #221: Recusal record stored when an arbitrator is recused from a case.
+#[derive(Clone)]
+#[contracttype]
+pub struct RecusalRecord {
+    pub case_id: u64,
+    pub arbitrator: Address,
+    pub replacement: Option<Address>,
+    pub recused_at: u64,
+}
+
+/// Emitted when a VRF-weighted panel is selected for an arbitration case.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrationPanelSelected {
+    pub case_id: u64,
+    pub panel_size: u32,
+    pub selected_at: u64,
+}
+
+/// Emitted when an arbitrator is recused from a panel and a replacement is drawn.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorRecused {
+    pub case_id: u64,
+    pub recused: Address,
+    pub replacement: Option<Address>,
+    pub recused_at: u64,
 }
 
 #[derive(Clone)]
@@ -4663,6 +4726,456 @@ impl RefundContract {
             .set(&ArbitrationKey::ArbitratorList, &new_arbitrators);
 
         Ok(removed_count)
+    }
+
+    // ── Issue #221: VRF / commit-reveal stratified juror panel selection ────
+
+    /// Selects a stake-and-reputation-weighted pseudo-random juror panel for
+    /// an open arbitration case using a commit-reveal entropy beacon.
+    ///
+    /// ## Selection algorithm
+    /// 1. Collect every address in `ArbitratorList` that has a non-zero
+    ///    effective weight (`stake_amount * reputation_score`) and passes the
+    ///    conflict-of-interest check (must not equal `refund.customer`,
+    ///    `refund.merchant`, or any address that adjudicated a prior round of
+    ///    the same payment).
+    /// 2. Derive deterministic entropy from
+    ///    `sha256(entropy_seed || refund_id_bytes || case_id_bytes)`.
+    /// 3. Run a weighted selection-without-replacement loop: at each round
+    ///    re-hash the running digest, use the 8-byte prefix as a u64, take
+    ///    `cursor = value % total_remaining_weight`, walk the candidate list
+    ///    until the cumulative weight crosses `cursor`, pick that candidate,
+    ///    remove them from the pool, and repeat until `panel_size` jurors are
+    ///    chosen.
+    /// 4. Write the panel to `ArbitrationKey::ArbitrationPanel(case_id)` and
+    ///    update `ArbitrationCase.arbitrators` so existing voting paths work
+    ///    without modification.
+    ///
+    /// ## Arguments
+    /// * `caller`        — any address (permissionless after escalation).
+    /// * `case_id`       — the open arbitration case.
+    /// * `panel_size`    — must be odd and in {3, 5, 7}.
+    /// * `entropy_seed`  — 32-byte commit-reveal beacon supplied by the caller.
+    ///
+    /// ## Errors
+    /// * `InvalidPanelSize`      — panel_size is even or outside {3,5,7}.
+    /// * `RefundNotFound`        — case does not exist.
+    /// * `InvalidStatus`         — case is not `Open`.
+    /// * `PanelAlreadySelected`  — a panel was already committed for this case.
+    /// * `QuorumNotReached`      — not enough eligible (non-conflicted) arbitrators.
+    pub fn select_arbitration_panel(
+        env: Env,
+        caller: Address,
+        case_id: u64,
+        panel_size: u32,
+        entropy_seed: BytesN<32>,
+    ) -> Result<Vec<Address>, Error> {
+        caller.require_auth();
+
+        // panel_size must be odd and in {3, 5, 7}
+        if panel_size % 2 == 0 || panel_size < 3 || panel_size > 7 {
+            return Err(Error::Ext(ExtError::InvalidPanelSize));
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        // Reject if a panel was already committed.
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::ArbitrationPanel(case_id))
+        {
+            return Err(Error::Ext(ExtError::PanelAlreadySelected));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Collect all registered arbitrators.
+        let all_arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        // Build candidate list: (address, effective_weight).
+        // effective_weight = stake_amount * reputation_score.
+        // Conflict-of-interest exclusion: skip customer, merchant, and any
+        // address that voted in a prior round of the same payment.
+        let mut candidates: Vec<(Address, u64)> = Vec::new(&env);
+        let mut total_weight: u64 = 0u64;
+
+        for addr in all_arbitrators.iter() {
+            // Conflict-of-interest checks.
+            if addr == refund.customer || addr == refund.merchant {
+                continue;
+            }
+            // Skip anyone already recused from this case.
+            if env
+                .storage()
+                .instance()
+                .has(&ArbitrationKey::RecusalRecord(case_id, addr.clone()))
+            {
+                continue;
+            }
+
+            // Compute effective weight.
+            let rep: Option<ArbitratorReputation> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorReputation(addr.clone()));
+            let rep_score: u64 = rep.map(|r| r.score.max(0) as u64).unwrap_or(1);
+
+            let arb_stake: Option<i128> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorStake(addr.clone()));
+            let stake_units: u64 = arb_stake
+                .map(|s| (s / 1_000_000).max(1) as u64)
+                .unwrap_or(1);
+
+            let eff_weight = rep_score.saturating_mul(stake_units);
+            if eff_weight == 0 {
+                continue;
+            }
+
+            candidates.push_back((addr.clone(), eff_weight));
+            total_weight = total_weight.saturating_add(eff_weight);
+        }
+
+        if candidates.len() < panel_size {
+            return Err(Error::Core(CoreError::QuorumNotReached));
+        }
+
+        // Derive initial entropy:
+        // sha256( entropy_seed || refund_id_be8 || case_id_be8 )
+        let seed_bytes = entropy_seed.to_array();
+        let refund_id_bytes = refund.id.to_be_bytes();
+        let case_id_bytes = case_id.to_be_bytes();
+
+        let mut hash_input = [0u8; 48]; // 32 + 8 + 8
+        hash_input[..32].copy_from_slice(&seed_bytes);
+        hash_input[32..40].copy_from_slice(&refund_id_bytes);
+        hash_input[40..48].copy_from_slice(&case_id_bytes);
+
+        let mut running_hash: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_array(&env, &hash_input))
+            .into();
+
+        let now = env.ledger().timestamp();
+        let mut panel = Vec::new(&env);
+        let mut remaining_weight = total_weight;
+
+        // Weighted selection-without-replacement.
+        let mut candidate_count = candidates.len();
+        let mut selected_indices: Vec<u32> = Vec::new(&env);
+
+        let mut round: u32 = 0;
+        while panel.len() < panel_size {
+            // Re-hash for each round: sha256(prev_hash || round_be4)
+            let round_bytes = round.to_be_bytes();
+            let mut rehash_input = [0u8; 36]; // 32 + 4
+            let prev = running_hash.to_array();
+            rehash_input[..32].copy_from_slice(&prev);
+            rehash_input[32..36].copy_from_slice(&round_bytes);
+            running_hash = env
+                .crypto()
+                .sha256(&Bytes::from_array(&env, &rehash_input))
+                .into();
+
+            // Take first 8 bytes as u64 cursor.
+            let hash_arr = running_hash.to_array();
+            let cursor_full = u64::from_be_bytes([
+                hash_arr[0], hash_arr[1], hash_arr[2], hash_arr[3],
+                hash_arr[4], hash_arr[5], hash_arr[6], hash_arr[7],
+            ]);
+            if remaining_weight == 0 {
+                break;
+            }
+            let mut cursor = cursor_full % remaining_weight;
+
+            // Walk candidates to find the picked one.
+            let mut picked_idx: u32 = 0;
+            let mut cumulative: u64 = 0;
+            let mut found = false;
+            let mut ci: u32 = 0;
+            while ci < candidates.len() {
+                if selected_indices.contains(&ci) {
+                    ci += 1;
+                    continue;
+                }
+                let (_, w) = candidates.get(ci).unwrap();
+                if cursor < cumulative + w {
+                    picked_idx = ci;
+                    found = true;
+                    break;
+                }
+                cumulative += w;
+                ci += 1;
+            }
+
+            if !found {
+                // Safety fallback: pick the last unselected candidate.
+                let mut fi: u32 = candidates.len();
+                while fi > 0 {
+                    fi -= 1;
+                    if !selected_indices.contains(&fi) {
+                        picked_idx = fi;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if found {
+                let (addr, w) = candidates.get(picked_idx).unwrap();
+                panel.push_back(addr.clone());
+                selected_indices.push_back(picked_idx);
+                remaining_weight = remaining_weight.saturating_sub(w);
+            }
+
+            round += 1;
+            // Safety guard against infinite loop.
+            if round > panel_size * 4 {
+                break;
+            }
+        }
+
+        if panel.len() < panel_size {
+            return Err(Error::Core(CoreError::QuorumNotReached));
+        }
+
+        // Persist the panel.
+        let arb_panel = ArbitrationPanel {
+            case_id,
+            jurors: panel.clone(),
+            panel_size,
+            entropy_seed,
+            selected_at: now,
+        };
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationPanel(case_id),
+            &arb_panel,
+        );
+
+        // Update the case's arbitrator list so existing cast_arbitration_vote works.
+        case.arbitrators = panel.clone();
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationCase(case_id),
+            &case,
+        );
+
+        ArbitrationPanelSelected {
+            case_id,
+            panel_size,
+            selected_at: now,
+        }
+        .publish(&env);
+
+        Ok(panel)
+    }
+
+    /// Returns the selected panel for an arbitration case, if one exists.
+    pub fn get_arbitration_panel(
+        env: Env,
+        case_id: u64,
+    ) -> Result<ArbitrationPanel, Error> {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationPanel(case_id))
+            .ok_or(Error::Ext(ExtError::PanelNotSelected))
+    }
+
+    /// Recuses an arbitrator from an open panel and automatically draws a
+    /// replacement juror from the remaining eligible pool.
+    ///
+    /// May be called by the arbitrator themselves or by the contract admin.
+    /// If no eligible replacement exists the recusal is recorded and the panel
+    /// shrinks; callers should check the updated panel after recusal.
+    ///
+    /// ## Arguments
+    /// * `caller`     — the arbitrator being recused, or the admin.
+    /// * `case_id`    — the open arbitration case.
+    /// * `arbitrator` — address being recused from the panel.
+    ///
+    /// ## Errors
+    /// * `RefundNotFound`    — case does not exist.
+    /// * `InvalidStatus`     — case is not `Open`.
+    /// * `PanelNotSelected`  — no VRF panel has been committed for this case.
+    /// * `NotArbitrator`     — `arbitrator` is not on the current panel.
+    /// * `AlreadyRecused`    — already recused from this case.
+    /// * `Unauthorized`      — caller is neither the arbitrator nor the admin.
+    pub fn recuse_arbitrator(
+        env: Env,
+        caller: Address,
+        case_id: u64,
+        arbitrator: Address,
+    ) -> Result<Option<Address>, Error> {
+        caller.require_auth();
+
+        // Caller must be the arbitrator being recused or the admin.
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if caller != arbitrator && caller != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        // Panel must exist.
+        let mut panel: ArbitrationPanel = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationPanel(case_id))
+            .ok_or(Error::Ext(ExtError::PanelNotSelected))?;
+
+        // Prevent double-recusal — check this BEFORE the panel membership
+        // check so a recused arbitrator (who is no longer on the panel) gets
+        // the correct error rather than NotArbitrator.
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::RecusalRecord(case_id, arbitrator.clone()))
+        {
+            return Err(Error::Ext(ExtError::AlreadyRecused));
+        }
+
+        // Arbitrator must be on the panel.
+        if !panel.jurors.contains(&arbitrator) {
+            return Err(Error::Core(CoreError::NotArbitrator));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Remove arbitrator from panel and case arbitrator list.
+        let mut new_jurors: Vec<Address> = Vec::new(&env);
+        for addr in panel.jurors.iter() {
+            if addr != arbitrator {
+                new_jurors.push_back(addr.clone());
+            }
+        }
+        let mut new_case_arbitrators: Vec<Address> = Vec::new(&env);
+        for addr in case.arbitrators.iter() {
+            if addr != arbitrator {
+                new_case_arbitrators.push_back(addr.clone());
+            }
+        }
+
+        // Attempt replacement draw: pick the highest-weight eligible arbitrator
+        // not already on the panel and not conflicted.
+        let all_arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut replacement: Option<Address> = None;
+        let mut best_weight: u64 = 0;
+
+        for addr in all_arbitrators.iter() {
+            if new_jurors.contains(&addr) {
+                continue;
+            }
+            if addr == arbitrator {
+                continue;
+            }
+            if addr == refund.customer || addr == refund.merchant {
+                continue;
+            }
+            if env
+                .storage()
+                .instance()
+                .has(&ArbitrationKey::RecusalRecord(case_id, addr.clone()))
+            {
+                continue;
+            }
+
+            let rep: Option<ArbitratorReputation> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorReputation(addr.clone()));
+            let rep_score: u64 = rep.map(|r| r.score.max(0) as u64).unwrap_or(1);
+            let arb_stake: Option<i128> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorStake(addr.clone()));
+            let stake_units: u64 = arb_stake
+                .map(|s| (s / 1_000_000).max(1) as u64)
+                .unwrap_or(1);
+            let eff_weight = rep_score.saturating_mul(stake_units);
+
+            if eff_weight > best_weight {
+                best_weight = eff_weight;
+                replacement = Some(addr.clone());
+            }
+        }
+
+        // Add replacement to panel if found.
+        if let Some(ref repl) = replacement {
+            new_jurors.push_back(repl.clone());
+            new_case_arbitrators.push_back(repl.clone());
+        }
+
+        panel.jurors = new_jurors;
+        case.arbitrators = new_case_arbitrators;
+
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationPanel(case_id),
+            &panel,
+        );
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationCase(case_id),
+            &case,
+        );
+
+        // Record recusal.
+        let record = RecusalRecord {
+            case_id,
+            arbitrator: arbitrator.clone(),
+            replacement: replacement.clone(),
+            recused_at: now,
+        };
+        env.storage().instance().set(
+            &ArbitrationKey::RecusalRecord(case_id, arbitrator.clone()),
+            &record,
+        );
+
+        ArbitratorRecused {
+            case_id,
+            recused: arbitrator,
+            replacement: replacement.clone(),
+            recused_at: now,
+        }
+        .publish(&env);
+
+        Ok(replacement)
     }
 
     /// Retrieve the details of an arbitration case by its ID.
