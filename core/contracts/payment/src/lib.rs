@@ -182,6 +182,9 @@ pub enum BasicError {
     // Issue #88: a data migration step failed, so the schema version must
     // not be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 127,
+    // Issue #3: a string field contains raw PII (email, phone, or tax ID)
+    // that must not be stored on the immutable public ledger.
+    PiiDetected = 128,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -397,6 +400,9 @@ pub enum FeatureError {
     /// Balance sum mismatch. The settlement amounts do not sum to the deposit.
     BalanceSumMismatch = 541,
     InsufficientBalanceForSweep = 542,
+    /// Structuring / smurfing detected: cumulative payment volume within the rolling window
+    /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
+    StructuringDetected = 543,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -442,7 +448,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 542 {
+            if code >= 500 && code <= 543 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
             if code >= 400 && code <= 406 {
@@ -454,7 +460,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 224 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 127 {
+            if code >= 100 && code <= 128 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -497,6 +503,14 @@ pub enum CustomerDataKey {
     MerchantCount(Address),
     MonthlyVolume(Address, u64),
     HourCount(Address, u32),
+    /// Cumulative payment volume from this address within the structuring detection window.
+    VelocityWindowVolume(Address),
+    /// Timestamp when the current velocity detection window started.
+    VelocityWindowStart(Address),
+    /// Net position for bilateral energy market clearing: (party_a, party_b) → i128
+    /// Positive means party_a owes party_b; negative means party_b owes party_a.
+    NetPosition(Address, Address),
+    NetPositionWindowStart(Address, Address),
 }
 
 // Merchant-specific data keys
@@ -1831,6 +1845,21 @@ pub struct PaymentAnalytics {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct NetPosition {
+    pub party_a: Address,
+    pub party_b: Address,
+    /// Net amount: positive = party_a owes party_b, negative = party_b owes party_a.
+    pub net_amount: i128,
+    /// Token used for settlement.
+    pub token: Address,
+    /// Timestamp of last position update.
+    pub last_updated: u64,
+    /// Timestamp of the current netting window start.
+    pub window_start: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct MerchantAnalytics {
     pub total_payments: u64,
     pub total_volume: i128,
@@ -2972,6 +3001,73 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Detect structuring / smurfing: accumulate the payer's payment volume within
+    /// a rolling window and flag when the total would have triggered `LargePaymentProposal`
+    /// if it had been sent as a single payment.
+    ///
+    /// Window size defaults to 3600 seconds (1 hour); configurable via the same
+    /// `large_payment_threshold` that governs single-payment timelocks.
+    fn check_velocity_structuring(
+        env: &Env,
+        customer: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        // If no threshold is configured, structuring detection is disabled.
+        if threshold <= 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        // Rolling window: 1 hour (3600 seconds).
+        const VELOCITY_WINDOW_SECONDS: u64 = 3600;
+
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::VelocityWindowStart(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let window_volume: i128 = if now.saturating_sub(window_start) < VELOCITY_WINDOW_SECONDS {
+            // Still within the rolling window — accumulate.
+            env.storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::VelocityWindowVolume(
+                    customer.clone(),
+                )))
+                .unwrap_or(0)
+        } else {
+            // Window has expired — start fresh.
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+            0
+        };
+
+        let new_volume = window_volume.saturating_add(amount);
+
+        if new_volume > threshold {
+            return Err(Error::Feature(FeatureError::StructuringDetected));
+        }
+
+        // Persist updated window state.
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::VelocityWindowVolume(customer.clone())),
+            &new_volume,
+        );
+        if window_start == 0 || now.saturating_sub(window_start) >= VELOCITY_WINDOW_SECONDS {
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+        }
+
+        Ok(())
+    }
+
     fn do_create_payment(
         env: &Env,
         customer: Address,
@@ -3015,6 +3111,9 @@ impl PaymentContract {
 
         // Check customer spend limit (#217)
         PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
+
+        // Issue #2: detect structuring / smurfing (split payments below threshold).
+        PaymentContract::check_velocity_structuring(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -13488,6 +13587,68 @@ impl PaymentContract {
         } else {
             false
         }
+    }
+
+    /// Scan a string field for patterns that look like PII (emails, phone numbers,
+    /// tax IDs / SSNs) and reject them to enforce GDPR/CCPA data-minimization on
+    /// the immutable public ledger.
+    ///
+    /// Detection rules (byte-level, no regex engine available in no_std Soroban):
+    /// - Email: contains '@' preceded and followed by at least one non-'@' byte.
+    /// - Phone: 10+ consecutive digit bytes (possibly separated by spaces, dashes,
+    ///   or dots), e.g. `+14155552671` or `415-555-2671`.
+    /// - SSN/Tax ID: pattern `DDD-DD-DDDD` or `DD.DDD.DDD-DD` (9+ digit cluster).
+    fn check_pii_free(env: &Env, text: &String) -> Result<(), Error> {
+        // Convert to raw bytes for scanning.
+        let bytes = text.to_xdr(env);
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // --- Email detection: look for '@' with at least one char before and after ---
+        let mut at_pos: Option<u32> = None;
+        let mut i: u32 = 0;
+        while i < len {
+            if bytes.get(i).unwrap_or(0) == 64u8 { // '@'
+                at_pos = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(pos) = at_pos {
+            if pos > 0 && pos + 1 < len {
+                return Err(Error::Basic(BasicError::PiiDetected));
+            }
+        }
+
+        // --- Phone / Tax-ID detection: count consecutive digit-or-separator runs ---
+        // A run of >=9 digits (with optional spaces, dashes, dots, parens, '+') is flagged.
+        let mut digit_run: u32 = 0;
+        let mut k: u32 = 0;
+        while k < len {
+            let b = bytes.get(k).unwrap_or(0);
+            if b >= 48u8 && b <= 57u8 { // '0'..'9'
+                digit_run += 1;
+                if digit_run >= 9 {
+                    return Err(Error::Basic(BasicError::PiiDetected));
+                }
+            } else if b == 32u8  // space
+                || b == 45u8     // '-'
+                || b == 46u8     // '.'
+                || b == 40u8     // '('
+                || b == 41u8     // ')'
+                || b == 43u8     // '+'
+            {
+                // Separator — keep the digit run going if we already have digits.
+                // (Allows separators within phone numbers)
+            } else {
+                digit_run = 0;
+            }
+            k += 1;
+        }
+
+        Ok(())
     }
 
     fn validate_bps(bps: u32) -> Result<(), Error> {

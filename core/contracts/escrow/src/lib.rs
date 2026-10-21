@@ -118,6 +118,10 @@ pub enum DisputeKey {
     AppealRecord(u64, u64),
     LiquidationConfig,
     LiquidationHistory(u64),
+    /// Configuration for minimum buyer inspection window after deliverable submission.
+    InspectionWindowConfig,
+    /// Record of a submitted milestone deliverable for an escrow.
+    DeliverableRecord(u64),
 }
 
 #[derive(Clone)]
@@ -234,6 +238,9 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    /// Inspection window has been extended because deliverable was submitted near deadline.
+    /// Resolution: wait for the extended inspection window to expire before releasing.
+    InspectionWindowExtended = 231,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
