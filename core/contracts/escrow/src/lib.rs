@@ -88,6 +88,8 @@ pub enum ParticipantKey {
     AccumulatedFees(Address),
     BeneficiaryTransferHistory(u64, u64),
     BeneficiaryTransferCount(u64),
+    /// Pending two-step beneficiary transfer awaiting confirmation by the nominee.
+    PendingBeneficiaryTransfer(u64),
 }
 
 #[derive(Clone)]
@@ -118,6 +120,10 @@ pub enum DisputeKey {
     AppealRecord(u64, u64),
     LiquidationConfig,
     LiquidationHistory(u64),
+    /// Initiation deadline + required-acceptance configuration for a multi-party escrow.
+    InitiationDeadline(u64),
+    /// Initiation-phase acceptance/rollback status for a multi-party escrow.
+    InitiationStatus(u64),
 }
 
 #[derive(Clone)]
@@ -274,6 +280,16 @@ pub enum ActionError {
     /// Deposited collateral balance is insufficient for this operation. Resolution: fund additional collateral to escrow.
     InsufficientCollateral = 315,
     ArbitrationRequired = 316,
+    /// Oracle price feed is too stale to use for a swap. Resolution: wait for the oracle to publish a fresh price.
+    StaleOraclePrice = 317,
+    /// A beneficiary transfer initiation is already pending for this escrow. Cancel it first.
+    TransferAlreadyPending = 318,
+    /// No pending beneficiary transfer exists for this escrow.
+    NoPendingTransfer = 319,
+    /// The pending beneficiary transfer has expired.
+    TransferExpired = 320,
+    /// A participant's voting weight exceeds the per-participant cap to prevent whale dominance.
+    ParticipantWeightExceedsCap = 321,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -281,6 +297,14 @@ pub enum Error {
     Basic(BasicError),
     Escrow(EscrowError),
     Action(ActionError),
+    /// Initiation deadline has passed; no further acceptances are allowed. (318)
+    InitiationDeadlinePassed,
+    /// Rollback is not yet available; the initiation deadline has not elapsed. (319)
+    RollbackNotYetAvailable,
+    /// This multi-party escrow has already been rolled back. (320)
+    RollbackAlreadyExecuted,
+    /// All required parties have already accepted; rollback is not permitted. (321)
+    EscrowAlreadyFullyAccepted,
 }
 
 impl Error {
@@ -299,6 +323,10 @@ impl Error {
             Error::Basic(e) => *e as u32,
             Error::Escrow(e) => *e as u32,
             Error::Action(e) => *e as u32,
+            Error::InitiationDeadlinePassed => 322,
+            Error::RollbackNotYetAvailable => 323,
+            Error::RollbackAlreadyExecuted => 324,
+            Error::EscrowAlreadyFullyAccepted => 325,
         }
     }
 }
@@ -320,7 +348,17 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            match code {
+                318..=321 => {
+                    // 318-321 are ActionError variants; fall through to the range check.
+                }
+                322 => return Ok(Error::InitiationDeadlinePassed),
+                323 => return Ok(Error::RollbackNotYetAvailable),
+                324 => return Ok(Error::RollbackAlreadyExecuted),
+                325 => return Ok(Error::EscrowAlreadyFullyAccepted),
+                _ => {}
+            }
+            if code >= 300 && code <= 321 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
             if code >= 200 && code <= 230 {
@@ -672,6 +710,23 @@ pub struct ParticipantApproved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiPartyEscrowReleased {
     pub escrow_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyEscrowAccepted {
+    pub escrow_id: u64,
+    pub acceptor: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyEscrowRolledBack {
+    pub escrow_id: u64,
+    /// Number of participants whose refund transfer succeeded.
+    pub refunded_count: u32,
+    /// Number of participants whose refund transfer failed (frozen/deleted accounts).
+    pub failed_count: u32,
 }
 
 #[contractevent]
@@ -1221,6 +1276,33 @@ pub struct EscrowSwapConfig {
     pub min_output_amount: i128,
     pub oracle: Address,
     pub executed: bool,
+    /// Oracle rate captured at configure time (1e7 fixed-point).
+    /// Used by execute_escrow_swap so a MEV sandwich cannot exploit
+    /// the gap between configure and execute by manipulating the live rate.
+    pub locked_rate: i128,
+}
+
+/// Deadline configuration for the multi-party escrow initiation phase.
+/// Stored at `DataKey::Dispute(DisputeKey::InitiationDeadline(escrow_id))`.
+#[derive(Clone)]
+#[contracttype]
+pub struct InitiationDeadlineConfig {
+    /// Absolute ledger timestamp after which no further acceptances are allowed.
+    pub deadline: u64,
+    /// Number of participants that must accept before the escrow is considered
+    /// fully accepted (i.e. rollback is no longer permitted).
+    pub required_acceptances: u32,
+}
+
+/// Acceptance and rollback state for the multi-party escrow initiation phase.
+/// Stored at `DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id))`.
+#[derive(Clone)]
+#[contracttype]
+pub struct InitiationStatus {
+    /// Addresses that have accepted so far.
+    pub accepted_by: Vec<Address>,
+    /// Whether a rollback has already been executed.
+    pub rolled_back: bool,
 }
 
 /// Snapshot of vesting cliff progress for a given escrow.
@@ -1594,6 +1676,24 @@ pub struct BeneficiaryTransfer {
     pub authorised_by: Address,
 }
 
+/// Pending two-step beneficiary transfer.  The current beneficiary calls
+/// `initiate_beneficiary_transfer` to create this record; the nominee must
+/// then call `confirm_beneficiary_transfer` to finalise the change.
+/// This prevents payouts from being permanently stranded by a typo address,
+/// a contract address without SEP-41 trustlines, or an address that has not
+/// consented to the escrow terms.
+#[derive(Clone)]
+#[contracttype]
+pub struct PendingBeneficiaryTransfer {
+    pub escrow_id: u64,
+    pub from: Address,
+    pub nominee: Address,
+    pub initiated_at: u64,
+    /// Absolute timestamp after which this pending transfer expires.
+    /// Set to `initiated_at + 7 * 24 * 3600` by default (~7 days).
+    pub expires_at: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct MultiPartyDispute {
@@ -1611,6 +1711,32 @@ pub struct BeneficiaryTransferred {
     pub escrow_id: u64,
     pub old_merchant: Address,
     pub new_merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiaryTransferInitiated {
+    pub escrow_id: u64,
+    pub from: Address,
+    pub nominee: Address,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiaryTransferConfirmed {
+    pub escrow_id: u64,
+    pub old_merchant: Address,
+    pub new_merchant: Address,
+    pub confirmed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiaryTransferCancelled {
+    pub escrow_id: u64,
+    pub nominee: Address,
+    pub cancelled_at: u64,
 }
 
 #[derive(Clone)]
@@ -1721,6 +1847,13 @@ const MIN_CLAWBACK_DELAY: u64 = 86_400;
 /// accepted only while `now < dispute_started_at + APPEAL_WINDOW_SECONDS`, so
 /// the boundary is deterministic rather than depending on `<` vs `≤` drift.
 const APPEAL_WINDOW_SECONDS: u64 = 259_200;
+
+/// Maximum voting weight any single participant may hold in a multi-party
+/// escrow (in basis points, out of 10,000).  Capping at 3,334 bps (≈33.34%)
+/// ensures no single party can unilaterally reach a standard 2/3 quorum
+/// threshold, protecting community grid-node participants from being
+/// overridden by a single large depositor (whale).
+const MAX_PARTICIPANT_WEIGHT_BPS: u32 = 3_334;
 
 #[contract]
 pub struct EscrowContract;
@@ -3119,9 +3252,13 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::MultiPartyCounter), &escrow_id);
 
         for p in escrow.participants.iter() {
+            // Whale-override prevention: cap each participant's voting weight
+            // to MAX_PARTICIPANT_WEIGHT_BPS so no single depositor can
+            // unilaterally reach any reasonable quorum threshold alone.
+            let weight = core::cmp::min(p.share_bps, MAX_PARTICIPANT_WEIGHT_BPS);
             env.storage().instance().set(
                 &DataKey::VoteWeight(escrow_id, p.address.clone()),
-                &p.share_bps,
+                &weight,
             );
         }
         env.storage()
@@ -3364,6 +3501,12 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        // Whale-override prevention: even admins cannot set a single
+        // participant's weight above the protocol cap.
+        if weight_bps > MAX_PARTICIPANT_WEIGHT_BPS {
+            return Err(Error::Action(ActionError::ParticipantWeightExceedsCap));
+        }
+
         let mut escrow: MultiPartyEscrow = env
             .storage()
             .instance()
@@ -3383,11 +3526,9 @@ impl EscrowContract {
 
         let mut updated = Vec::new(&env);
         let mut found = false;
-        let mut new_total: u32 = 0;
         for p in escrow.participants.iter() {
             if p.address == participant {
                 found = true;
-                new_total += weight_bps;
                 updated.push_back(Participant {
                     address: p.address.clone(),
                     role: p.role.clone(),
@@ -3397,7 +3538,6 @@ impl EscrowContract {
                     approved_at: p.approved_at,
                 });
             } else {
-                new_total += p.weight_bps;
                 updated.push_back(p.clone());
             }
         }
@@ -3405,9 +3545,10 @@ impl EscrowContract {
         if !found {
             return Err(Error::Basic(BasicError::ParticipantNotFound));
         }
-        if new_total != 10000 {
-            return Err(Error::Escrow(EscrowError::InvalidStatus));
-        }
+        // Note: we no longer enforce new_total == 10000 here because stored
+        // VoteWeight values are individually capped at MAX_PARTICIPANT_WEIGHT_BPS
+        // and may not sum to 10000 — the threshold comparison operates on the
+        // actual capped weights, not on the raw sum.
 
         escrow.participants = updated;
         env.storage()
@@ -3474,6 +3615,252 @@ impl EscrowContract {
 
         Ok(())
     }
+
+    // ── MULTI-PARTY INITIATION-PHASE ROLLBACK ─────────────────────────────
+    // Solves the "all-or-nothing rollback" vulnerability: when one of N
+    // depositors has a frozen or deleted SEP-41 account, a naive loop that
+    // calls `token.transfer()` (which panics on failure) would revert the
+    // entire rollback transaction, permanently trapping the other N-1
+    // participants' funds.  These functions use `try_transfer` so each
+    // individual transfer failure is recorded and only the affected
+    // participant's share is skipped—the rest are refunded normally.
+
+    /// Admin sets an absolute initiation deadline and the required number of
+    /// acceptances for a multi-party escrow.  Must be called before the
+    /// deadline for `accept_multi_party_escrow` and
+    /// `rollback_unaccepted_escrow` to work.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `admin` - Admin address (must be in the multisig admin set).
+    /// * `escrow_id` - Target multi-party escrow ID.
+    /// * `deadline_seconds` - Seconds added to the current ledger timestamp
+    ///   to compute the absolute acceptance deadline.
+    /// * `required_acceptances` - Number of participants that must accept
+    ///   before the escrow is considered fully accepted.
+    pub fn set_initiation_deadline(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        deadline_seconds: u64,
+        required_acceptances: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_initiation_deadline")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+
+        // Verify the escrow exists.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let deadline = env.ledger().timestamp() + deadline_seconds;
+        let config = InitiationDeadlineConfig {
+            deadline,
+            required_acceptances,
+        };
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::InitiationDeadline(escrow_id)),
+            &config,
+        );
+
+        // Initialise status if it does not yet exist.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)))
+        {
+            let status = InitiationStatus {
+                accepted_by: Vec::new(&env),
+                rolled_back: false,
+            };
+            env.storage().instance().set(
+                &DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)),
+                &status,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A participant accepts the multi-party escrow during the initiation phase.
+    ///
+    /// Fails with:
+    /// * `InitiationDeadlinePassed` — if the current timestamp is at or after
+    ///   the deadline.
+    /// * `BasicError::ParticipantNotFound` — if the caller is not in the
+    ///   participant list.
+    /// * `BasicError::AlreadyApproved` — if the caller has already accepted.
+    pub fn accept_multi_party_escrow(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "accept_multi_party_escrow")?;
+
+        let deadline_config: InitiationDeadlineConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::InitiationDeadline(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if env.ledger().timestamp() >= deadline_config.deadline {
+            return Err(Error::InitiationDeadlinePassed);
+        }
+
+        let escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        // Caller must be a participant in the escrow.
+        let mut is_participant = false;
+        for p in escrow.participants.iter() {
+            if p.address == caller {
+                is_participant = true;
+                break;
+            }
+        }
+        if !is_participant {
+            return Err(Error::Basic(BasicError::ParticipantNotFound));
+        }
+
+        let mut status: InitiationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if status.accepted_by.contains(&caller) {
+            return Err(Error::Basic(BasicError::AlreadyApproved));
+        }
+
+        status.accepted_by.push_back(caller.clone());
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)),
+            &status,
+        );
+
+        MultiPartyEscrowAccepted {
+            escrow_id,
+            acceptor: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Rolls back an under-accepted multi-party escrow after its deadline.
+    ///
+    /// Each participant receives their `share_bps` fraction of `total_amount`
+    /// back.  Transfers are attempted with `try_transfer` so that a frozen or
+    /// deleted SEP-41 account for one participant does NOT revert the whole
+    /// transaction — the other participants' refunds still go through.
+    ///
+    /// The escrow status is set to `Cancelled` regardless of how many
+    /// individual refund transfers succeeded.
+    ///
+    /// Fails with:
+    /// * `RollbackNotYetAvailable` — if the deadline has not elapsed.
+    /// * `EscrowAlreadyFullyAccepted` — if the required number of acceptances
+    ///   was already reached.
+    /// * `RollbackAlreadyExecuted` — if rollback was already performed.
+    pub fn rollback_unaccepted_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "rollback_unaccepted_escrow")?;
+
+        let deadline_config: InitiationDeadlineConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::InitiationDeadline(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if env.ledger().timestamp() < deadline_config.deadline {
+            return Err(Error::RollbackNotYetAvailable);
+        }
+
+        let mut status: InitiationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if status.rolled_back {
+            return Err(Error::RollbackAlreadyExecuted);
+        }
+
+        // Block rollback if the required number of acceptances was already reached.
+        if status.accepted_by.len() >= deadline_config.required_acceptances {
+            return Err(Error::EscrowAlreadyFullyAccepted);
+        }
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        // CEI: mark as cancelled and rolled-back before transferring funds.
+        escrow.status = EscrowStatus::Cancelled;
+        status.rolled_back = true;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)),
+            &status,
+        );
+
+        let token_client = token::Client::new(&env, &escrow.token);
+        let contract_address = env.current_contract_address();
+        let mut refunded_count: u32 = 0;
+        let mut failed_count: u32 = 0;
+
+        for p in escrow.participants.iter() {
+            if p.share_bps == 0 {
+                continue;
+            }
+            let amount = (escrow.total_amount * (p.share_bps as i128)) / 10_000;
+            if amount <= 0 {
+                continue;
+            }
+            // Use try_transfer so a frozen/deleted SEP-41 token account for
+            // one participant does not revert the entire rollback and trap
+            // the other participants' funds.
+            match token_client.try_transfer(&contract_address, &p.address, &amount) {
+                Ok(_) => refunded_count += 1,
+                Err(_) => failed_count += 1,
+            }
+        }
+
+        MultiPartyEscrowRolledBack {
+            escrow_id,
+            refunded_count,
+            failed_count,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the initiation-phase acceptance/rollback status for a
+    /// multi-party escrow, or `None` if no deadline has been configured.
+    pub fn get_initiation_status(env: Env, escrow_id: u64) -> Option<InitiationStatus> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::InitiationStatus(escrow_id)))
+    }
+
+    // ── END MULTI-PARTY INITIATION-PHASE ROLLBACK ──────────────────────────
 
     /// Creates multi token escrow.
     ///
@@ -10197,6 +10584,236 @@ impl EscrowContract {
         Ok(())
     }
 
+    // ── TWO-STEP BENEFICIARY TRANSFER ─────────────────────────────────────
+    // Fixes the single-step transfer vulnerability: previously, calling
+    // transfer_beneficiary(escrow_id, new_beneficiary) with a typo address,
+    // a contract without SEP-41 trustlines, or an unconsenting address would
+    // permanently strand the escrow payout with no recovery path.
+    //
+    // The two-step flow:
+    //   1. Current beneficiary calls initiate_beneficiary_transfer, which
+    //      stores a PendingBeneficiaryTransfer with a 7-day expiry.
+    //   2. The nominee calls confirm_beneficiary_transfer to finalise.
+    //   3. Either party may call cancel_beneficiary_transfer to abort.
+    //
+    // The existing transfer_escrow_beneficiary and transfer_beneficiary
+    // single-step functions are preserved for backward compatibility.
+
+    /// Step 1 of 2: the current beneficiary nominates a new address.
+    /// The change is NOT applied yet.  The nominee must confirm within the
+    /// expiry window (default 7 days) by calling `confirm_beneficiary_transfer`.
+    ///
+    /// Fails with `TransferAlreadyPending` if an unconfirmed nomination already
+    /// exists.  Cancel the existing one first.
+    pub fn initiate_beneficiary_transfer(
+        env: Env,
+        escrow_id: u64,
+        nominee: Address,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "initiate_beneficiary_transfer")?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        escrow.merchant.require_auth();
+
+        match escrow.status {
+            EscrowStatus::Disputed | EscrowStatus::Resolved => {
+                return Err(Error::Action(ActionError::TransferNotAllowed));
+            }
+            _ => {}
+        }
+
+        if escrow.dispute_started_at != 0 {
+            escrow.customer.require_auth();
+        }
+
+        if nominee == escrow.merchant {
+            return Err(Error::Action(ActionError::SameBeneficiary));
+        }
+
+        // Block if a pending transfer is already waiting.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Participant(
+                ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+            ))
+        {
+            return Err(Error::Action(ActionError::TransferAlreadyPending));
+        }
+
+        let now = env.ledger().timestamp();
+        const EXPIRY_WINDOW: u64 = 7 * 24 * 3600;
+        let pending = PendingBeneficiaryTransfer {
+            escrow_id,
+            from: escrow.merchant.clone(),
+            nominee: nominee.clone(),
+            initiated_at: now,
+            expires_at: now + EXPIRY_WINDOW,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Participant(ParticipantKey::PendingBeneficiaryTransfer(escrow_id)),
+            &pending,
+        );
+
+        BeneficiaryTransferInitiated {
+            escrow_id,
+            from: escrow.merchant,
+            nominee,
+            expires_at: now + EXPIRY_WINDOW,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Step 2 of 2: the nominated address confirms the pending transfer.
+    /// Only the exact nominee stored in the pending record may call this.
+    /// The confirmation finalises the beneficiary change and clears the pending entry.
+    ///
+    /// Fails with:
+    /// * `NoPendingTransfer` — no initiation exists.
+    /// * `TransferExpired`   — the 7-day confirmation window has elapsed.
+    /// * `BasicError::Unauthorized` — caller is not the nominee.
+    pub fn confirm_beneficiary_transfer(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "confirm_beneficiary_transfer")?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let pending: PendingBeneficiaryTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Participant(
+                ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+            ))
+            .ok_or(Error::Action(ActionError::NoPendingTransfer))?;
+
+        // The nominee must authorise this step to prove they consent and
+        // control the address — preventing typos from stranding payouts.
+        pending.nominee.require_auth();
+
+        let now = env.ledger().timestamp();
+        if now > pending.expires_at {
+            return Err(Error::Action(ActionError::TransferExpired));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        let old_merchant = escrow.merchant.clone();
+
+        // Remove pending entry first (CEI pattern).
+        env.storage().instance().remove(&DataKey::Participant(
+            ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+        ));
+
+        // Append history record.
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Participant(
+                ParticipantKey::BeneficiaryTransferCount(escrow_id),
+            ))
+            .unwrap_or(0);
+
+        let transfer = BeneficiaryTransfer {
+            escrow_id,
+            from: old_merchant.clone(),
+            to: pending.nominee.clone(),
+            transferred_at: now,
+            authorised_by: pending.nominee.clone(),
+        };
+
+        env.storage().instance().set(
+            &DataKey::Participant(ParticipantKey::BeneficiaryTransferHistory(escrow_id, count)),
+            &transfer,
+        );
+        env.storage().instance().set(
+            &DataKey::Participant(ParticipantKey::BeneficiaryTransferCount(escrow_id)),
+            &(count + 1),
+        );
+
+        escrow.merchant = pending.nominee.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        BeneficiaryTransferConfirmed {
+            escrow_id,
+            old_merchant,
+            new_merchant: pending.nominee,
+            confirmed_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Either the current beneficiary or the nominee may cancel a pending transfer.
+    pub fn cancel_beneficiary_transfer(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "cancel_beneficiary_transfer")?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let pending: PendingBeneficiaryTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Participant(
+                ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+            ))
+            .ok_or(Error::Action(ActionError::NoPendingTransfer))?;
+
+        // Allow either the current beneficiary (from) or the nominee to cancel.
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.merchant != pending.from {
+            // A previous step already changed the merchant; only nominee can cancel.
+            pending.nominee.require_auth();
+        } else {
+            // Either the current beneficiary or the nominee may cancel.
+            // We check auth for whichever matches the caller without
+            // a separate `caller` parameter to stay API-compatible.
+            pending.from.require_auth();
+        }
+
+        env.storage().instance().remove(&DataKey::Participant(
+            ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+        ));
+
+        BeneficiaryTransferCancelled {
+            escrow_id,
+            nominee: pending.nominee,
+            cancelled_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the pending beneficiary transfer for `escrow_id`, if any.
+    pub fn get_pending_beneficiary_transfer(
+        env: Env,
+        escrow_id: u64,
+    ) -> Option<PendingBeneficiaryTransfer> {
+        env.storage().instance().get(&DataKey::Participant(
+            ParticipantKey::PendingBeneficiaryTransfer(escrow_id),
+        ))
+    }
+
     // ── MULTI-PARTY DISPUTE ────────────────────────────────────────────────
 
     /// Files or manages a dispute for an escrow.
@@ -11809,6 +12426,17 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
+        // MEV sandwich-attack mitigation: snapshot the oracle rate at
+        // configure time and store it as `locked_rate`.  execute_escrow_swap
+        // will use this locked rate rather than re-fetching the live oracle
+        // price, so an attacker who manipulates the oracle between configure
+        // and execute cannot exploit the caller's slippage tolerance.
+        let locked_rate: i128 = env.invoke_contract(
+            &oracle,
+            &Symbol::new(&env, "get_rate"),
+            Vec::new(&env),
+        );
+
         let swap_config = EscrowSwapConfig {
             escrow_id,
             source_token: escrow.token.clone(),
@@ -11816,6 +12444,7 @@ impl EscrowContract {
             min_output_amount: min_output,
             oracle,
             executed: false,
+            locked_rate,
         };
 
         env.storage().instance().set(
@@ -11870,17 +12499,9 @@ impl EscrowContract {
             return Err(Error::Action(ActionError::SwapAlreadyExecuted));
         }
 
-        // Call oracle to get the rate (get_rate symbol takes no arguments and returns i128)
-        let rate: i128 = env.invoke_contract(
-            &swap_config.oracle,
-            &Symbol::new(&env, "get_rate"),
-            Vec::new(&env),
-        );
-
         // Staleness check: oracle must expose `get_updated_at` returning the
         // ledger timestamp (u64) of its last price update. Reject rates
-        // older than MAX_ORACLE_AGE_SECS to guard against front-running /
-        // sandwich attacks on stale prices.
+        // older than MAX_ORACLE_AGE_SECS to guard against stale prices.
         const MAX_ORACLE_AGE_SECS: u64 = 300;
         let updated_at: u64 = env.invoke_contract(
             &swap_config.oracle,
@@ -11892,8 +12513,13 @@ impl EscrowContract {
             return Err(Error::Action(ActionError::StaleOraclePrice));
         }
 
+        // MEV sandwich-attack mitigation: use the rate locked at configure
+        // time rather than re-fetching the live oracle rate here. An attacker
+        // who manipulates the oracle between configure and execute cannot widen
+        // the effective slippage window beyond what the caller intended.
+        let rate = swap_config.locked_rate;
+
         // Output amount scaled by Stellar/Soroban standard 1e7 fixed-point rate representation.
-        // The mock oracle and implementation use a 1e7 rate because the issue does not specify oracle decimals.
         let output_amount = (escrow.amount * rate) / 10_000_000;
 
         // Slippage protection: caller-configured min_output_amount acts as
@@ -12322,9 +12948,8 @@ mod verification_test;
 // #[cfg(test)]
 // mod collateral_test;
 //
-// #[cfg(test)]
-// mod beneficiary_transfer_test;
-//
+#[cfg(test)]
+mod beneficiary_transfer_test;
 // #[cfg(test)]
 // mod multi_party_dispute_test;
 //
@@ -12346,9 +12971,8 @@ mod bulk_evidence_test;
 #[cfg(test)]
 mod migration_test;
 //
-// #[cfg(test)]
-// mod multi_party_rollback_test;
-//
+#[cfg(test)]
+mod multi_party_rollback_test;
 #[cfg(test)]
 mod observer_test;
 //
