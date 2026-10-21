@@ -63,6 +63,13 @@ pub enum EscrowKey {
     EvidencePage(u64, u32),
     EvidencePageCount(u64),
     EvidenceCommitment(u64),
+    /// Stores an `EvidenceBundleCommitment` by (escrow_id, bundle_id).
+    EvidenceBundle(u64, u32),
+    /// Monotonic counter of committed bundles for a given escrow.
+    EvidenceBundleCount(u64),
+    /// Dedup guard: stores `true` when `(escrow_id, submitter_address)` has already
+    /// committed a given `merkle_root`. Keyed by (escrow_id, submitter) for cheapest lookup.
+    EvidenceBundleDupRoot(u64, Address),
     VestingSchedule(u64),
     VestingAccelerationConfig(u64),
     Conditional(u64),
@@ -234,6 +241,12 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    /// Evidence bundle CID URI failed validation: wrong prefix, out-of-range length, or contains control characters.
+    InvalidCidUri = 235,
+    /// A bundle with the same Merkle root has already been committed by this submitter for this escrow.
+    DuplicateMerkleRoot = 236,
+    /// leaf_count must be > 0 and <= 10_000.
+    InvalidBundleLeafCount = 237,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -323,7 +336,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 316 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 230 {
+            if code >= 200 && code <= 237 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 114 {
@@ -1186,6 +1199,42 @@ pub struct EvidenceCommitment {
     pub merkle_root: BytesN<32>,
     pub committed_at: u64,
     pub committed_by: Address,
+}
+
+/// A named, versioned Merkle-root bundle commitment for an escrow dispute.
+///
+/// Multiple bundles may be committed per escrow (one per submitter per dispute),
+/// enabling both parties to anchor large evidence sets without individual ledger entries.
+/// Each bundle is identified by `(escrow_id, bundle_id)` where `bundle_id` is a
+/// monotonically incrementing counter scoped to the escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct EvidenceBundleCommitment {
+    /// Sequential ID within the escrow (1-based).
+    pub bundle_id: u32,
+    pub escrow_id: u64,
+    pub submitter: Address,
+    /// Keccak-256 Merkle root over the leaf set.
+    pub merkle_root: BytesN<32>,
+    /// IPFS CIDv1 or Arweave TX URI anchoring the full leaf dataset off-chain.
+    /// Must be 32–128 ASCII bytes, start with "bafy", "bafk", "Qm", or "ar://",
+    /// and contain no ASCII control characters.
+    pub cid_uri: String,
+    /// Number of leaves in the Merkle tree. Must be > 0 and <= 10_000.
+    pub leaf_count: u32,
+    pub submitted_at: u64,
+}
+
+/// Emitted on each successful `commit_evidence_bundle` call.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceBundleCommitted {
+    pub escrow_id: u64,
+    pub bundle_id: u32,
+    pub submitter: Address,
+    pub merkle_root: BytesN<32>,
+    pub leaf_count: u32,
+    pub submitted_at: u64,
 }
 
 #[derive(Clone)]
@@ -4508,6 +4557,255 @@ impl EscrowContract {
                 escrow_id,
             )))
             .ok_or(Error::Basic(BasicError::RootAlreadyCommitted))
+    }
+
+
+    // ── Evidence Bundle Commitment ────────────────────────────────────────────
+
+    /// Commits a Merkle-root bundle for a disputed escrow, anchoring a large set of
+    /// off-chain evidence leaves without storing raw data on-chain.
+    ///
+    /// Multiple bundles may be committed per escrow (one per party per call). Each
+    /// bundle is identified by a monotonically incrementing `bundle_id` scoped to the
+    /// escrow and stored at `EscrowKey::EvidenceBundle(escrow_id, bundle_id)`.
+    ///
+    /// # CID URI validation rules
+    /// * Length: 32–128 bytes (UTF-8 encoded, ASCII range enforced).
+    /// * Prefix: must start with `"bafy"`, `"bafk"`, `"Qm"`, or `"ar://"`.
+    /// * Character set: no ASCII control characters (bytes 0x00–0x1F, 0x7F).
+    ///
+    /// # Duplicate root rejection
+    /// A given `(escrow_id, submitter)` pair may only commit each unique `merkle_root`
+    /// once. Resubmitting the same root returns `EscrowError::DuplicateMerkleRoot`.
+    ///
+    /// # Evidence deadline enforcement
+    /// Rejected with `ActionError::EvidenceDeadlinePassed` when `now > deadline`.
+    ///
+    /// # Arguments
+    /// * `env`         - Soroban environment.
+    /// * `submitter`   - Caller; must be the escrow customer or merchant.
+    /// * `escrow_id`   - Target escrow (must be `Disputed`).
+    /// * `merkle_root` - 32-byte keccak-256 root over the leaf set.
+    /// * `cid_uri`     - IPFS CIDv1 or Arweave TX URI (32–128 ASCII bytes).
+    /// * `leaf_count`  - Number of leaves; must be > 0 and <= 10_000.
+    ///
+    /// # Returns
+    /// The newly assigned `bundle_id` (1-based) on success.
+    pub fn commit_evidence_bundle(
+        env: Env,
+        submitter: Address,
+        escrow_id: u64,
+        merkle_root: BytesN<32>,
+        cid_uri: String,
+        leaf_count: u32,
+    ) -> Result<u32, Error> {
+        submitter.require_auth();
+        Self::require_not_paused(&env, "commit_evidence_bundle")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::NotDisputed));
+        }
+
+        if escrow.customer != submitter && escrow.merchant != submitter {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        const MAX_LEAF_COUNT: u32 = 10_000;
+        if leaf_count == 0 || leaf_count > MAX_LEAF_COUNT {
+            return Err(Error::Escrow(EscrowError::InvalidBundleLeafCount));
+        }
+
+        Self::validate_cid_uri(&env, &cid_uri)?;
+
+        let now = env.ledger().timestamp();
+
+        // Evidence deadline enforcement.
+        if let Some(deadline) = escrow.evidence_deadline {
+            if now > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: now,
+                }
+                .publish(&env);
+                return Err(Error::Action(ActionError::EvidenceDeadlinePassed));
+            }
+        }
+
+        // Duplicate root rejection for this (escrow_id, submitter) pair.
+        let dup_key = DataKey::Escrow(EscrowKey::EvidenceBundleDupRoot(
+            escrow_id,
+            submitter.clone(),
+        ));
+        if let Some(prev_root) = env
+            .storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&dup_key)
+        {
+            if prev_root == merkle_root {
+                return Err(Error::Escrow(EscrowError::DuplicateMerkleRoot));
+            }
+        }
+
+        // Assign bundle_id (1-based).
+        let prev_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::EvidenceBundleCount(escrow_id)))
+            .unwrap_or(0);
+        let bundle_id = prev_count + 1;
+
+        let commitment = EvidenceBundleCommitment {
+            bundle_id,
+            escrow_id,
+            submitter: submitter.clone(),
+            merkle_root: merkle_root.clone(),
+            cid_uri,
+            leaf_count,
+            submitted_at: now,
+        };
+
+        // CEI: persist all state before event emission.
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::EvidenceBundle(escrow_id, bundle_id)),
+            &commitment,
+        );
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::EvidenceBundleCount(escrow_id)),
+            &bundle_id,
+        );
+        env.storage().instance().set(&dup_key, &merkle_root);
+
+        EvidenceBundleCommitted {
+            escrow_id,
+            bundle_id,
+            submitter,
+            merkle_root,
+            leaf_count,
+            submitted_at: now,
+        }
+        .publish(&env);
+
+        Ok(bundle_id)
+    }
+
+    /// Verifies that `item_hash` is a valid leaf in the Merkle tree committed in
+    /// `(escrow_id, bundle_id)`.
+    ///
+    /// Uses the standard binary keccak-256 Merkle inclusion proof algorithm:
+    /// each proof element is the sibling node at that tree level, ordered
+    /// bottom-up from the leaf to the root.
+    ///
+    /// # Returns
+    /// * `true`  – proof valid; `item_hash` is in the committed tree.
+    /// * `false` – bundle not found, or proof is invalid.
+    pub fn verify_evidence_bundle_item(
+        env: Env,
+        escrow_id: u64,
+        bundle_id: u32,
+        item_hash: BytesN<32>,
+        merkle_proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> bool {
+        let commitment_opt = env
+            .storage()
+            .instance()
+            .get::<DataKey, EvidenceBundleCommitment>(&DataKey::Escrow(
+                EscrowKey::EvidenceBundle(escrow_id, bundle_id),
+            ));
+
+        match commitment_opt {
+            None => false,
+            Some(commitment) => Self::verify_keccak_merkle_proof(
+                &env,
+                item_hash,
+                merkle_proof,
+                leaf_index,
+                commitment.merkle_root,
+            ),
+        }
+    }
+
+    /// Returns the `EvidenceBundleCommitment` for a given `(escrow_id, bundle_id)`,
+    /// or `None` if the bundle has not been committed.
+    pub fn get_evidence_bundle(
+        env: Env,
+        escrow_id: u64,
+        bundle_id: u32,
+    ) -> Option<EvidenceBundleCommitment> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::EvidenceBundle(
+                escrow_id, bundle_id,
+            )))
+    }
+
+    /// Returns the number of bundles committed for a given escrow (0 if none).
+    pub fn get_evidence_bundle_count(env: Env, escrow_id: u64) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::EvidenceBundleCount(escrow_id)))
+            .unwrap_or(0)
+    }
+
+    /// Validates a CID URI string for `commit_evidence_bundle`.
+    ///
+    /// Rules:
+    /// - Length 32–128 bytes.
+    /// - Starts with `"bafy"`, `"bafk"`, `"Qm"`, or `"ar://"`.
+    /// - No ASCII control characters (0x00–0x1F or 0x7F).
+    fn validate_cid_uri(env: &Env, uri: &String) -> Result<(), Error> {
+        const MIN_URI_LEN: u32 = 32;
+        const MAX_URI_LEN: u32 = 128;
+
+        let len = uri.len();
+        if len < MIN_URI_LEN || len > MAX_URI_LEN {
+            return Err(Error::Escrow(EscrowError::InvalidCidUri));
+        }
+
+        // Soroban String::to_xdr() prepends a 4-byte big-endian length header.
+        let uri_bytes = uri.to_xdr(env);
+        const XDR_HEADER: u32 = 4;
+
+        // Validate character set: no ASCII control chars.
+        for i in XDR_HEADER..XDR_HEADER + len {
+            let b = uri_bytes.get(i).unwrap_or(0);
+            if b < 0x20 || b == 0x7F {
+                return Err(Error::Escrow(EscrowError::InvalidCidUri));
+            }
+        }
+
+        // Validate prefix.
+        let b0 = uri_bytes.get(XDR_HEADER).unwrap_or(0);
+        let b1 = uri_bytes.get(XDR_HEADER + 1).unwrap_or(0);
+        let b2 = uri_bytes.get(XDR_HEADER + 2).unwrap_or(0);
+        let b3 = uri_bytes.get(XDR_HEADER + 3).unwrap_or(0);
+        let b4 = uri_bytes.get(XDR_HEADER + 4).unwrap_or(0);
+
+        // "bafy" = 0x62 0x61 0x66 0x79
+        let is_bafy = b0 == 0x62 && b1 == 0x61 && b2 == 0x66 && b3 == 0x79;
+        // "bafk" = 0x62 0x61 0x66 0x6B
+        let is_bafk = b0 == 0x62 && b1 == 0x61 && b2 == 0x66 && b3 == 0x6B;
+        // "Qm"   = 0x51 0x6D
+        let is_qm   = b0 == 0x51 && b1 == 0x6D;
+        // "ar://" = 0x61 0x72 0x3A 0x2F 0x2F
+        let is_ar   = b0 == 0x61 && b1 == 0x72 && b2 == 0x3A && b3 == 0x2F && b4 == 0x2F;
+
+        if !(is_bafy || is_bafk || is_qm || is_ar) {
+            return Err(Error::Escrow(EscrowError::InvalidCidUri));
+        }
+
+        Ok(())
     }
 
     fn verify_keccak_merkle_proof(
