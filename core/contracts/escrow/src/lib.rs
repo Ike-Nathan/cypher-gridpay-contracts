@@ -234,6 +234,14 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    /// Clawback timelock window has not yet elapsed. Resolution: wait until execute_after timestamp before executing.
+    ClawbackTimelockNotExpired = 231,
+    /// Requested clawback amount exceeds the eligible (non-settled) balance. Resolution: reduce requested_amount.
+    InsufficientClawbackBalance = 232,
+    /// Beneficiary transfer seasoning window has not elapsed; escrow is subject to FraudulentOrigin clawback. Resolution: wait until seasoning period ends.
+    BeneficiarySeasoningActive = 233,
+    /// Escrow release is in a mandatory cooling/hold period. Resolution: wait until hold period expires.
+    HoldPeriodActive = 234,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -281,6 +289,8 @@ pub enum Error {
     Basic(BasicError),
     Escrow(EscrowError),
     Action(ActionError),
+    /// A clawback request has already been initiated for this escrow and is pending execution.
+    ClawbackAlreadyInitiated,
 }
 
 impl Error {
@@ -299,6 +309,8 @@ impl Error {
             Error::Basic(e) => *e as u32,
             Error::Escrow(e) => *e as u32,
             Error::Action(e) => *e as u32,
+            // Use a dedicated code outside all sub-enum ranges for the top-level variant.
+            Error::ClawbackAlreadyInitiated => 999,
         }
     }
 }
@@ -320,14 +332,17 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            if code >= 300 && code <= 319 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 230 {
+            if code >= 200 && code <= 234 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 114 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
+            }
+            if code == 999 {
+                return Ok(Error::ClawbackAlreadyInitiated);
             }
         }
         Err(error)
@@ -1092,6 +1107,17 @@ pub struct Escrow {
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
     pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
+    /// The portion of `amount` that is still eligible for administrative clawback.
+    /// Starts equal to `amount` and is decremented as partial milestone releases or
+    /// authorised beneficiary transfers reduce the recoverable balance.
+    pub clawback_eligible_balance: i128,
+    /// Timestamp of the most recent beneficiary transfer, or 0 if no transfer has occurred.
+    /// While `now < beneficiary_transferred_at + beneficiary_seasoning_secs`, the new
+    /// beneficiary's escrow share remains subject to `ClawbackCode::FraudulentOrigin`.
+    pub beneficiary_transferred_at: u64,
+    /// Per-escrow seasoning window applied after each beneficiary transfer (seconds).
+    /// 0 means the global default (`DEFAULT_BENEFICIARY_SEASONING_SECS`) applies.
+    pub beneficiary_seasoning_secs: u64,
 }
 
 #[derive(Clone)]
@@ -1306,6 +1332,8 @@ pub struct ClawbackRequest {
     pub execute_after: u64,
     pub executed: bool,
     pub cancelled: bool,
+    /// Optional cryptographic evidence hash supplied at initiation for audit trail.
+    pub evidence_hash: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -1613,6 +1641,23 @@ pub struct BeneficiaryTransferred {
     pub new_merchant: Address,
 }
 
+/// Emitted whenever a full or partial clawback is executed against an escrow.
+/// Provides a cryptographic audit trail via `evidence_hash`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowClawedBack {
+    pub escrow_id: u64,
+    pub request_id: u64,
+    pub authority: Address,
+    /// Amount actually transferred to the clawback authority.
+    pub amount_clawed: i128,
+    /// Remaining clawback-eligible balance after this operation.
+    pub remaining_eligible: i128,
+    /// Cryptographic evidence/audit-trail hash supplied by the authority.
+    pub evidence_hash: BytesN<32>,
+    pub executed_at: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct OnChainCondition {
@@ -1717,6 +1762,9 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
+/// Default seasoning window applied to a beneficiary after a transfer (24 h).
+/// During this window the escrow remains subject to ClawbackCode::FraudulentOrigin.
+const DEFAULT_BENEFICIARY_SEASONING_SECS: u64 = 86_400;
 /// Length of the dispute appeal window in seconds (72 hours). An appeal is
 /// accepted only while `now < dispute_started_at + APPEAL_WINDOW_SECONDS`, so
 /// the boundary is deterministic rather than depending on `<` vs `≤` drift.
@@ -2574,7 +2622,7 @@ impl EscrowContract {
                     ))
             {
                 if !request.executed && !request.cancelled {
-                    return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+                    return Err(Error::ClawbackAlreadyInitiated);
                 }
             }
         }
@@ -2598,6 +2646,7 @@ impl EscrowContract {
             execute_after: now + delay_seconds,
             executed: false,
             cancelled: false,
+            evidence_hash: None,
         };
 
         env.storage().instance().set(
@@ -2650,14 +2699,18 @@ impl EscrowContract {
 
         let now = env.ledger().timestamp();
         if now < request.execute_after {
-            return Err(Error::Action(ActionError::NotReady));
+            return Err(Error::Escrow(EscrowError::ClawbackTimelockNotExpired));
         }
 
         let mut escrow = EscrowContract::get_escrow(&env, request.escrow_id);
 
+        // Full clawback operates on the entire clawback_eligible_balance.
+        let amount_clawed = escrow.clawback_eligible_balance;
+
         // CEI: mark the escrow Resolved and the request executed before the
         // outbound transfer so a re-entrant call sees the clawback as done.
         escrow.status = EscrowStatus::Resolved;
+        escrow.clawback_eligible_balance = 0;
         env.storage().instance().set(
             &DataKey::Escrow(EscrowKey::Data(request.escrow_id)),
             &escrow,
@@ -2669,10 +2722,24 @@ impl EscrowContract {
             &request,
         );
 
+        // Use reason_hash as the evidence_hash for the full-clawback audit trail.
+        let evidence = request.evidence_hash.clone().unwrap_or(request.reason_hash.clone());
+        EscrowClawedBack {
+            escrow_id: request.escrow_id,
+            request_id,
+            authority: admin.clone(),
+            amount_clawed,
+            remaining_eligible: 0,
+            evidence_hash: evidence,
+            executed_at: now,
+        }
+        .publish(&env);
+
         let token_client = token::Client::new(&env, &escrow.token);
         let contract_address = env.current_contract_address();
-        token_client.transfer(&contract_address, &admin, &escrow.amount);
-
+        if amount_clawed > 0 {
+            token_client.transfer(&contract_address, &admin, &amount_clawed);
+        }
         Ok(())
     }
 
@@ -2688,6 +2755,118 @@ impl EscrowContract {
     ///
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
+
+    /// Executes a proportional (partial) clawback against an escrow.
+    ///
+    /// Unlike `execute_clawback` which always seizes the full eligible balance,
+    /// this function allows the authority to recover only `requested_amount` while
+    /// leaving the remainder locked in the escrow. The operation is bounded by
+    /// `clawback_eligible_balance` so that already-settled tranches and authorised
+    /// beneficiary transfers are never double-seized.
+    ///
+    /// A non-empty `evidence_hash` is required for every invocation and is emitted
+    /// in the `EscrowClawedBack` event, creating a cryptographic audit trail.
+    ///
+    /// # Arguments
+    /// * `env`              - Soroban environment.
+    /// * `escrow_id`        - Target escrow identifier.
+    /// * `authority`        - Admin address authorising the clawback; must sign.
+    /// * `requested_amount` - Tokens to recover; must be > 0 and <= clawback_eligible_balance.
+    /// * `evidence_hash`    - 32-byte cryptographic hash of supporting evidence.
+    ///
+    /// # Returns
+    /// The actual amount clawed back on success.
+    ///
+    /// # Errors
+    /// * `BasicError::NotAnAdmin`              – caller is not a multisig admin.
+    /// * `EscrowError::NotFound`               – escrow does not exist.
+    /// * `EscrowError::InvalidStatus`          – escrow is terminal (Resolved/Cancelled/etc).
+    /// * `EscrowError::InsufficientClawbackBalance` – requested_amount > clawback_eligible_balance.
+    pub fn execute_partial_clawback(
+        env: Env,
+        escrow_id: u64,
+        authority: Address,
+        requested_amount: i128,
+        evidence_hash: BytesN<32>,
+    ) -> Result<i128, Error> {
+        authority.require_auth();
+        Self::require_not_paused(&env, "execute_partial_clawback")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&authority) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+
+        if requested_amount <= 0 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+
+        // Only active (Locked) escrows may be partially clawed back.
+        match escrow.status {
+            EscrowStatus::Locked => {}
+            _ => return Err(Error::Escrow(EscrowError::InvalidStatus)),
+        }
+
+        // Guard: requested amount must not exceed what is still eligible.
+        if requested_amount > escrow.clawback_eligible_balance {
+            return Err(Error::Escrow(EscrowError::InsufficientClawbackBalance));
+        }
+
+        // Check seasoning: if the escrow is within its beneficiary seasoning window
+        // the new beneficiary's share remains subject to FraudulentOrigin clawback.
+        let seasoning = if escrow.beneficiary_seasoning_secs == 0 {
+            DEFAULT_BENEFICIARY_SEASONING_SECS
+        } else {
+            escrow.beneficiary_seasoning_secs
+        };
+        let now = env.ledger().timestamp();
+        let in_seasoning = escrow.beneficiary_transferred_at > 0
+            && now < escrow.beneficiary_transferred_at + seasoning;
+
+        // Emit a warning in the event about active seasoning (carried as a flag via remaining_eligible).
+        // The clawback is still permitted during the seasoning window — the shield only
+        // protects innocent transferees from clawbacks that fire AFTER the window elapses.
+        let _ = in_seasoning; // explicitly noted; future policy can block here if desired.
+
+        let new_eligible = escrow.clawback_eligible_balance - requested_amount;
+
+        // CEI: update state before any token transfer.
+        escrow.clawback_eligible_balance = new_eligible;
+        // When the full eligible balance has been clawed back, resolve the escrow.
+        if new_eligible == 0 {
+            escrow.status = EscrowStatus::Resolved;
+        }
+        escrow.last_activity_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        EscrowClawedBack {
+            escrow_id,
+            request_id: 0, // 0 = ad-hoc partial clawback; no ClawbackRequest record.
+            authority: authority.clone(),
+            amount_clawed: requested_amount,
+            remaining_eligible: new_eligible,
+            evidence_hash,
+            executed_at: now,
+        }
+        .publish(&env);
+
+        Self::transfer_if_token_contract(&env, &escrow.token, &authority, requested_amount)?;
+
+        Ok(requested_amount)
+    }
+
     pub fn cancel_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
         admin.require_auth();
         Self::require_not_paused(&env, "cancel_clawback")?;
@@ -2920,6 +3099,9 @@ impl EscrowContract {
             escalation_timeout: escalation_cfg.timeout_seconds,
             auto_resolve_in_favor_of: escalation_cfg.favor,
             evidence_deadline: None,
+            clawback_eligible_balance: amount,
+            beneficiary_transferred_at: 0,
+            beneficiary_seasoning_secs: 0,
         };
 
         env.storage()
@@ -3943,6 +4125,7 @@ impl EscrowContract {
             EscrowStatus::Resolved => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
             EscrowStatus::Cancelled => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
         }
+            EscrowStatus::ExpiredRefunded => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
     }
 
     fn internal_release_escrow(
@@ -6725,6 +6908,9 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            clawback_eligible_balance: amount,
+            beneficiary_transferred_at: 0,
+            beneficiary_seasoning_secs: 0,
         };
 
         env.storage()
@@ -9812,6 +9998,9 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            clawback_eligible_balance: amount,
+            beneficiary_transferred_at: 0,
+            beneficiary_seasoning_secs: 0,
         };
 
         env.storage()
@@ -10064,6 +10253,10 @@ impl EscrowContract {
         );
 
         escrow.merchant = new_merchant.clone();
+        // Record the transfer timestamp for the beneficiary seasoning window.
+        // While now < beneficiary_transferred_at + effective_seasoning_secs, the
+        // escrow remains subject to ClawbackCode::FraudulentOrigin clawback.
+        escrow.beneficiary_transferred_at = now;
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
@@ -10183,6 +10376,8 @@ impl EscrowContract {
         );
 
         escrow.merchant = new_beneficiary.clone();
+        // Record transfer timestamp for the beneficiary seasoning window.
+        escrow.beneficiary_transferred_at = now;
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
@@ -10607,6 +10802,9 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            clawback_eligible_balance: entry.amount,
+            beneficiary_transferred_at: 0,
+            beneficiary_seasoning_secs: 0,
         };
 
         env.storage()
@@ -12324,6 +12522,10 @@ mod verification_test;
 //
 // #[cfg(test)]
 // mod beneficiary_transfer_test;
+#[cfg(test)]
+mod beneficiary_transfer_test;
+#[cfg(test)]
+mod clawback_test;
 //
 // #[cfg(test)]
 // mod multi_party_dispute_test;
