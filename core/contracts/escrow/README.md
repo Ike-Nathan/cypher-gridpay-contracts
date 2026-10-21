@@ -478,4 +478,123 @@ multi-observer escrow.
 
 ---
 
+## Source Layout & Module Hierarchy
+
+All active contract code lives under `core/contracts/escrow/src/`. The layout
+below reflects the state after issue #220 removed the deprecated `lib_stable.rs`
+snapshot.
+
+```
+core/contracts/escrow/
+├── Cargo.toml              # crate manifest; defines the `stable-abi` feature gate
+└── src/
+    ├── lib.rs              # single source-of-truth for the entire EscrowContract
+    │                       # implementation — structs, enums, events, errors, and
+    │                       # every #[contractimpl] function live here.
+    ├── storage.rs          # TTL helpers (extend_instance, get/set/has_persistent)
+    │                       # and storage lifetime constants (DAY_IN_LEDGERS, etc.)
+    │
+    │   ── Test modules (cfg(test) only, compiled with `testutils` feature) ──
+    ├── test.rs                        # core escrow lifecycle tests
+    ├── test_storage_keys.rs           # DataKey serialisation round-trip tests
+    ├── test_sub_account.rs            # sub-account allocation & release tests
+    ├── appeal_expiry_test.rs          # appeal window expiry tests
+    ├── batch_release_test.rs          # batch_release_escrows tests
+    ├── beneficiary_transfer_test.rs   # transfer_beneficiary tests
+    ├── bulk_evidence_test.rs          # submit_evidence_batch / page tests
+    ├── clawback_test.rs               # initiate / execute / cancel clawback tests
+    ├── collateral_test.rs             # dispute collateral deposit & liquidation
+    ├── dispute_appeal_test.rs         # file_dispute_appeal round tests
+    ├── dispute_opened_event_test.rs   # DisputeOpened event emission tests
+    ├── escalation_timeout_test.rs     # trigger_timeout_resolution & rubric tests
+    │                                  # (also covers issue #218 DisputeRubricEvaluation)
+    ├── escrow_status_guard_test.rs    # status transition guard tests
+    ├── expiry_test.rs                 # expiry & auto-refund tests
+    ├── health_check_test.rs           # get_escrow_health / get_stale_escrows tests
+    ├── hierarchy_test.rs              # create_child_escrow & release guard tests
+    ├── hold_period_test.rs            # mandatory hold-period enforcement tests
+    ├── migration_test.rs              # begin_migration / migrate_escrow tests
+    ├── multi_party_dispute_test.rs    # MultiPartyDispute vote & quorum tests
+    ├── multi_party_rollback_test.rs   # multi-party escrow rollback tests
+    ├── multi_party_weight_test.rs     # set_participant_weight & threshold tests
+    ├── multisig_threshold_test.rs     # admin multisig threshold & key rotation tests
+    │                                  # (also covers issue #219 PendingKeyRotation)
+    ├── observer_test.rs               # add / remove / verify observer tests
+    ├── pause_history_test.rs          # pause_contract / pause_function history
+    ├── storage_ttl_test.rs            # instance & persistent TTL bump tests
+    ├── succession_test.rs             # designate / activate / revoke succession
+    ├── swap_test.rs                   # configure / execute escrow swap tests
+    ├── timelock_test.rs               # queue_action / execute_queued_action tests
+    └── verification_test.rs           # verify_escrow_participant / observer tests
+```
+
+### Design decision: single-file contract (`lib.rs`)
+
+Soroban's `#[contractimpl]` macro requires all exported contract functions to be
+defined inside a single `impl EscrowContract` block, which must live in the crate
+root (`lib.rs`).  Splitting the implementation across multiple `impl` blocks in
+separate files is currently not supported by the macro — doing so generates
+duplicate WASM exports and fails to compile.
+
+All struct, enum, event, and error definitions therefore also reside in `lib.rs`
+so they are visible to every `#[contractimpl]` item without requiring re-exports.
+`storage.rs` is the only module that ships independently because it contains
+pure utility functions (`extend_instance`, `get_persistent`, etc.) with no
+dependency on the contract types.
+
+If Soroban adds support for split `#[contractimpl]` blocks in a future SDK
+version, the domain groupings below describe the natural split points:
+
+| Domain          | Approximate lines in `lib.rs` | Functions                                                                        |
+|-----------------|-------------------------------|----------------------------------------------------------------------------------|
+| Escrow lifecycle| ~2 700                        | `create_escrow`, `release_escrow`, `cancel_escrow`, `expire_escrow`, `batch_*`  |
+| Dispute & arbitration | ~1 200                 | `dispute_escrow`, `submit_evidence*`, `escalate_dispute`, `resolve_dispute`      |
+| Multi-party     | ~700                          | `create_multi_party_escrow`, `approve_release`, `set_participant_weight`, `propose_participant_key_rotation`, `execute_participant_key_rotation` |
+| Reputation      | ~400                          | `update_reputation`, `get_reputation`, `set_reputation_config`                   |
+| Vesting         | ~600                          | `create_vesting_escrow`, `release_vested_amount`, `release_milestone`            |
+| Admin / multisig| ~900                          | `initialize`, `propose_action`, `execute_action`, `add_admin`, `clawback_*`     |
+| Collateral & oracle | ~350                      | `dispute_escrow` (collateral path), `liquidate_collateral`, `get_oracle_price`   |
+| Observers       | ~300                          | `add_observer`, `remove_observer`, `verify_observer_access`                      |
+| Hierarchy       | ~350                          | `create_child_escrow`, `can_parent_release`, `get_escrow_hierarchy`              |
+| Health & analytics | ~250                       | `get_escrow_health`, `get_stale_escrows`, analytics helpers                      |
+
+### `stable-abi` feature gate
+
+`Cargo.toml` now declares a `stable-abi = []` feature (disabled by default).
+It is intentionally empty today and reserved for CI drift detection.  Future
+use:
+
+```toml
+# Cargo.toml
+[features]
+stable-abi = []
+```
+
+```bash
+# CI script — verifies WASM ABI is unchanged
+cargo build -p escrow --features escrow/stable-abi --target wasm32-unknown-unknown
+./scripts/generate-ts-bindings.sh --check   # exits 1 if ABI drifted
+```
+
+Any PR that would alter an exported function name, add/remove a parameter, or
+change an XDR type **must** update the baseline in `scripts/generate-ts-bindings.sh`
+and include a `## ABI Impact` section in the PR description.
+
+### Removal of `lib_stable.rs` (issue #220)
+
+`src/lib_stable.rs` was an unmaintained snapshot of an earlier contract
+version.  It was **not compiled** by Cargo (not listed in `Cargo.toml`, not
+imported via `mod lib_stable` in `lib.rs`), so it had zero effect on the WASM
+output.  Its presence posed two risks:
+
+1. **Contributor confusion** — the file looked like a second, authoritative
+   implementation and invited accidental patches being applied to the wrong file.
+2. **Drift** — every feature added to `lib.rs` silently widened the gap with the
+   snapshot, making the file increasingly misleading.
+
+The file was deleted in this commit.  The full history of the snapshot remains
+accessible via `git log -- core/contracts/escrow/src/lib_stable.rs`.
+
+---
+
 [⬅ Back to Main README](../../README.md)
