@@ -234,6 +234,16 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    /// Source child is currently in Disputed status; rebalancing from disputed children is disallowed.
+    ChildDisputed = 231,
+    /// Amount requested for rebalancing or contingency draw exceeds available funds or overdraft cap.
+    InvalidRebalanceAmount = 232,
+    /// Specified child escrow is not a direct child of the given parent.
+    NotAChildOfParent = 233,
+    /// Contingency reserve draw exceeds max_child_overdraft_bps cap for this child.
+    OverdraftCapExceeded = 234,
+    /// Hierarchy tree invariant violated: total locked funds do not match after operation.
+    HierarchyInvariantViolated = 235,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -323,7 +333,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 316 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 230 {
+            if code >= 200 && code <= 235 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 114 {
@@ -514,6 +524,14 @@ pub struct EscrowHierarchyNode {
     pub parent_id: Option<u64>,
     pub children: Vec<u64>,
     pub depth: u32,
+    /// Portion of the parent escrow's total that is held as a contingency reserve.
+    /// This can be drawn by child escrows via `draw_parent_contingency`.
+    /// Starts at 0; can only be set by the parent-escrow payer (customer).
+    pub contingency_reserve: i128,
+    /// Maximum overdraft any single child may draw from the parent contingency
+    /// reserve, expressed in basis points of the child's original `amount`.
+    /// 0 means no overdraft is permitted.
+    pub max_child_overdraft_bps: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11985,6 +12003,8 @@ impl EscrowContract {
                 parent_id: None,
                 children: Vec::new(&env),
                 depth: 0, // Root depth is 0
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
             });
 
         if parent_node.depth + 1 > 3 {
@@ -12020,6 +12040,8 @@ impl EscrowContract {
             parent_id: Some(parent_id),
             children: Vec::new(&env),
             depth: child_depth,
+            contingency_reserve: 0,
+            max_child_overdraft_bps: 0,
         };
         env.storage().instance().set(
             &DataKey::Escrow(EscrowKey::Hierarchy(child_id)),
@@ -12069,6 +12091,8 @@ impl EscrowContract {
                     parent_id: None,
                     children: Vec::new(&env),
                     depth: 0,
+                    contingency_reserve: 0,
+                    max_child_overdraft_bps: 0,
                 });
 
             result.push_back(node.clone());
@@ -12091,6 +12115,337 @@ impl EscrowContract {
     ///
     /// # Panics
     /// Panics if the contract state is invalid.
+
+    // ── Hierarchical budget rebalancing ───────────────────────────────────────
+
+    /// Atomically moves an allocated amount from one sibling child escrow to another.
+    ///
+    /// Requires mutual consent: both the parent payer (customer of the parent) and
+    /// the affected sub-account beneficiaries must authorise the transfer.
+    ///
+    /// Security invariants enforced:
+    /// * `from_child.parent_id == Some(parent_escrow_id)`
+    /// * `to_child.parent_id == Some(parent_escrow_id)`
+    /// * `from_child` must not be `Disputed`.
+    /// * `amount > 0` and `amount <= from_child.amount`.
+    /// * Neither child may be in a terminal state (Released/Resolved/Cancelled).
+    ///
+    /// # Arguments
+    /// * `env`            - Soroban environment.
+    /// * `parent_escrow_id` - The common parent escrow.
+    /// * `from_child_id`  - Source child escrow ID.
+    /// * `to_child_id`    - Destination child escrow ID.
+    /// * `amount`         - Token amount to rebalance.
+    pub fn rebalance_sibling_sub_escrows(
+        env: Env,
+        parent_escrow_id: u64,
+        from_child_id: u64,
+        to_child_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "rebalance_sibling_sub_escrows")?;
+
+        if amount <= 0 {
+            return Err(Error::Escrow(EscrowError::InvalidRebalanceAmount));
+        }
+
+        // Load parent escrow to get the payer (customer).
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(parent_escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let parent_escrow = Self::get_escrow(&env, parent_escrow_id);
+
+        // Require parent payer (customer) auth.
+        parent_escrow.customer.require_auth();
+
+        // Load both child escrows.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(from_child_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(to_child_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let from_child = Self::get_escrow(&env, from_child_id);
+        let to_child = Self::get_escrow(&env, to_child_id);
+
+        // Verify both are children of the same parent.
+        let from_node = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowHierarchyNode>(&DataKey::Escrow(EscrowKey::Hierarchy(from_child_id)))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: from_child_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0,
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
+            });
+        let to_node = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowHierarchyNode>(&DataKey::Escrow(EscrowKey::Hierarchy(to_child_id)))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: to_child_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0,
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
+            });
+
+        if from_node.parent_id != Some(parent_escrow_id) {
+            return Err(Error::Escrow(EscrowError::NotAChildOfParent));
+        }
+        if to_node.parent_id != Some(parent_escrow_id) {
+            return Err(Error::Escrow(EscrowError::NotAChildOfParent));
+        }
+
+        // Source child must not be Disputed.
+        if from_child.status == EscrowStatus::Disputed {
+            return Err(Error::Escrow(EscrowError::ChildDisputed));
+        }
+
+        // Neither child may be terminal.
+        match from_child.status {
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
+                return Err(Error::Escrow(EscrowError::InvalidStatus));
+            }
+            _ => {}
+        }
+        match to_child.status {
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
+                return Err(Error::Escrow(EscrowError::InvalidStatus));
+            }
+            _ => {}
+        }
+
+        // Amount must not exceed source child's amount.
+        if amount > from_child.amount {
+            return Err(Error::Escrow(EscrowError::InvalidRebalanceAmount));
+        }
+
+        // Require the destination child's merchant (beneficiary) auth for mutual consent.
+        to_child.merchant.require_auth();
+
+        // CEI: update both child escrows before any token transfer.
+        let mut updated_from = from_child.clone();
+        updated_from.amount -= amount;
+        updated_from.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(from_child_id)), &updated_from);
+
+        let mut updated_to = to_child.clone();
+        updated_to.amount += amount;
+        updated_to.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(to_child_id)), &updated_to);
+
+        // Move the actual tokens between child escrow balances in the contract.
+        // Both children share the same token (inherited from parent).
+        Self::transfer_if_token_contract(&env, &from_child.token, &to_child.customer, amount)?;
+
+        Ok(())
+    }
+
+    /// Draws funds from the parent escrow's contingency reserve into a child escrow.
+    ///
+    /// The draw amount is capped by `max_child_overdraft_bps` expressed in basis points
+    /// of the child's original `amount`. If `max_child_overdraft_bps == 0`, no draw is
+    /// permitted.
+    ///
+    /// # Arguments
+    /// * `env`            - Soroban environment.
+    /// * `parent_escrow_id` - The parent escrow whose contingency reserve is being drawn.
+    /// * `child_escrow_id`  - The child escrow receiving the contingency funds.
+    /// * `amount`         - Token amount to draw.
+    pub fn draw_parent_contingency(
+        env: Env,
+        parent_escrow_id: u64,
+        child_escrow_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "draw_parent_contingency")?;
+
+        if amount <= 0 {
+            return Err(Error::Escrow(EscrowError::InvalidRebalanceAmount));
+        }
+
+        // Load parent escrow.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(parent_escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let parent_escrow = Self::get_escrow(&env, parent_escrow_id);
+
+        // Require parent payer (customer) auth.
+        parent_escrow.customer.require_auth();
+
+        // Load parent hierarchy node.
+        let mut parent_node = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowHierarchyNode>(&DataKey::Escrow(EscrowKey::Hierarchy(parent_escrow_id)))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: parent_escrow_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0,
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
+            });
+
+        // Load child escrow and verify parent-child relationship.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(child_escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let child = Self::get_escrow(&env, child_escrow_id);
+
+        let child_node = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowHierarchyNode>(&DataKey::Escrow(EscrowKey::Hierarchy(child_escrow_id)))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: child_escrow_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0,
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
+            });
+
+        if child_node.parent_id != Some(parent_escrow_id) {
+            return Err(Error::Escrow(EscrowError::NotAChildOfParent));
+        }
+
+        // Child must not be terminal.
+        match child.status {
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
+                return Err(Error::Escrow(EscrowError::InvalidStatus));
+            }
+            _ => {}
+        }
+
+        // Check overdraft cap.
+        if parent_node.max_child_overdraft_bps == 0 {
+            return Err(Error::Escrow(EscrowError::OverdraftCapExceeded));
+        }
+
+        // Cap: amount <= child.amount * max_child_overdraft_bps / 10000
+        let overdraft_cap = (child.amount * parent_node.max_child_overdraft_bps as i128) / 10_000_i128;
+        if amount > overdraft_cap {
+            return Err(Error::Escrow(EscrowError::OverdraftCapExceeded));
+        }
+
+        // Check contingency reserve has enough.
+        if amount > parent_node.contingency_reserve {
+            return Err(Error::Escrow(EscrowError::InvalidRebalanceAmount));
+        }
+
+        // CEI: update parent node reserve and child escrow amount.
+        parent_node.contingency_reserve -= amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Hierarchy(parent_escrow_id)), &parent_node);
+
+        let mut updated_child = child.clone();
+        updated_child.amount += amount;
+        updated_child.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(child_escrow_id)), &updated_child);
+
+        // Transfer tokens from parent's unallocated balance to child.
+        // The parent's liquidatable amount decreases; child's amount increases.
+        Self::transfer_if_token_contract(&env, &parent_escrow.token, &child.customer, amount)?;
+
+        Ok(())
+    }
+
+    /// Sets the contingency reserve and max child overdraft on a parent escrow's
+    /// hierarchy node. Only the parent escrow's customer (payer) may call this.
+    ///
+    /// # Arguments
+    /// * `env`               - Soroban environment.
+    /// * `parent_escrow_id`  - The parent escrow ID.
+    /// * `customer`          - The parent escrow's customer (payer).
+    /// * `contingency_reserve` - Amount to set aside as contingency.
+    /// * `max_child_overdraft_bps` - Max overdraft bps per child draw (0–10000).
+    pub fn set_hierarchy_contingency(
+        env: Env,
+        parent_escrow_id: u64,
+        customer: Address,
+        contingency_reserve: i128,
+        max_child_overdraft_bps: u32,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "set_hierarchy_contingency")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(parent_escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = Self::get_escrow(&env, parent_escrow_id);
+        if escrow.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if max_child_overdraft_bps > 10_000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+        if contingency_reserve < 0 || contingency_reserve > escrow.amount {
+            return Err(Error::Escrow(EscrowError::InvalidRebalanceAmount));
+        }
+
+        let mut node = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowHierarchyNode>(&DataKey::Escrow(EscrowKey::Hierarchy(parent_escrow_id)))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: parent_escrow_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0,
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
+            });
+
+        node.contingency_reserve = contingency_reserve;
+        node.max_child_overdraft_bps = max_child_overdraft_bps;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Hierarchy(parent_escrow_id)), &node);
+
+        Ok(())
+    }
+
     pub fn can_parent_release(env: Env, parent_id: u64) -> bool {
         if !env
             .storage()
@@ -12371,7 +12726,8 @@ mod escrow_status_guard_test;
 mod health_check_test;
 //
 // #[cfg(test)]
-// mod test_sub_account;
+#[cfg(test)]
+mod test_sub_account;
 
 #[cfg(test)]
 mod storage_ttl_test;
