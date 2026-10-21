@@ -183,6 +183,9 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `pause_subscription(admin, subscription_id)`                                                                                        | Pause a subscription, pausing the billing clock.                                                                |
 | `resume_subscription(admin, subscription_id, proration_enabled)`                                                                    | Resume a paused subscription, optionally prorating the next billing date.                                       |
 | `extend_trial(admin, subscription_id, extension_seconds)`                                                                           | Extend the trial period of a subscription.                                                                      |
+| `emit_trial_conversion_notice(subscription_id)`                                                                                     | Merchant emits the required conversion notice during the permitted lead-time window.                             |
+| `authorize_trial_conversion_amount(customer, subscription_id, amount)`                                                             | Customer explicitly consents to a new conversion amount and invalidates any prior notice.                       |
+| `report_trial_conversion_usage(merchant, subscription_id, units)`                                                                   | Merchant records usage during the post-conversion cancellation grace period.                                     |
 | `get_subscription(subscription_id)`                                                                                                 | Retrieve the `Subscription` record.                                                                             |
 | `get_subscriptions_by_customer(customer, page)`                                                                                     | Paginated list of subscription IDs for a customer.                                                              |
 | `get_subscriptions_by_merchant(merchant, page)`                                                                                     | Paginated list of subscription IDs for a merchant.                                                              |
@@ -230,22 +233,41 @@ record as `trial_data` (`period_seconds`, `ends_at`, `converted`).
 
 **The trial-to-paid transition**
 
-- The transition is driven by `execute_recurring_payment`, which an off-chain
-  keeper / cron calls once a cycle is due. There is **no separate "convert" call**,
-  and the customer does **not** need to take any action to convert to a paid
-  subscription.
+- The merchant must call `emit_trial_conversion_notice(subscription_id)` between
+  30 days and the subscription's `min_notice_lead_secs` before `trial_data.ends_at`.
+  The minimum lead is at most 24 hours and is shortened for trials shorter than
+  48 hours. A notice cannot be emitted at the trial's creation timestamp.
+- The notice publishes the locked conversion amount in the
+  `TrialConversionNoticeEmitted` event. Extending a trial or obtaining new customer
+  consent for a changed amount invalidates the existing notice.
+- The first post-trial charge is driven by `execute_recurring_payment`, which an
+  off-chain keeper / cron calls once a cycle is due. It is rejected unless the
+  notice exists and `subscription.amount <= trial_data.locked_conversion_amount`.
+  The customer can explicitly approve a different amount during the trial using
+  `authorize_trial_conversion_amount`; a new notice is then required.
 - While `now < trial_data.ends_at`, a due `execute_recurring_payment` performs
   **no token transfer**, does **not** increment `payment_count`, advances
   `next_payment_at` by one `interval`, and returns `Ok`. Repeated due cycles
   during the trial are each skipped this way.
-- On the first `execute_recurring_payment` where `now >= trial_data.ends_at` and a
-  payment is due, the customer is charged normally (running through the usual
-  merchant-not-paused, not-expired, spend-limit and discount checks). If that
-  transfer succeeds, `trial_data.converted` is set to `true` and a
-  `TrialConverted { subscription_id, converted_at }` event is emitted. Later
-  charges behave like any recurring payment.
+- Once the notice and locked-price checks pass, the first post-trial charge runs
+  through the usual merchant-not-paused, not-expired, spend-limit and discount
+  checks. If the transfer succeeds, `trial_data.converted` is set to `true`, the
+  charge and timestamp are retained for the grace period, and a `TrialConverted`
+  event is emitted. Later charges behave like any recurring payment.
 - If the first post-trial charge fails, the subscription follows the standard
   retry / dunning path and `converted` stays `false` until a charge succeeds.
+
+**Post-conversion cancellation**
+
+- For 24 hours after the first conversion charge, a customer cancellation with
+  zero reported usage and no subsequent recurring charge attempts to transfer
+  the entire initial charge back from the merchant to the customer. A
+  `TrialConversionChargeReversed` event is emitted on success.
+- Because the first charge is paid to the merchant immediately, the merchant
+  must have approved the payment contract to pull back the charge. If the
+  merchant's balance or allowance is insufficient, cancellation fails with
+  `TransferFailed`; the contract does not record a successful cancellation or
+  refund. Reported usage during the grace period prevents the automatic reversal.
 
 **Cancelling during a trial**
 

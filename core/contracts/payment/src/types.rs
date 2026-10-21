@@ -104,6 +104,14 @@ pub struct SubscriptionTrialData {
     pub period_seconds: u64,
     pub ends_at: u64,
     pub converted: bool,
+    pub locked_conversion_amount: i128,
+    pub notice_emitted_at: Option<u64>,
+    pub min_notice_lead_secs: u64,
+    pub post_trial_cancel_grace_secs: u64,
+    pub conversion_charge_amount: Option<i128>,
+    pub conversion_charged_at: Option<u64>,
+    pub post_conversion_usage_units: u64,
+    pub conversion_charge_reversed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
