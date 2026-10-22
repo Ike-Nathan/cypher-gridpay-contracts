@@ -13,6 +13,11 @@ use soroban_sdk::{
 pub mod storage;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
+mod archival;
+mod finality;
+mod reconciliation;
+pub use archival::{ArchivalConfig, CompactArchivedPayment};
+pub use finality::{FinalityFlag, FinalityRiskConfig};
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -184,6 +189,9 @@ pub enum BasicError {
     // Issue #88: a data migration step failed, so the schema version must
     // not be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 127,
+    /// A merchant's aggregate volume for the day would exceed its verification
+    /// tier limit (#23).
+    DailyTierLimitExceeded = 128,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -466,7 +474,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 127 {
+            if code >= 100 && code <= 128 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -569,7 +577,7 @@ pub struct PayoutSchedule {
     pub accumulated: i128,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum PaymentStatus {
     Pending,
@@ -2109,6 +2117,189 @@ impl PaymentContract {
             .instance()
             .set(&DataKey::Config(ConfigKey::SchemaVersion), &target_version);
         Ok(())
+    }
+
+    /// Runs the data transformations registered for every schema version step
+    /// between `from_version` (exclusive) and `to_version` (inclusive).
+    ///
+    /// # Arguments
+    /// * `from_version` - The currently stored schema version.
+    /// * `to_version` - The requested schema version.
+    ///
+    /// # Returns
+    /// `Ok(())` when all steps completed, or `SchemaMigrationFailed` if any
+    /// entry could not be transformed (in which case the caller reverts).
+    fn run_data_migrations(env: &Env, from_version: u32, to_version: u32) -> Result<(), Error> {
+        let mut version = from_version;
+        while version < to_version {
+            let next_version = version + 1;
+            // v2: every stored payment must be reachable through the customer
+            // index, the merchant index and the paged merchant index. Versions
+            // without a registered data transformation are no-ops.
+            if next_version == 2 {
+                Self::migrate_v1_to_v2(env)?;
+            }
+            version = next_version;
+        }
+        Ok(())
+    }
+
+    /// v1 -> v2 data migration: backfills the per-customer and per-merchant
+    /// payment indexes for payments stored before those indexes existed.
+    ///
+    /// # Returns
+    /// `Ok(())` when every payment in `1..=PaymentKey::Counter` could be read
+    /// and indexed, otherwise `SchemaMigrationFailed`.
+    fn migrate_v1_to_v2(env: &Env) -> Result<(), Error> {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Counter))
+            .unwrap_or(0);
+
+        for payment_id in 1..=counter {
+            let payment: Payment = env
+                .storage()
+                .instance()
+                .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
+
+            // Corrupted record: the id and the indexed party must agree.
+            if payment.id != payment_id {
+                return Err(Error::Basic(BasicError::SchemaMigrationFailed));
+            }
+
+            Self::index_payment_for_customer(env, &payment.customer, payment_id);
+            Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
+        }
+
+        Ok(())
+    }
+
+    /// Appends `payment_id` to the customer's payment index when missing.
+    fn index_payment_for_customer(env: &Env, customer: &Address, payment_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        if Self::index_contains(
+            env,
+            count,
+            |index| DataKey::Customer(CustomerDataKey::Payments(customer.clone(), index)),
+            payment_id,
+        ) {
+            return;
+        }
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::Payments(customer.clone(), count)),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::PaymentCount(customer.clone())),
+            &(count + 1),
+        );
+    }
+
+    /// Appends `payment_id` to the merchant's flat and paged payment indexes
+    /// when missing.
+    fn index_payment_for_merchant(env: &Env, merchant: &Address, payment_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        if !Self::index_contains(
+            env,
+            count,
+            |index| DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), index)),
+            payment_id,
+        ) {
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), count)),
+                &payment_id,
+            );
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
+                &(count + 1),
+            );
+        }
+        Self::index_payment_in_merchant_page(env, merchant, payment_id);
+    }
+
+    /// Number of payment ids stored per paged merchant index page.
+    const MERCHANT_PAYMENT_PAGE_SIZE: u64 = 100;
+
+    /// Appends `payment_id` to the merchant's paged payment index, starting a
+    /// new page when the current one is full.
+    fn index_payment_in_merchant_page(env: &Env, merchant: &Address, payment_id: u64) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let last_page = if total == 0 {
+            0
+        } else {
+            (total - 1) / Self::MERCHANT_PAYMENT_PAGE_SIZE
+        };
+        let mut page: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                merchant.clone(),
+                last_page,
+            )))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..page.len() {
+            if page.get(i) == Some(payment_id) {
+                return;
+            }
+        }
+
+        if page.len() as u64 >= Self::MERCHANT_PAYMENT_PAGE_SIZE {
+            page = Vec::new(env);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    last_page + 1,
+                )),
+                &page,
+            );
+        }
+        page.push_back(payment_id);
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                merchant.clone(),
+                last_page,
+            )),
+            &page,
+        );
+    }
+
+    /// Returns `true` when `payment_id` is already stored in one of the `count`
+    /// slots addressed by `key_at`.
+    fn index_contains<F>(env: &Env, count: u64, key_at: F, payment_id: u64) -> bool
+    where
+        F: Fn(u64) -> DataKey,
+    {
+        if count == 0 {
+            return false;
+        }
+        // Healthy indexes are append-only, so the newest slot is checked first.
+        for index in (0..count).rev() {
+            if env.storage().instance().get::<DataKey, u64>(&key_at(index)) == Some(payment_id) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Simulates a schema migration and returns an impact report without
@@ -8223,6 +8414,7 @@ impl PaymentContract {
             PaymentContract::risk_surcharge_bps(&env, &customer, amount, &currency);
 
         PaymentContract::compute_fee_amount(
+            &env,
             amount,
             effective_fee_bps,
             &FeeTier::Standard, // Tier already applied in get_effective_fee_bps
@@ -8385,6 +8577,7 @@ impl PaymentContract {
             PaymentContract::risk_surcharge_bps(env, customer, amount, &currency);
         let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
         let fee = PaymentContract::compute_fee_amount(
+            env,
             amount,
             effective_bps,
             &record.fee_tier,
@@ -8438,6 +8631,7 @@ impl PaymentContract {
     /// Computes the fee amount applying the tier discount, adding the
     /// risk-based surcharge, then clamping to min/max.
     fn compute_fee_amount(
+        env: &Env,
         amount: i128,
         fee_bps: u32,
         tier: &FeeTier,
@@ -12455,6 +12649,16 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the caller is not an admin, the sweep recipient
     /// is not set, the fee config is missing, or there are no fees to sweep.
+    pub fn sweep_platform_fees(env: Env, admin: Address) -> Result<i128, Error> {
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+            .unwrap_or(0);
+        let amount = if accumulated > 0 { accumulated } else { 0 };
+        Self::sweep_fees(env, admin, amount)
+    }
+
     /// Sweeps up to `sweep_amount` of accumulated platform fees to the configured recipient.
     ///
     /// # Arguments
@@ -12492,25 +12696,17 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::NothingToSweep));
         }
 
-        // Issue #111: Mathematical assertion — sweep amount must never exceed accumulated fees.
-        let sweep_amount: i128 = accumulated;
-        assert!(
-            sweep_amount <= accumulated,
-            "sweep_amount ({}) exceeds accumulated_fees ({})",
-            sweep_amount,
-            accumulated
-        );
+        // Issue #111: the swept amount must be positive and never exceed the
+        // accumulated fees, so a sweep can't dip into merchant settlements.
+        if sweep_amount <= 0 || sweep_amount > accumulated {
+            return Err(Error::Feature(FeatureError::InsufficientFees));
+        }
 
-        // Issue #111: Require multisig approval for sweeps exceeding the threshold.
-        let sweep_threshold: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::LargePaymentThreshold))
-            .unwrap_or(0);
-        if sweep_threshold > 0 && sweep_amount > sweep_threshold {
-            if config.required_signatures > 1 {
-                return Err(Error::Basic(BasicError::InsufficientAdmins));
-            }
+        // Issue #111: sweeps above the large-payment threshold need multisig.
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        let multisig_threshold = if threshold > 0 { threshold } else { 1_000_000 };
+        if sweep_amount > multisig_threshold && config.required_signatures > 1 {
+            return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
         let fee_config: FeeConfig = env
@@ -12522,6 +12718,7 @@ impl PaymentContract {
         // Security check: Ensure sweep won't encroach on merchant pending settlements
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
+        let remaining = accumulated - sweep_amount;
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::AccumulatedFees), &remaining);

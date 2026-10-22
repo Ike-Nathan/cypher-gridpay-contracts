@@ -592,17 +592,19 @@ pub struct RefundDeniedEvent {
     pub rejection_reason: String,
 }
 
+/// Emitted when a denied/appealed refund is escalated to the orchestrator's
+/// supreme council (#294). (Event names are limited to 32 characters.)
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AppealEscalatedToSupremeCouncilEvent {
+pub struct SupremeEscalationEvent {
     pub refund_id: u64,
     pub appellant: Address,
     pub amount: i128,
     pub escalated_at: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppealFiledEvent {
     pub appeal_id: u64,
     pub refund_id: u64,
@@ -2688,9 +2690,11 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
         refund.status = RefundStatus::EscalatedToSupremeCouncil;
-        Self::save_refund(&env, &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
 
-        (AppealEscalatedToSupremeCouncilEvent {
+        (SupremeEscalationEvent {
             refund_id,
             appellant,
             amount: refund.amount,
@@ -5500,7 +5504,7 @@ impl RefundContract {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
-                        RefundStatus::PendingAppeal => {
+                        RefundStatus::PendingAppeal | RefundStatus::EscalatedToSupremeCouncil => {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
@@ -7069,7 +7073,9 @@ impl RefundContract {
             };
             let active = match refund.status {
                 RefundStatus::Requested => refund.expires_at.is_none_or(|exp| now < exp),
-                RefundStatus::Approved | RefundStatus::PendingAppeal => true,
+                RefundStatus::Approved
+                | RefundStatus::PendingAppeal
+                | RefundStatus::EscalatedToSupremeCouncil => true,
                 RefundStatus::Rejected
                 | RefundStatus::PermanentlyDenied
                 | RefundStatus::Processed => false,

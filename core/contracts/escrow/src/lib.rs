@@ -46,6 +46,8 @@ pub enum ConfigKey {
     EvidenceDeadlineConfig,
     ThresholdVersion,
     ProposalApprovalVersion(String),
+    /// Minimum escrow deposit amount (#45).
+    MinEscrowAmount,
 }
 
 #[derive(Clone)]
@@ -185,7 +187,7 @@ pub enum EscrowError {
     /// Inactivity or dispute resolution timeout has not been reached. Resolution: wait until timeout deadline passes.
     TimeoutNotReached = 204,
     /// Escrow release is in a mandatory cooling/hold period. Resolution: wait until hold period expires.
-    ReleaseOnHoldPeriod = 205,
+    HoldPeriodActive = 205,
     /// Vesting schedule parameters (cliff, duration, intervals) are invalid. Resolution: provide non-zero duration and valid cliff.
     InvalidVestingSchedule = 206,
     /// Vesting cliff timestamp has not arrived yet. Resolution: wait until vesting cliff period has elapsed.
@@ -235,6 +237,10 @@ pub enum EscrowError {
     /// Clawback delay parameter is below protocol minimum safety delay. Resolution: increase clawback delay.
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
+    /// The release timelock has not elapsed yet. Resolution: wait until the timelock expires.
+    TimelockNotElapsed = 231,
+    /// Escrow deposit is below the configured minimum (`ConfigKey::MinEscrowAmount`). Resolution: deposit at least the minimum.
+    DepositBelowMinimum = 232,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -275,6 +281,8 @@ pub enum ActionError {
     /// Deposited collateral balance is insufficient for this operation. Resolution: fund additional collateral to escrow.
     InsufficientCollateral = 315,
     ArbitrationRequired = 316,
+    /// The oracle price is older than the configured staleness threshold. Resolution: refresh the oracle price.
+    StaleOraclePrice = 317,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -321,10 +329,10 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            if code >= 300 && code <= 317 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 230 {
+            if code >= 200 && code <= 232 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 114 {
@@ -1718,6 +1726,9 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
+/// Number of pause-history entries retained; older entries are overwritten
+/// in a ring buffer.
+pub const PAUSE_HISTORY_LIMIT: u64 = 20;
 /// Length of the dispute appeal window in seconds (72 hours). An appeal is
 /// accepted only while `now < dispute_started_at + APPEAL_WINDOW_SECONDS`, so
 /// the boundary is deterministic rather than depending on `<` vs `≤` drift.
@@ -3942,7 +3953,9 @@ impl EscrowContract {
             EscrowStatus::Released => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
             EscrowStatus::Disputed => Err(Error::Escrow(EscrowError::InvalidStatus)),
             EscrowStatus::Resolved => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
-            EscrowStatus::Cancelled => Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::Cancelled | EscrowStatus::ExpiredRefunded => {
+                Err(Error::Escrow(EscrowError::AlreadyProcessed))
+            }
         }
     }
 
@@ -3981,8 +3994,11 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, escrow.fee_bps, 10000);
-        let merchant_amount = escrow.amount - fee_amount;
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
+        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, distributable, escrow.fee_bps, 10000);
+        let merchant_amount = distributable - fee_amount;
         let fee_config = Self::get_escrow_fee_config(env.clone());
 
         if fee_amount > 0 && fee_config.fee_recipient == env.current_contract_address() {
@@ -4126,7 +4142,10 @@ impl EscrowContract {
             EscrowStatus::Disputed => {
                 return Err(Error::Escrow(EscrowError::InvalidStatus));
             }
-            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
                 return Err(Error::Escrow(EscrowError::AlreadyProcessed))
             }
         }
@@ -4135,6 +4154,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // CEI: Resolved status is persisted above before refunding the customer.
         EscrowContract::transfer_if_token_contract(
             &env,
@@ -5016,6 +5038,10 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         Self::dequeue_escalation(&env, escrow_id);
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
+
         match &favor {
             AutoResolveFavor::Customer => {
                 EscrowContract::transfer_if_token_contract(
@@ -5247,8 +5273,11 @@ impl EscrowContract {
         // CEI: all state (status, collateral record, reputation, analytics) is
         // persisted above. External token transfers happen last.
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // Transfer main escrow funds to the dispute winner
-        Self::transfer_if_token_contract(&env, &escrow.token, &winner, escrow.amount)?;
+        Self::transfer_if_token_contract(&env, &escrow.token, &winner, distributable)?;
 
         // Distribute collateral to the dispute winner
         if let Some(collateral) = collateral {
@@ -6718,7 +6747,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0,
+            hold_period_until: current_timestamp,
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -7599,7 +7628,7 @@ impl EscrowContract {
                     EscrowStatus::Resolved => {
                         return Err(Error::Escrow(EscrowError::AlreadyProcessed))
                     }
-                    EscrowStatus::Cancelled => {
+                    EscrowStatus::Cancelled | EscrowStatus::ExpiredRefunded => {
                         return Err(Error::Escrow(EscrowError::AlreadyProcessed))
                     }
                 }
@@ -7608,8 +7637,11 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-                let fee_amount = fixed_math::mul_div_ceil_or_panic(env, escrow.amount, escrow.fee_bps, 10000);
-                let merchant_amount = escrow.amount - fee_amount;
+                // Sub-account milestone ledgers are isolated from the parent: a
+                // parent-level liquidation may only touch the parent's own remainder.
+                let distributable = EscrowContract::parent_liquidatable_amount(env, &escrow);
+                let fee_amount = fixed_math::mul_div_ceil_or_panic(env, distributable, escrow.fee_bps, 10000);
+                let merchant_amount = distributable - fee_amount;
                 let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
 
                 if fee_amount > 0 && fee_config.fee_recipient == env.current_contract_address() {
@@ -7755,12 +7787,15 @@ impl EscrowContract {
                     a.total_resolutions += 1;
                 });
 
+                // Sub-account milestone ledgers are isolated from the parent: a
+                // parent-level liquidation may only touch the parent's own remainder.
+                let distributable = EscrowContract::parent_liquidatable_amount(env, &escrow);
                 // CEI: status, reputation and analytics are persisted above.
                 EscrowContract::transfer_if_token_contract(
                     env,
                     &escrow.token,
                     &winner,
-                    escrow.amount,
+                    distributable,
                 )?;
 
                 EscrowResolved {
@@ -9805,7 +9840,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0,
+            hold_period_until: current_timestamp,
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -10600,7 +10635,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0, // Default for batch
+            hold_period_until: current_timestamp, // no hold period for batch-created escrows
             fee_bps: 0,         // Default fee
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -10820,7 +10855,10 @@ impl EscrowContract {
         let mut escrow = Self::get_escrow(&env, escrow_id);
 
         match escrow.status {
-            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
                 return Err(Error::Escrow(EscrowError::EscrowAlreadyExpired));
             }
             EscrowStatus::Disputed => return Err(Error::Escrow(EscrowError::InvalidStatus)),
@@ -10836,6 +10874,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // CEI: Cancelled status is persisted above before the refund transfer.
         EscrowContract::transfer_if_token_contract(
             &env,
@@ -12002,7 +12043,10 @@ impl EscrowContract {
             amount,
             token,
             parent_escrow.release_timestamp,
-            parent_escrow.min_hold_period,
+            // The child inherits whatever is left of the parent's hold period.
+            parent_escrow
+                .hold_period_until
+                .saturating_sub(env.ledger().timestamp()),
             parent_escrow.expiry_timestamp,
             parent_escrow.auto_refund_on_expiry,
             None,
