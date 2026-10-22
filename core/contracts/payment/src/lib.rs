@@ -241,6 +241,16 @@ pub enum PaymentError {
     InvalidScheduleTime = 223,
     /// Token not allowed. Use an allowed token.
     TokenNotAllowed = 224,
+    /// Payment is flagged during its finality window (#196). Clear or resolve the flag first.
+    PaymentFlagged = 225,
+    /// Payment is not flagged (#196).
+    NotFlagged = 226,
+    /// Caller is not the payer, risk oracle or emergency pauser (#196).
+    NotAuthorizedChallenger = 227,
+    /// The finality window for this settlement has already closed (#196).
+    FinalityWindowClosed = 228,
+    /// Invalid finality risk configuration (#196).
+    InvalidFinalityRiskConfig = 229,
 }
 
 /// Errors relating to recurring subscription plans, dunning cycles, and billing.
@@ -453,7 +463,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 318 {
                 return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 224 {
+            if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 127 {
@@ -3841,6 +3851,19 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Permissionless: reconciles a payment with its escrow's terminal state (#198).
+    /// Applies `Released -> Completed`, `ExpiredRefunded -> Refunded`,
+    /// `Cancelled -> Cancelled` once; `Disputed` mirrors an unresolved dispute.
+    /// Returns the payment's status after reconciliation.
+    pub fn sync_escrowed_payment_state(env: Env, payment_id: u64) -> Result<PaymentStatus, Error> {
+        reconciliation::sync_escrowed_payment_state(&env, payment_id)
+    }
+
+    /// Returns true once a payment's escrow outcome has been reconciled by sync (#198).
+    pub fn is_escrow_reconciled(env: Env, payment_id: u64) -> bool {
+        reconciliation::is_reconciled(&env, payment_id)
+    }
+
     /// Retrieves the escrowed payment bridge record for a given payment.
     ///
     /// # Arguments
@@ -4189,7 +4212,8 @@ impl PaymentContract {
         if let Some(ref fc) = finality {
             if fc.active && payment.amount >= fc.min_amount_threshold {
                 // Hold funds — create PendingSettlement instead of transferring
-                let release_at = env.ledger().timestamp() + fc.delay_seconds;
+                let release_at = env.ledger().timestamp()
+                    + finality::compute_required_finality_delay(env, &payment, fc.delay_seconds);
                 let settlement = PendingSettlement {
                     payment_id,
                     merchant: payment.merchant.clone(),
@@ -12952,6 +12976,81 @@ impl PaymentContract {
             .get(&DataKey::Config(ConfigKey::FinalityConfig))
     }
 
+    /// Sets the archival retention and refund windows (#197). Admin only.
+    pub fn configure_archival(
+        env: Env,
+        admin: Address,
+        config: ArchivalConfig,
+    ) -> Result<(), Error> {
+        archival::configure(&env, &admin, &config)
+    }
+
+    /// Compacts aged terminal payments into `CompactArchivedPayment` records (#197).
+    /// Returns the number compacted; ineligible ids are skipped. See `archival.rs`.
+    pub fn compact_settled_payments(env: Env, payment_ids: Vec<u64>) -> Result<u32, Error> {
+        archival::compact_settled_payments(&env, payment_ids)
+    }
+
+    /// Returns the compact archive record for a payment, if compacted.
+    pub fn get_archived_payment(env: Env, payment_id: u64) -> Option<CompactArchivedPayment> {
+        archival::get_archived(&env, payment_id)
+    }
+
+    /// Proves a full historical `Payment` against its on-chain `state_hash` (#197).
+    pub fn verify_archived_payment_blob(env: Env, payment_id: u64, full_payment: Payment) -> bool {
+        archival::verify_archived_payment_blob(&env, payment_id, full_payment)
+    }
+
+    /// Configures risk-tier finality scaling (#196). Admin only.
+    pub fn configure_finality_risk(
+        env: Env,
+        admin: Address,
+        config: FinalityRiskConfig,
+    ) -> Result<(), Error> {
+        finality::configure(&env, &admin, &config)
+    }
+
+    /// Returns the risk-tier finality configuration, if set.
+    pub fn get_finality_risk_config(env: Env) -> Option<FinalityRiskConfig> {
+        finality::get_risk_config(&env)
+    }
+
+    /// Returns the finality delay (seconds) that would apply to `payment_id`.
+    pub fn get_required_finality_delay(env: Env, payment_id: u64) -> u64 {
+        let payment = Self::get_payment(&env, payment_id);
+        let legacy = Self::get_finality_config(env.clone())
+            .map(|c| c.delay_seconds)
+            .unwrap_or(0);
+        finality::compute_required_finality_delay(&env, &payment, legacy)
+    }
+
+    /// Freezes a pending settlement during its finality window (#196). The
+    /// payer, the configured risk oracle or the emergency pauser may call it.
+    pub fn flag_payment_during_finality(
+        env: Env,
+        payment_id: u64,
+        challenger: Address,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        finality::flag(&env, payment_id, &challenger, reason)
+    }
+
+    /// Returns the finality flag recorded for a payment, if any.
+    pub fn get_finality_flag(env: Env, payment_id: u64) -> Option<FinalityFlag> {
+        finality::get_flag(&env, payment_id)
+    }
+
+    /// Admin resolution of a flagged settlement: `refund = true` returns the
+    /// held funds to the payer and cancels the settlement; `false` clears the flag.
+    pub fn resolve_finality_flag(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+        refund: bool,
+    ) -> Result<(), Error> {
+        finality::resolve(&env, &admin, payment_id, refund)
+    }
+
     /// Finalizes a pending settlement by transferring funds to the merchant.
     ///
     /// The settlement's release time must have passed. After finalization,
@@ -12967,6 +13066,9 @@ impl PaymentContract {
     /// Returns an error if the settlement is already finalized, not found,
     /// or the release time has not yet passed.
     pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        if finality::is_flagged(&env, payment_id) {
+            return Err(Error::Payment(PaymentError::PaymentFlagged));
+        }
         if env
             .storage()
             .instance()

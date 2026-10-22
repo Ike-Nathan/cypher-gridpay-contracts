@@ -140,3 +140,97 @@ fn test_payment_tag_reads_extend_ttl() {
     client.get_payment(&payment_id);
     assert_eq!(instance_ttl(), storage::INSTANCE_BUMP_AMOUNT);
 }
+
+// ── Payment archival / state compression (#197) ──────────────────────────────
+
+mod archival_compaction {
+    use super::*;
+    use soroban_sdk::{vec, String};
+
+    fn setup() -> (Env, PaymentContractClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentContract);
+        let client = PaymentContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token_addr = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+        token.mint(&contract_id, &10_000_000);
+        client.initialize(&admin);
+        let customer = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let id = client.create_payment(
+            &customer,
+            &merchant,
+            &500,
+            &token_addr,
+            &Currency::USDC,
+            &0,
+            &String::from_str(&env, "some verbose metadata"),
+        );
+        client.complete_payment(&admin, &id);
+        client.configure_archival(
+            &admin,
+            &ArchivalConfig {
+                archival_retention_secs: 100,
+                max_refund_window_secs: 500,
+            },
+        );
+        (env, client, admin, id)
+    }
+
+    #[test]
+    fn test_refund_window_guard_then_compaction_and_proof() {
+        let (env, client, _admin, id) = setup();
+        let full = client.get_payment(&id);
+
+        // First call only records the first-seen time; nothing compacted.
+        assert_eq!(client.compact_settled_payments(&vec![&env, id]), 0);
+        env.ledger().with_mut(|l| l.timestamp += 499);
+        assert_eq!(client.compact_settled_payments(&vec![&env, id]), 0);
+        assert!(client.get_archived_payment(&id).is_none());
+
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        assert_eq!(client.compact_settled_payments(&vec![&env, id]), 1);
+        // Idempotent.
+        assert_eq!(client.compact_settled_payments(&vec![&env, id]), 0);
+
+        let rec = client.get_archived_payment(&id).unwrap();
+        assert_eq!(rec.amount, 500);
+        assert_eq!(rec.status, PaymentStatus::Completed);
+
+        // Stub keeps the terminal status but drops the verbose payload.
+        let stub = client.get_payment(&id);
+        assert_eq!(stub.status, PaymentStatus::Completed);
+        assert_eq!(stub.metadata, String::from_str(&env, ""));
+
+        // The original full record proves against the commitment; the stub does not.
+        assert!(client.verify_archived_payment_blob(&id, &full));
+        assert!(!client.verify_archived_payment_blob(&id, &stub));
+    }
+
+    #[test]
+    fn test_pending_payment_is_never_compacted() {
+        let (env, client, admin, _id) = setup();
+        let c = Address::generate(&env);
+        let m = Address::generate(&env);
+        let tok = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let pid = client.create_payment(
+            &c,
+            &m,
+            &10,
+            &tok,
+            &Currency::USDC,
+            &0,
+            &String::from_str(&env, ""),
+        );
+        env.ledger().with_mut(|l| l.timestamp += 10_000);
+        assert_eq!(client.compact_settled_payments(&vec![&env, pid]), 0);
+        assert_eq!(client.compact_settled_payments(&vec![&env, pid]), 0);
+        assert!(client.get_archived_payment(&pid).is_none());
+    }
+}
