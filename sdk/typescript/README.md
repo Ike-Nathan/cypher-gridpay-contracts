@@ -99,3 +99,40 @@ application is the cheapest possible contract-migration test.
 ## License
 
 MIT
+
+## Strongly-Typed ContractError Decoder & Diagnostics
+
+The SDK provides automated decoders to parse raw Soroban simulation reverts (`ScErrorType::Contract`) and on-chain transaction errors into structured, user-friendly diagnostic objects with remediation guidance:
+
+```typescript
+import {
+  decodeGridPayError,
+  isContractError,
+  isRetryableError,
+  formatDiagnosticError,
+} from "@cypher-gridpay/contracts-sdk";
+
+try {
+  await client.submitPayment(params);
+} catch (rawError) {
+  const decoded = decodeGridPayError(rawError, "payment");
+  if (decoded) {
+    console.error(`[${decoded.contract.toUpperCase()}::${decoded.name} (#${decoded.code})]`);
+    console.error(`Category: ${decoded.category}`);
+    console.error(`Message: ${decoded.message}`);
+    console.error(`Remediation: ${decoded.resolution}`);
+
+    if (decoded.retryable) {
+      console.log("Transient failure detected — eligible for retry after backoff.");
+    }
+  } else {
+    console.error(formatDiagnosticError(rawError));
+  }
+}
+```
+
+### Supported Contract Catalogs:
+- **PaymentContract**: `BasicError` (100–126), `PaymentError` (200–224), `SubscriptionError` (300–318), `ProposalError` (400–406), `FeatureError` (500–541)
+- **EscrowContract**: `BasicError` (100–114), `EscrowError` (200–230), `ActionError` (300–316)
+- **RefundContract**: `CoreError` (1–33), `ExtError` (34–51)
+- **AdminContract**: `AdminError` (1–5)
