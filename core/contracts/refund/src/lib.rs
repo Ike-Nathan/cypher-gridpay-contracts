@@ -6635,6 +6635,21 @@ impl RefundContract {
     }
 
     fn add_to_status_index(env: &Env, status: RefundStatus, refund_id: u64) {
+        // Issue #243: every finalized refund is committed to the archived-record
+        // Merkle accumulator as the SHA-256 of its XDR.
+        if matches!(
+            status,
+            RefundStatus::Processed | RefundStatus::Rejected | RefundStatus::PermanentlyDenied
+        ) {
+            if let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+            {
+                storage::append_archived_leaf(env, storage::archived_record_leaf(env, &refund));
+            }
+        }
+
         let count = Self::get_refund_count_by_status(env, status.clone());
         env.storage()
             .instance()
@@ -10831,6 +10846,18 @@ impl RefundContract {
     }
 
     // Issue #370: Customer tier management
+
+    /// Issue #243: prove that `leaf_hash` (SHA-256 of a finalized refund's XDR)
+    /// is the `index`-th leaf of the archived-record Merkle accumulator.
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
 
     /// Assign a tier level to a customer for tier-based refund cap policies.
     ///

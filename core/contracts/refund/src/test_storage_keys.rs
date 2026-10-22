@@ -17,9 +17,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     xdr::{FromXdr, ToXdr},
-    Address, Env, Symbol, TryFromVal, Val,
+    Address, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Number of variants in each key enum. Update alongside the enumerations.
@@ -822,4 +822,134 @@ fn test_key_encoding_is_keyed_on_variant_name() {
             "`{label}` aliases the versioned-policy counter slot"
         );
     }
+}
+
+// ── Issue #243: archived-record Merkle accumulator ──────────────────────────
+
+fn merkle_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    let mut data = Bytes::from_array(env, &left.to_array());
+    data.extend_from_array(&right.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Builds every level of the full depth-20 tree over `leaves` (missing
+/// nodes are the all-zero subtree hashes) and returns `(levels, zeros)`.
+fn merkle_levels(
+    env: &Env,
+    leaves: &[BytesN<32>],
+) -> (
+    std::vec::Vec<std::vec::Vec<BytesN<32>>>,
+    std::vec::Vec<BytesN<32>>,
+) {
+    let mut zeros = std::vec![BytesN::from_array(env, &[0u8; 32])];
+    let mut levels = std::vec![leaves.to_vec()];
+    for depth in 0..storage::MERKLE_TREE_DEPTH as usize {
+        let current = &levels[depth];
+        let mut next = std::vec::Vec::new();
+        for i in (0..current.len()).step_by(2) {
+            let right = current.get(i + 1).unwrap_or(&zeros[depth]);
+            next.push(merkle_pair(env, &current[i], right));
+        }
+        zeros.push(merkle_pair(env, &zeros[depth], &zeros[depth]));
+        levels.push(next);
+    }
+    (levels, zeros)
+}
+
+fn merkle_proof(
+    env: &Env,
+    levels: &[std::vec::Vec<BytesN<32>>],
+    zeros: &[BytesN<32>],
+    index: u64,
+) -> Vec<BytesN<32>> {
+    let mut proof = Vec::new(env);
+    for depth in 0..storage::MERKLE_TREE_DEPTH as usize {
+        let sibling = ((index >> depth) ^ 1) as usize;
+        proof.push_back(levels[depth].get(sibling).unwrap_or(&zeros[depth]).clone());
+    }
+    proof
+}
+
+#[test]
+fn test_merkle_accumulator_1000_leaves_and_inclusion_proofs() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let leaves: std::vec::Vec<BytesN<32>> = (0..1_000u32)
+        .map(|i| {
+            env.crypto()
+                .sha256(&Bytes::from_array(&env, &i.to_be_bytes()))
+                .to_bytes()
+        })
+        .collect();
+    env.as_contract(&contract_id, || {
+        for (i, leaf) in leaves.iter().enumerate() {
+            assert_eq!(storage::append_archived_leaf(&env, leaf.clone()), i as u64);
+        }
+    });
+
+    let (levels, zeros) = merkle_levels(&env, &leaves);
+    let imt = env.as_contract(&contract_id, || storage::get_merkle_frontier(&env));
+    assert_eq!(imt.leaf_count, 1_000);
+    assert_eq!(imt.frontier.len(), storage::MERKLE_TREE_DEPTH);
+    assert_eq!(imt.root, levels[storage::MERKLE_TREE_DEPTH as usize][0]);
+
+    for (i, leaf) in leaves.iter().enumerate() {
+        let proof = merkle_proof(&env, &levels, &zeros, i as u64);
+        assert!(client.verify_archived_record_inclusion(leaf, &(i as u64), &proof));
+    }
+
+    // Wrong leaf, wrong position, out-of-range index and short proofs fail.
+    let proof = merkle_proof(&env, &levels, &zeros, 7);
+    assert!(!client.verify_archived_record_inclusion(&leaves[8], &7, &proof));
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &6, &proof));
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &1_000, &proof));
+    let mut short = proof.clone();
+    short.pop_back();
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &7, &short));
+}
+
+#[test]
+fn test_merkle_accumulator_empty_rejects_index_zero() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let (levels, zeros) = merkle_levels(&env, &[]);
+    let proof = merkle_proof(&env, &levels, &zeros, 0);
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(!client.verify_archived_record_inclusion(&zero, &0, &proof));
+}
+
+#[test]
+fn test_finalized_refund_is_committed_to_accumulator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let refund_id = client.request_refund(
+        &Address::generate(&env),
+        &1,
+        &Address::generate(&env),
+        &1000,
+        &5000,
+        &Address::generate(&env),
+        &String::from_str(&env, "archive"),
+        &RefundReasonCode::CustomerRequest,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "denied"));
+    let deadline = client.get_refund(&refund_id).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    let leaf = env.crypto().sha256(&refund.to_xdr(&env)).to_bytes();
+    let (levels, zeros) = merkle_levels(&env, &[leaf.clone()]);
+    let proof = merkle_proof(&env, &levels, &zeros, 0);
+    assert!(client.verify_archived_record_inclusion(&leaf, &0, &proof));
 }

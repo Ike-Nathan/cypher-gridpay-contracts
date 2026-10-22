@@ -13001,6 +13001,18 @@ impl PaymentContract {
         archival::verify_archived_payment_blob(&env, payment_id, full_payment)
     }
 
+    /// Proves that `leaf_hash` (SHA-256 of an archived payment's XDR) is the
+    /// `index`-th leaf of the archived-record Merkle accumulator (#243).
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
+
     /// Configures risk-tier finality scaling (#196). Admin only.
     pub fn configure_finality_risk(
         env: Env,

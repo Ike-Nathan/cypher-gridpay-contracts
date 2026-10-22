@@ -373,3 +373,219 @@ fn test_admin_calls_extend_instance_ttl() {
     s.client().set_payment_contract(&s.admin, &s.payment);
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
 }
+
+// ── Rotation handshake (Issue #237) ─────────────────────────────────────────
+
+mod peer {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+
+    #[contracttype]
+    enum Key {
+        Initialized,
+        Rejecting,
+        Peer(Symbol),
+    }
+
+    /// Stand-in sibling contract exposing the rotation handshake entry points.
+    #[contract]
+    pub struct MockPeer;
+
+    #[contractimpl]
+    impl MockPeer {
+        pub fn configure(env: Env, initialized: bool, rejecting: bool) {
+            env.storage()
+                .instance()
+                .set(&Key::Initialized, &initialized);
+            env.storage().instance().set(&Key::Rejecting, &rejecting);
+        }
+
+        pub fn get_schema_version(_env: Env) -> u32 {
+            1
+        }
+
+        pub fn is_initialized(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&Key::Initialized)
+                .unwrap_or(false)
+        }
+
+        pub fn set_payment_contract(env: Env, caller: Address, address: Address) {
+            let name = Symbol::new(&env, "payment");
+            Self::set_peer(env, caller, name, address);
+        }
+
+        pub fn set_escrow_contract(env: Env, caller: Address, address: Address) {
+            let name = Symbol::new(&env, "escrow");
+            Self::set_peer(env, caller, name, address);
+        }
+
+        pub fn set_refund_contract(env: Env, caller: Address, address: Address) {
+            let name = Symbol::new(&env, "refund");
+            Self::set_peer(env, caller, name, address);
+        }
+
+        pub fn peer(env: Env, name: Symbol) -> Option<Address> {
+            env.storage().instance().get(&Key::Peer(name))
+        }
+    }
+
+    impl MockPeer {
+        fn set_peer(env: Env, caller: Address, name: Symbol, address: Address) {
+            caller.require_auth();
+            let rejecting: bool = env
+                .storage()
+                .instance()
+                .get(&Key::Rejecting)
+                .unwrap_or(false);
+            if rejecting {
+                panic!("peer rejected address update");
+            }
+            env.storage().instance().set(&Key::Peer(name), &address);
+        }
+    }
+}
+
+fn setup_peer(env: &Env, initialized: bool, rejecting: bool) -> Address {
+    let id = env.register(peer::MockPeer, ());
+    peer::MockPeerClient::new(env, &id).configure(&initialized, &rejecting);
+    id
+}
+
+/// Admin contract wired to three mock siblings.
+fn setup_with_peers(refund_rejects: bool) -> Setup {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AdminContract, ());
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    let payment = setup_peer(&env, true, false);
+    let escrow = setup_peer(&env, true, false);
+    let refund = setup_peer(&env, true, refund_rejects);
+    let s = Setup {
+        env,
+        contract_id,
+        admin,
+        pauser,
+        payment,
+        escrow,
+        refund,
+    };
+    s.client()
+        .initialize(&s.admin, &s.pauser, &s.payment, &s.escrow, &s.refund);
+    s
+}
+
+fn peer_of(s: &Setup, contract: &Address, name: &str) -> Option<Address> {
+    peer::MockPeerClient::new(&s.env, contract).peer(&Symbol::new(&s.env, name))
+}
+
+fn pass_rotation_timelock(s: &Setup) {
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp += CONTRACT_ROTATION_TIMELOCK);
+}
+
+#[test]
+fn test_escrow_rotation_propagates_to_peers() {
+    let s = setup_with_peers(false);
+    let c = s.client();
+    let new_escrow = setup_peer(&s.env, true, false);
+
+    c.set_escrow_contract(&s.admin, &new_escrow);
+    pass_rotation_timelock(&s);
+    c.execute_escrow_rotation(&s.admin);
+
+    assert_eq!(peer_of(&s, &s.payment, "escrow"), Some(new_escrow.clone()));
+    assert_eq!(peer_of(&s, &s.refund, "escrow"), Some(new_escrow.clone()));
+    assert!(c.is_deprecated_contract(&ContractTarget::Escrow, &s.escrow));
+    assert!(!c.is_deprecated_contract(&ContractTarget::Escrow, &new_escrow));
+}
+
+#[test]
+fn test_payment_and_refund_rotations_propagate_to_peers() {
+    let s = setup_with_peers(false);
+    let c = s.client();
+    let new_payment = setup_peer(&s.env, true, false);
+    let new_refund = setup_peer(&s.env, true, false);
+
+    c.set_payment_contract(&s.admin, &new_payment);
+    c.set_refund_contract(&s.admin, &new_refund);
+    pass_rotation_timelock(&s);
+    c.execute_payment_rotation(&s.admin);
+    c.execute_refund_rotation(&s.admin);
+
+    assert_eq!(peer_of(&s, &s.escrow, "payment"), Some(new_payment.clone()));
+    assert_eq!(peer_of(&s, &s.refund, "payment"), Some(new_payment.clone()));
+    // The refund rotation reaches the already-rotated payment contract.
+    assert_eq!(
+        peer_of(&s, &new_payment, "refund"),
+        Some(new_refund.clone())
+    );
+    assert_eq!(peer_of(&s, &s.escrow, "refund"), Some(new_refund));
+    assert_eq!(
+        c.get_deprecated_contracts(&ContractTarget::Payment),
+        Vec::from_array(&s.env, [s.payment.clone()])
+    );
+}
+
+#[test]
+fn test_rotation_rejects_uninitialized_target() {
+    let s = setup_with_peers(false);
+    let c = s.client();
+    let uninitialized = setup_peer(&s.env, false, false);
+
+    c.set_escrow_contract(&s.admin, &uninitialized);
+    pass_rotation_timelock(&s);
+    assert_eq!(
+        c.try_execute_escrow_rotation(&s.admin),
+        Err(Ok(Error::RotationTargetNotReady))
+    );
+    assert!(c.get_pending_rotation(&ContractTarget::Escrow).is_some());
+    assert_eq!(peer_of(&s, &s.payment, "escrow"), None);
+}
+
+#[test]
+fn test_rotation_rejects_non_contract_target() {
+    let s = setup_with_peers(false);
+    let c = s.client();
+    c.set_payment_contract(&s.admin, &Address::generate(&s.env));
+    pass_rotation_timelock(&s);
+    assert_eq!(
+        c.try_execute_payment_rotation(&s.admin),
+        Err(Ok(Error::RotationTargetNotReady))
+    );
+}
+
+#[test]
+fn test_rotation_rejects_current_address() {
+    let s = setup_with_peers(false);
+    let c = s.client();
+    c.set_refund_contract(&s.admin, &s.refund);
+    pass_rotation_timelock(&s);
+    assert_eq!(
+        c.try_execute_refund_rotation(&s.admin),
+        Err(Ok(Error::RotationToCurrentAddress))
+    );
+}
+
+#[test]
+fn test_rotation_rolls_back_when_peer_rejects() {
+    let s = setup_with_peers(true);
+    let c = s.client();
+    let new_escrow = setup_peer(&s.env, true, false);
+
+    c.set_escrow_contract(&s.admin, &new_escrow);
+    pass_rotation_timelock(&s);
+    assert_eq!(
+        c.try_execute_escrow_rotation(&s.admin),
+        Err(Ok(Error::PeerSyncFailed))
+    );
+
+    // Payment's update, the deprecation entry and the address swap all roll back.
+    assert_eq!(peer_of(&s, &s.payment, "escrow"), None);
+    assert!(c
+        .get_deprecated_contracts(&ContractTarget::Escrow)
+        .is_empty());
+    assert!(c.get_pending_rotation(&ContractTarget::Escrow).is_some());
+}

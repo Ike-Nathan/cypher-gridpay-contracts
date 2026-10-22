@@ -3,7 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, IntoVal,
+    String, Symbol, Val, Vec,
 };
 
 #[contracterror]
@@ -15,6 +16,10 @@ pub enum Error {
     RotationNotPending = 4,
     RotationTimelockActive = 5,
     RotationAlreadyPending = 6,
+    // Issue #237: rotation handshake
+    RotationToCurrentAddress = 20,
+    RotationTargetNotReady = 21,
+    PeerSyncFailed = 22,
 }
 
 /// Identifies which downstream contract address is being rotated.
@@ -92,6 +97,8 @@ pub enum DataKey {
     PendingPaymentRotation,
     PendingEscrowRotation,
     PendingRefundRotation,
+    // Issue #237: addresses a target was rotated away from
+    DeprecatedContracts(ContractTarget),
 }
 
 /// Schema version written by `initialize`.
@@ -673,6 +680,13 @@ impl AdminContract {
     }
 
     /// Applies a pending rotation once its timelock has elapsed.
+    ///
+    /// Issue #237: the new address must differ from the current one and pass
+    /// a readiness probe (`get_schema_version` and `is_initialized`). The old
+    /// address is kept in the deprecated-contract allowlist so in-flight
+    /// escrows/refunds can still complete legacy settlement callbacks, and
+    /// the new address is broadcast to both sibling contracts. If any sibling
+    /// rejects the update the whole rotation is rolled back.
     fn execute_rotation(
         env: &Env,
         target: ContractTarget,
@@ -696,11 +710,26 @@ impl AdminContract {
             .instance()
             .get(&stored_key)
             .ok_or(Error::NotInitialized)?;
+        if rotation.new_address == old_address {
+            return Err(Error::RotationToCurrentAddress);
+        }
+        Self::probe_rotation_target(env, &rotation.new_address)?;
 
         env.storage()
             .instance()
             .set(&stored_key, &rotation.new_address);
         env.storage().instance().remove(&pending_key);
+
+        let deprecated_key = DataKey::DeprecatedContracts(target.clone());
+        let mut deprecated: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&deprecated_key)
+            .unwrap_or(Vec::new(env));
+        deprecated.push_back(old_address.clone());
+        env.storage().instance().set(&deprecated_key, &deprecated);
+
+        Self::broadcast_peer_address(env, &target, &rotation.new_address)?;
 
         (ContractTargetUpdated {
             target,
@@ -711,6 +740,67 @@ impl AdminContract {
         .publish(env);
 
         Ok(())
+    }
+
+    /// Rejects a rotation target that is not a deployed, initialized contract.
+    fn probe_rotation_target(env: &Env, new_address: &Address) -> Result<(), Error> {
+        let schema = env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            new_address,
+            &Symbol::new(env, "get_schema_version"),
+            Vec::new(env),
+        );
+        let initialized = env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            new_address,
+            &Symbol::new(env, "is_initialized"),
+            Vec::new(env),
+        );
+        match (schema, initialized) {
+            (Ok(Ok(version)), Ok(Ok(true))) if version > 0 => Ok(()),
+            _ => Err(Error::RotationTargetNotReady),
+        }
+    }
+
+    /// Pushes a rotated address to the two sibling contracts, e.g. an escrow
+    /// rotation calls `set_escrow_contract` on Payment and Refund.
+    fn broadcast_peer_address(
+        env: &Env,
+        target: &ContractTarget,
+        new_address: &Address,
+    ) -> Result<(), Error> {
+        let (payment, escrow, refund) = Self::get_contract_addresses(env)?;
+        let (setter, peers) = match target {
+            ContractTarget::Payment => ("set_payment_contract", [escrow, refund]),
+            ContractTarget::Escrow => ("set_escrow_contract", [payment, refund]),
+            ContractTarget::Refund => ("set_refund_contract", [payment, escrow]),
+        };
+        let args: Vec<Val> = (env.current_contract_address(), new_address.clone()).into_val(env);
+        for peer in peers {
+            let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
+                &peer,
+                &Symbol::new(env, setter),
+                args.clone(),
+            );
+            if !matches!(result, Ok(Ok(_))) {
+                return Err(Error::PeerSyncFailed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the addresses a contract target was rotated away from, oldest
+    /// first (Issue #237). Siblings use this allowlist to accept legacy
+    /// settlement callbacks from contracts that are still draining.
+    pub fn get_deprecated_contracts(env: Env, target: ContractTarget) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DeprecatedContracts(target))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns whether `address` is a deprecated `target` contract that may
+    /// still complete legacy settlement callbacks (Issue #237).
+    pub fn is_deprecated_contract(env: Env, target: ContractTarget, address: Address) -> bool {
+        Self::get_deprecated_contracts(env, target).contains(&address)
     }
 
     /// Sets or updates the emergency pauser address.
