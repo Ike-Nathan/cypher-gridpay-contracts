@@ -11,6 +11,7 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+pub mod fixed_math;
 
 #[derive(Clone)]
 #[contracttype]
@@ -3294,7 +3295,7 @@ impl EscrowContract {
 
         for p in escrow.participants.iter() {
             if p.share_bps > 0 {
-                let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                let amount = fixed_math::mul_div_floor_or_panic(&env, escrow.total_amount, p.share_bps as i128, 10000);
                 if amount > 0 {
                     token_client.transfer(&contract_address, &p.address, &amount);
                 }
@@ -3980,7 +3981,7 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, escrow.fee_bps, 10000);
         let merchant_amount = escrow.amount - fee_amount;
         let fee_config = Self::get_escrow_fee_config(env.clone());
 
@@ -7607,7 +7608,7 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-                let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+                let fee_amount = fixed_math::mul_div_ceil_or_panic(env, escrow.amount, escrow.fee_bps, 10000);
                 let merchant_amount = escrow.amount - fee_amount;
                 let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
 
@@ -9087,7 +9088,7 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
 
-        let premium = (escrow.amount * config.premium_bps) / 10000;
+        let premium = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, config.premium_bps, 10000);
         if premium == 0 {
             return Ok(());
         }
@@ -9144,7 +9145,7 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::InsuranceConfig))
             .ok_or(Error::Basic(BasicError::Unauthorized))?;
-        let max_coverage = (escrow.amount * config.max_coverage_bps) / 10000;
+        let max_coverage = fixed_math::mul_div_floor_or_panic(&env, escrow.amount, config.max_coverage_bps, 10000);
         if amount > max_coverage {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
@@ -9905,7 +9906,7 @@ impl EscrowContract {
                 .instance()
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-            let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+            let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, escrow.fee_bps, 10000);
             let merchant_amount = escrow.amount - fee_amount;
             let fee_config = Self::get_escrow_fee_config(env.clone());
 
@@ -10420,7 +10421,7 @@ impl EscrowContract {
         if favor_merchant {
             for p in escrow.participants.iter() {
                 if p.share_bps > 0 {
-                    let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                    let amount = fixed_math::mul_div_floor_or_panic(&env, escrow.total_amount, p.share_bps as i128, 10000);
                     if amount > 0 {
                         token_client.transfer(&contract_address, &p.address, &amount);
                     }
@@ -10441,7 +10442,7 @@ impl EscrowContract {
             } else {
                 for p in escrow.participants.iter() {
                     if p.share_bps > 0 {
-                        let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                        let amount = fixed_math::mul_div_floor_or_panic(&env, escrow.total_amount, p.share_bps as i128, 10000);
                         if amount > 0 {
                             token_client.transfer(&contract_address, &p.address, &amount);
                         }
@@ -10954,7 +10955,7 @@ impl EscrowContract {
                 return Err(Error::Escrow(EscrowError::RenewalPeriodTooLong));
             }
 
-            renewal_fee = (escrow.amount * config.renewal_fee_bps as i128) / 10_000;
+            renewal_fee = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, config.renewal_fee_bps as i128, 10_000);
             renewal_count += 1;
 
             env.storage().instance().set(
@@ -11688,7 +11689,7 @@ impl EscrowContract {
         }
 
         let fee_bps = Self::effective_sub_account_fee_bps(&sub, escrow.fee_bps);
-        let fee_amount = (sub.amount * fee_bps) / 10000;
+        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, sub.amount, fee_bps, 10000);
         let merchant_amount = sub.amount - fee_amount;
 
         // CEI: mark the sub-account released before any transfer so it cannot
