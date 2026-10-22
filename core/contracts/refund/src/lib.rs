@@ -5,6 +5,8 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+#[path = "../../escrow/src/fixed_math.rs"]
+pub mod fixed_math;
 
 #[cfg(test)]
 extern crate std;
@@ -271,6 +273,8 @@ pub enum RefundStatus {
     // merchant), as opposed to `Rejected`, which is the initial merchant
     // denial before any appeal has been decided.
     PermanentlyDenied,
+    /// Issue #294: Escalated to orchestrator supreme governance council
+    EscalatedToSupremeCouncil,
 }
 
 // Issue #397: canonical reason codes, enforced by the type system on Refund and
@@ -590,6 +594,15 @@ pub struct RefundDeniedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealEscalatedToSupremeCouncilEvent {
+    pub refund_id: u64,
+    pub appellant: Address,
+    pub amount: i128,
+    pub escalated_at: u64,
+}
+
 pub struct AppealFiledEvent {
     pub appeal_id: u64,
     pub refund_id: u64,
@@ -2659,6 +2672,35 @@ impl RefundContract {
     ///   to the terminal `RefundStatus::PermanentlyDenied` state rather than
     ///   the pre-appeal `Rejected` state, so callers can distinguish "denied,
     ///   appeal pending/available" from "denied, appeal exhausted".
+        /// Issue #294: Cross-contract escalation path for high-value or deadlocked refund appeals
+    /// to the orchestrator governance council.
+    pub fn escalate_appeal_to_orchestrator(
+        env: Env,
+        refund_id: u64,
+        appellant: Address,
+    ) -> Result<(), Error> {
+        appellant.require_auth();
+        let mut refund = Self::get_refund(&env, refund_id)?;
+        if refund.customer != appellant && refund.merchant != appellant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::PendingAppeal && refund.status != RefundStatus::Rejected {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        refund.status = RefundStatus::EscalatedToSupremeCouncil;
+        Self::save_refund(&env, &refund);
+
+        (AppealEscalatedToSupremeCouncilEvent {
+            refund_id,
+            appellant,
+            amount: refund.amount,
+            escalated_at: env.ledger().timestamp(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn resolve_appeal(
         env: Env,
         admin: Address,
@@ -2983,11 +3025,9 @@ impl RefundContract {
         }
 
         let payment = Self::get_external_payment(&env, trigger.payment_id)?;
-        let refund_amount = payment
-            .amount
-            .checked_mul(trigger.refund_bps as i128)
-            .and_then(|value| value.checked_div(10000))
-            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        let refund_amount =
+            fixed_math::mul_div_floor(&env, payment.amount, trigger.refund_bps as i128, 10000)
+                .map_err(|_| Error::Core(CoreError::InvalidAmount))?;
         if refund_amount <= 0 {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
@@ -3809,8 +3849,8 @@ impl RefundContract {
             {
                 // Calculate shares based on basis points
                 let arbitrator_amount =
-                    (case.fee_pool * config.arbitrator_share_bps as i128) / 10000;
-                let treasury_amount = (case.fee_pool * config.treasury_share_bps as i128) / 10000;
+                    fixed_math::mul_div_floor_or_panic(&env, case.fee_pool, config.arbitrator_share_bps as i128, 10000);
+                let treasury_amount = fixed_math::mul_div_floor_or_panic(&env, case.fee_pool, config.treasury_share_bps as i128, 10000);
                 (
                     arbitrator_amount,
                     treasury_amount,
@@ -4820,7 +4860,7 @@ impl RefundContract {
         env.storage().instance().remove(&award_key);
 
         let fee_bps = Self::get_arbitration_protocol_fee(env.clone()) as i128;
-        let fee = payout.saturating_mul(fee_bps) / 10_000;
+        let fee = fixed_math::mul_div_ceil_or_panic(env, payout, fee_bps, 10_000);
         if fee <= 0 {
             return payout;
         }
