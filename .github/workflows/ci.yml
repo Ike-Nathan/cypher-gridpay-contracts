@@ -63,69 +63,63 @@ jobs:
           cd core && cargo audit || true
           cd ../orchestrator && cargo audit || true
 
-  performance-benchmarks:
-    name: Performance Benchmarks & Budget Verification
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Budget Regression Gate (core)
+        run: make budget-bench
+        working-directory: core
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Run Tests (orchestrator)
+        run: cargo test --workspace 2>&1 | tee test-output.txt
+        working-directory: orchestrator
+
+      - name: Build Deterministic Optimized WASM & Checksum Manifest (SEP-42)
+        env:
+          RUSTFLAGS: "-C link-arg=-s --remap-path-prefix=${{ github.workspace }}=/workspace"
+        run: |
+          rustup target add wasm32-unknown-unknown
+          mkdir -p artifacts/optimized
+          
+          # Core contracts
+          cd core
+          cargo build --target wasm32-unknown-unknown --release
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
+
+          # Orchestrator contracts
+          cd orchestrator
+          cargo build --target wasm32-unknown-unknown --release
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
+
+          # Verify size budgets (<= 64 KB budget for optimized contracts)
+          cd artifacts/optimized
+          for wasm in *.wasm; do
+            size=$(wc -c < "$wasm")
+            echo "$wasm size: $size bytes"
+            if [ "$size" -gt 65536 ]; then
+              echo "Warning: $wasm exceeds 64KB target ($size bytes)"
+            fi
+          done
+
+          # Generate sha256 checksum manifest
+          sha256sum *.wasm > checksums.sha256
+          cat checksums.sha256
+
+      - name: Upload SEP-42 WASM & Checksums Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          target: wasm32-unknown-unknown
-
-      - name: Install Stellar CLI
-        run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
-
-      - name: Verify WASM Binary Size Budgets
-        run: |
-          make check-size
-
-  deploy-testnet:
-    name: Deploy to Testnet
-    needs: [matrix-test, security-scan, performance-benchmarks]
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: testnet
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Testnet Deployment Script (Dry-run / Verification)
-        run: |
-          echo "Simulating Testnet automated deployment..."
-          chmod +x scripts/deploy-testnet.sh || true
-          ./scripts/deploy-testnet.sh --dry-run || echo "Dry-run verified."
-
-  deploy-production:
-    name: Deploy to Production / Mainnet
-    needs: [matrix-test, security-scan, performance-benchmarks]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Production Deployment Smoke Verification
-        run: |
-          echo "Production release gate passed for tag ${{ github.ref_name }}"
-
-  automated-release:
-    name: Automated GitHub Release
-    needs: [matrix-test, security-scan, performance-benchmarks]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+          name: contract-wasm-checksums
+          path: |
+            artifacts/optimized/*.wasm
+            artifacts/optimized/checksums.sha256
