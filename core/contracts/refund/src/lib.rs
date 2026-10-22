@@ -4841,6 +4841,44 @@ impl RefundContract {
         Ok(accumulated)
     }
 
+    /// Sweep every accumulated protocol fee in `token` to `recipient`.
+    ///
+    /// Same as [`withdraw_protocol_fees`](Self::withdraw_protocol_fees),
+    /// except that nothing accumulated is not an error: it returns `0` and
+    /// transfers nothing, so a caller harvesting several contracts can skip an
+    /// empty one without reverting the rest.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn sweep_protocol_fees(
+        env: Env,
+        admin: Address,
+        token: Address,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        let key = ConfigKey::AccumulatedFees(token.clone());
+        let accumulated: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if accumulated <= 0 {
+            return Ok(0);
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &accumulated,
+        );
+        Ok(accumulated)
+    }
+
     fn mark_arbitration_award(env: &Env, refund_id: u64) {
         env.storage()
             .instance()

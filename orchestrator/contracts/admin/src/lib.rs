@@ -3,8 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN, Env,
+    String, Symbol, Vec,
 };
 
 #[contracterror]
@@ -25,6 +25,16 @@ pub enum Error {
     InvalidWasmHash = 13,
     /// The upgrade targets a contract this one cannot upgrade (only itself).
     InvalidUpgradeTarget = 14,
+    /// The treasury allocation's basis points do not sum to 10_000.
+    InvalidTreasuryAllocation = 15,
+    /// `harvest_all_protocol_fees` was called before `set_treasury_allocation`.
+    TreasuryAllocationNotSet = 16,
+    /// A child contract's fee sweep failed (e.g. the admin contract is not
+    /// one of its admins, or a payment sweep needs multisig).
+    FeeHarvestFailed = 17,
+    /// A child reported sweeping fees that did not arrive at this contract
+    /// (e.g. the payment sweep recipient is not the admin contract).
+    FeeHarvestNotReceived = 18,
 }
 
 /// Identifies which downstream contract address is being rotated.
@@ -107,6 +117,68 @@ pub enum DataKey {
     UpgradeProposalCounter,
     UpgradeTimelock,
     UpgradeRequiredApprovals,
+    TreasuryAllocation,
+    TreasuryRecipients,
+}
+
+/// Split of every harvested protocol fee, in basis points. The four parts
+/// must sum to exactly 10_000.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryAllocationConfig {
+    pub insurance_pool_bps: u32,
+    pub arbitrator_incentive_bps: u32,
+    pub protocol_treasury_bps: u32,
+    pub operations_bps: u32,
+}
+
+/// Where each part of the treasury allocation is paid.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryRecipients {
+    pub insurance_pool: Address,
+    pub arbitrator_pool: Address,
+    pub protocol_treasury: Address,
+    pub operations: Address,
+}
+
+/// What `harvest_all_protocol_fees` collected and paid out for one token.
+/// `total == from_payment + from_escrow + from_refund ==
+/// insurance_pool + arbitrator_incentive + protocol_treasury + operations`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeHarvestReport {
+    pub token: Address,
+    pub from_payment: i128,
+    pub from_escrow: i128,
+    pub from_refund: i128,
+    pub total: i128,
+    pub insurance_pool: i128,
+    pub arbitrator_incentive: i128,
+    pub protocol_treasury: i128,
+    pub operations: i128,
+}
+
+/// Emitted once per token that `harvest_all_protocol_fees` collected.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeesHarvested {
+    pub token: Address,
+    pub total: i128,
+    pub insurance_pool: i128,
+    pub arbitrator_incentive: i128,
+    pub protocol_treasury: i128,
+    pub operations: i128,
+}
+
+const BPS_DENOMINATOR: u32 = 10_000;
+
+/// `amount * bps / 10_000`, rounded down, without overflowing for any
+/// non-negative `amount`.
+fn bps_share(amount: i128, bps: u32) -> i128 {
+    let bps = bps as i128;
+    let denom = BPS_DENOMINATOR as i128;
+    (amount / denom) * bps + (amount % denom) * bps / denom
 }
 
 /// A proposed WASM upgrade awaiting approvals and its timelock.
@@ -1035,6 +1107,183 @@ impl AdminContract {
         Ok(())
     }
 
+    /// Sets how harvested protocol fees are split, and where each part goes.
+    ///
+    /// # Errors
+    /// `NotInitialized` / `Unauthorized` for anyone but the stored admin;
+    /// `InvalidTreasuryAllocation` unless the four parts sum to exactly 10_000.
+    pub fn set_treasury_allocation(
+        env: Env,
+        admin: Address,
+        config: TreasuryAllocationConfig,
+        recipients: TreasuryRecipients,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let sum = config.insurance_pool_bps as u64
+            + config.arbitrator_incentive_bps as u64
+            + config.protocol_treasury_bps as u64
+            + config.operations_bps as u64;
+        if sum != BPS_DENOMINATOR as u64 {
+            return Err(Error::InvalidTreasuryAllocation);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryAllocation, &config);
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryRecipients, &recipients);
+        Ok(())
+    }
+
+    /// The configured treasury split and recipients, if set.
+    pub fn get_treasury_allocation(
+        env: Env,
+    ) -> Option<(TreasuryAllocationConfig, TreasuryRecipients)> {
+        let config: TreasuryAllocationConfig =
+            env.storage().instance().get(&DataKey::TreasuryAllocation)?;
+        let recipients: TreasuryRecipients =
+            env.storage().instance().get(&DataKey::TreasuryRecipients)?;
+        Some((config, recipients))
+    }
+
+    /// Collects the protocol fees accrued in the payment, escrow and refund
+    /// contracts for each of `tokens`, routes them through this contract,
+    /// and pays them out according to the treasury allocation.
+    ///
+    /// Per token:
+    /// * Payment: `sweep_fees` for the whole accumulated balance, when
+    ///   `token` is the payment contract's fee token. The payment contract's
+    ///   sweep recipient must be this contract.
+    /// * Escrow: `withdraw_escrow_fees` for its accumulated fees in `token`.
+    /// * Refund: `sweep_protocol_fees` for its accumulated protocol fees.
+    ///
+    /// A contract with nothing accrued for a token is skipped; the other
+    /// contracts are still harvested. This contract must be an admin of all
+    /// three. The harvested total is split by the configured basis points,
+    /// rounding down, and the rounding remainder goes to the protocol
+    /// treasury, so the four payouts always add up to exactly what was
+    /// harvested. A token with nothing to harvest anywhere gets no report.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `Unauthorized` for anyone but the stored admin.
+    /// * `TreasuryAllocationNotSet` before `set_treasury_allocation`.
+    /// * `FeeHarvestFailed` if a child refuses a sweep.
+    /// * `FeeHarvestNotReceived` if swept fees did not reach this contract.
+    pub fn harvest_all_protocol_fees(
+        env: Env,
+        caller: Address,
+        tokens: Vec<Address>,
+    ) -> Result<Vec<FeeHarvestReport>, Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        let config: TreasuryAllocationConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryAllocation)
+            .ok_or(Error::TreasuryAllocationNotSet)?;
+        let recipients: TreasuryRecipients = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryRecipients)
+            .ok_or(Error::TreasuryAllocationNotSet)?;
+        let (payment_contract, escrow_contract, refund_contract) =
+            Self::get_contract_addresses(&env)?;
+
+        let this = env.current_contract_address();
+        let payment = PaymentContractClient::new(&env, &payment_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract);
+        let refund = RefundContractClient::new(&env, &refund_contract);
+        // The payment contract accrues fees in a single fee token.
+        let payment_fee_token = match payment.try_get_fee_config() {
+            Ok(Ok(fee_config)) => Some(fee_config.fee_token),
+            _ => None,
+        };
+
+        let mut reports = Vec::new(&env);
+        for token_address in tokens.iter() {
+            let token_client = token::Client::new(&env, &token_address);
+
+            let from_payment = if payment_fee_token.as_ref() == Some(&token_address) {
+                let accrued = payment.get_accumulated_fees();
+                if accrued > 0 {
+                    let before = token_client.balance(&this);
+                    payment
+                        .try_sweep_fees(&this, &accrued)
+                        .map_err(|_| Error::FeeHarvestFailed)?
+                        .map_err(|_| Error::FeeHarvestFailed)?;
+                    if token_client.balance(&this) - before != accrued {
+                        return Err(Error::FeeHarvestNotReceived);
+                    }
+                }
+                accrued.max(0)
+            } else {
+                0
+            };
+
+            let escrow_accrued = escrow.get_accumulated_escrow_fees(&token_address);
+            let from_escrow = if escrow_accrued > 0 {
+                escrow
+                    .try_withdraw_escrow_fees(&this, &token_address, &this, &escrow_accrued)
+                    .map_err(|_| Error::FeeHarvestFailed)?
+                    .map_err(|_| Error::FeeHarvestFailed)?
+            } else {
+                0
+            };
+
+            let from_refund = refund
+                .try_sweep_protocol_fees(&this, &token_address, &this)
+                .map_err(|_| Error::FeeHarvestFailed)?
+                .map_err(|_| Error::FeeHarvestFailed)?;
+
+            let total = from_payment + from_escrow + from_refund;
+            if total <= 0 {
+                continue;
+            }
+
+            let insurance_pool = bps_share(total, config.insurance_pool_bps);
+            let arbitrator_incentive = bps_share(total, config.arbitrator_incentive_bps);
+            let operations = bps_share(total, config.operations_bps);
+            // The remainder, including every rounding unit, goes to the
+            // treasury so the payouts add up to exactly `total`.
+            let protocol_treasury = total - insurance_pool - arbitrator_incentive - operations;
+
+            for (to, amount) in [
+                (&recipients.insurance_pool, insurance_pool),
+                (&recipients.arbitrator_pool, arbitrator_incentive),
+                (&recipients.protocol_treasury, protocol_treasury),
+                (&recipients.operations, operations),
+            ] {
+                if amount > 0 {
+                    token_client.transfer(&this, to, &amount);
+                }
+            }
+
+            ProtocolFeesHarvested {
+                token: token_address.clone(),
+                total,
+                insurance_pool,
+                arbitrator_incentive,
+                protocol_treasury,
+                operations,
+            }
+            .publish(&env);
+
+            reports.push_back(FeeHarvestReport {
+                token: token_address,
+                from_payment,
+                from_escrow,
+                from_refund,
+                total,
+                insurance_pool,
+                arbitrator_incentive,
+                protocol_treasury,
+                operations,
+            });
+        }
+        Ok(reports)
+    }
+
     pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Result<UpgradeProposal, Error> {
         env.storage()
             .instance()
@@ -1658,3 +1907,7 @@ mod test {
 
 #[cfg(test)]
 mod schema_version_test;
+
+#[cfg(test)]
+#[path = "test.rs"]
+mod admin_test;

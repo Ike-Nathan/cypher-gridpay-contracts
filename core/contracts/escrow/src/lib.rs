@@ -1908,8 +1908,6 @@ impl EscrowContract {
         );
         Self::transfer_if_token_contract(&env, &token, &to, amount)?;
 
-        Self::transfer_if_token_contract(&env, &token, &to, amount)?;
-
         EscrowFeesWithdrawn {
             amount,
             withdrawn_by: admin,
