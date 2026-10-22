@@ -119,6 +119,7 @@ pub enum DisputeKey {
     AppealRecord(u64, u64),
     LiquidationConfig,
     LiquidationHistory(u64),
+    MultiPartyCommitment(u64, Address),
 }
 
 #[derive(Clone)]
@@ -275,6 +276,12 @@ pub enum ActionError {
     /// Deposited collateral balance is insufficient for this operation. Resolution: fund additional collateral to escrow.
     InsufficientCollateral = 315,
     ArbitrationRequired = 316,
+    /// The revealed vote does not match the voter's committed hash. Resolution: reveal the committed choice and salt.
+    InvalidVoteCommitment = 317,
+    /// The dispute is not currently accepting this commit or reveal. Resolution: follow the commit/reveal deadlines.
+    VotingPhaseClosed = 318,
+    /// Vote choice must be 0 (customer) or 1 (merchant). Resolution: use one of the supported choices.
+    InvalidVoteChoice = 319,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -321,7 +328,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 316 {
+            if code >= 300 && code <= 319 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
             if code >= 200 && code <= 230 {
@@ -1595,6 +1602,13 @@ pub struct BeneficiaryTransfer {
     pub authorised_by: Address,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum MultiPartyDisputePhase {
+    CommitPhase,
+    RevealPhase,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct MultiPartyDispute {
@@ -1602,7 +1616,10 @@ pub struct MultiPartyDispute {
     pub votes_for_merchant: Vec<Address>,
     pub votes_for_customer: Vec<Address>,
     pub quorum_required: u32,
-    pub resolution_deadline: u64,
+    pub commit_deadline: u64,
+    pub reveal_deadline: u64,
+    pub phase: MultiPartyDisputePhase,
+    pub committed_voters: Vec<Address>,
     pub resolved: bool,
 }
 
@@ -10241,16 +10258,29 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let participant_count = escrow.participants.len();
-        let quorum_required = (participant_count / 2) + 1;
-        let resolution_deadline = env.ledger().timestamp() + 7 * 24 * 3600;
+        let mut total_weight = 0_u32;
+        for participant in escrow.participants.iter() {
+            let vote_weight: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VoteWeight(escrow_id, participant.address.clone()))
+                .unwrap_or(participant.share_bps);
+            total_weight = total_weight.saturating_add(vote_weight);
+        }
+        let quorum_required = (total_weight / 2).saturating_add(1);
+        let now = env.ledger().timestamp();
+        let commit_deadline = now.saturating_add(3 * 24 * 3600 + 12 * 3600);
+        let reveal_deadline = now.saturating_add(7 * 24 * 3600);
 
         let dispute = MultiPartyDispute {
             escrow_id,
             votes_for_merchant: Vec::new(&env),
             votes_for_customer: Vec::new(&env),
             quorum_required,
-            resolution_deadline,
+            commit_deadline,
+            reveal_deadline,
+            phase: MultiPartyDisputePhase::CommitPhase,
+            committed_voters: Vec::new(&env),
             resolved: false,
         };
 
@@ -10273,27 +10303,19 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Executes vote on multi party dispute.
+    /// Commits a voter-bound hash during the dispute's commit phase.
     ///
-    /// # Arguments
-    /// * `env` - Soroban environment.
-    /// * `voter` - Parameter value.
-    /// * `escrow_id` - Identifier for the requested object.
-    /// * `favor_merchant` - Parameter value.
-    ///
-    /// # Returns
-    /// Results in `Ok(())` on success or `Err(Error)` on failure.
-    ///
-    /// # Errors
-    /// Returns `Err(Error)` when the operation cannot be completed.
-    pub fn vote_on_multi_party_dispute(
+    /// Hash the concatenated XDR encodings of `escrow_id`, `voter`,
+    /// `vote_choice` (0 for customer or 1 for merchant), and `salt`, in that
+    /// order, to create `commitment`.
+    pub fn commit_dispute_vote(
         env: Env,
-        voter: Address,
         escrow_id: u64,
-        favor_merchant: bool,
+        voter: Address,
+        commitment: BytesN<32>,
     ) -> Result<(), Error> {
         voter.require_auth();
-        Self::require_not_paused(&env, "vote_on_multi_party_dispute")?;
+        Self::require_not_paused(&env, "commit_dispute_vote")?;
 
         let escrow: MultiPartyEscrow = env
             .storage()
@@ -10311,29 +10333,123 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::AlreadyProcessed));
         }
 
-        let mut is_participant = false;
+        let now = env.ledger().timestamp();
+        if now >= dispute.commit_deadline
+            || matches!(&dispute.phase, MultiPartyDisputePhase::RevealPhase)
+        {
+            return Err(Error::Action(ActionError::VotingPhaseClosed));
+        }
+
+        let mut eligible = false;
         for p in escrow.participants.iter() {
             if p.address == voter {
-                is_participant = true;
+                eligible = true;
                 break;
             }
         }
-        if !is_participant {
+        if !eligible {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        for addr in dispute.votes_for_merchant.iter() {
-            if addr == voter {
-                return Err(Error::Basic(BasicError::DuplicateApproval));
-            }
-        }
-        for addr in dispute.votes_for_customer.iter() {
-            if addr == voter {
-                return Err(Error::Basic(BasicError::DuplicateApproval));
-            }
+        if dispute.committed_voters.contains(&voter) {
+            return Err(Error::Basic(BasicError::DuplicateApproval));
         }
 
-        if favor_merchant {
+        dispute.committed_voters.push_back(voter.clone());
+        if dispute.committed_voters.len() == escrow.participants.len() {
+            dispute.phase = MultiPartyDisputePhase::RevealPhase;
+        }
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::MultiPartyDispute(escrow_id)),
+            &dispute,
+        );
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::MultiPartyCommitment(escrow_id, voter.clone())),
+            &commitment,
+        );
+
+        Ok(())
+    }
+
+    /// Reveals a previously committed vote once the commit phase is over.
+    /// `vote_choice` is 0 for the customer and 1 for the merchant.
+    pub fn reveal_dispute_vote(
+        env: Env,
+        escrow_id: u64,
+        voter: Address,
+        vote_choice: u32,
+        salt: BytesN<32>,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+        Self::require_not_paused(&env, "reveal_dispute_vote")?;
+
+        if vote_choice > 1 {
+            return Err(Error::Action(ActionError::InvalidVoteChoice));
+        }
+
+        let escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        let mut dispute: MultiPartyDispute = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::MultiPartyDispute(escrow_id)))
+            .ok_or(Error::Action(ActionError::NotDisputed))?;
+
+        if dispute.resolved {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        let mut eligible = false;
+        for p in escrow.participants.iter() {
+            if p.address == voter {
+                eligible = true;
+                break;
+            }
+        }
+        if !eligible {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let now = env.ledger().timestamp();
+        let all_committed = dispute.committed_voters.len() == escrow.participants.len();
+        if now < dispute.commit_deadline && !all_committed {
+            return Err(Error::Action(ActionError::VotingPhaseClosed));
+        }
+        if now >= dispute.reveal_deadline {
+            return Err(Error::Action(ActionError::VotingPhaseClosed));
+        }
+
+        if dispute.votes_for_merchant.contains(&voter)
+            || dispute.votes_for_customer.contains(&voter)
+        {
+            return Err(Error::Basic(BasicError::DuplicateApproval));
+        }
+
+        let committed_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::MultiPartyCommitment(
+                escrow_id,
+                voter.clone(),
+            )))
+            .ok_or(Error::Action(ActionError::VotingPhaseClosed))?;
+
+        let mut preimage = escrow_id.to_xdr(&env);
+        preimage.append(&voter.clone().to_xdr(&env));
+        preimage.append(&vote_choice.to_xdr(&env));
+        preimage.append(&salt.to_xdr(&env));
+        let revealed_hash = env.crypto().sha256(&preimage).to_bytes();
+        if revealed_hash != committed_hash {
+            return Err(Error::Action(ActionError::InvalidVoteCommitment));
+        }
+
+        dispute.phase = MultiPartyDisputePhase::RevealPhase;
+        if vote_choice == 1 {
             dispute.votes_for_merchant.push_back(voter.clone());
         } else {
             dispute.votes_for_customer.push_back(voter.clone());
@@ -10343,11 +10459,17 @@ impl EscrowContract {
             &DataKey::Dispute(DisputeKey::MultiPartyDispute(escrow_id)),
             &dispute,
         );
+        env.storage()
+            .instance()
+            .remove(&DataKey::Dispute(DisputeKey::MultiPartyCommitment(
+                escrow_id,
+                voter.clone(),
+            )));
 
         MultiPartyDisputeVoteCast {
             escrow_id,
             voter,
-            favor_merchant,
+            favor_merchant: vote_choice == 1,
         }
         .publish(&env);
 
@@ -10384,19 +10506,72 @@ impl EscrowContract {
         }
 
         let now = env.ledger().timestamp();
-        let merchant_votes = dispute.votes_for_merchant.len();
-        let customer_votes = dispute.votes_for_customer.len();
+        let mut merchant_weight = 0_u32;
+        let mut customer_weight = 0_u32;
+        let mut total_revealed = 0_u32;
+        for participant in escrow.participants.iter() {
+            let vote_weight: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VoteWeight(escrow_id, participant.address.clone()))
+                .unwrap_or(participant.share_bps);
+            if dispute.votes_for_merchant.contains(&participant.address) {
+                merchant_weight = merchant_weight.saturating_add(vote_weight);
+                total_revealed = total_revealed.saturating_add(1);
+            } else if dispute.votes_for_customer.contains(&participant.address) {
+                customer_weight = customer_weight.saturating_add(vote_weight);
+                total_revealed = total_revealed.saturating_add(1);
+            }
+        }
 
-        let favor_merchant;
+        let all_revealed = total_revealed == escrow.participants.len();
+        let merchant_quorum = merchant_weight >= dispute.quorum_required;
+        let customer_quorum = customer_weight >= dispute.quorum_required;
+        let reveal_deadline_passed = now >= dispute.reveal_deadline;
+        if !reveal_deadline_passed && !(all_revealed && (merchant_quorum || customer_quorum)) {
+            return Err(Error::Action(ActionError::ApprovalsThresholdNotMet));
+        }
 
-        if merchant_votes >= dispute.quorum_required {
-            favor_merchant = true;
-        } else if customer_votes >= dispute.quorum_required {
-            favor_merchant = false;
-        } else if now > dispute.resolution_deadline {
-            favor_merchant = false;
+        let favor_merchant = if merchant_quorum {
+            true
+        } else if customer_quorum || reveal_deadline_passed {
+            false
         } else {
             return Err(Error::Action(ActionError::ApprovalsThresholdNotMet));
+        };
+
+        if reveal_deadline_passed {
+            let reputation_config = Self::get_or_default_reputation_config(&env);
+            for voter in dispute.committed_voters.iter() {
+                if dispute.votes_for_merchant.contains(&voter)
+                    || dispute.votes_for_customer.contains(&voter)
+                {
+                    continue;
+                }
+
+                let mut reputation = Self::get_or_default_reputation(&env, &voter);
+                let old_score = reputation.score;
+                reputation.score = (reputation.score - reputation_config.loss_penalty).max(0);
+                reputation.last_updated = now;
+                env.storage().instance().set(
+                    &DataKey::Participant(ParticipantKey::ReputationScore(voter.clone())),
+                    &reputation,
+                );
+                ReputationUpdated {
+                    address: voter,
+                    old_score,
+                    new_score: reputation.score,
+                }
+                .publish(&env);
+            }
+        }
+
+        if reveal_deadline_passed && !merchant_quorum && !customer_quorum {
+            DisputeEscalated {
+                escrow_id,
+                level: 1,
+            }
+            .publish(&env);
         }
 
         dispute.resolved = true;
@@ -10473,10 +10648,21 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn get_multi_party_dispute(env: Env, escrow_id: u64) -> Result<MultiPartyDispute, Error> {
-        env.storage()
+        let mut dispute: MultiPartyDispute = env
+            .storage()
             .instance()
             .get(&DataKey::Dispute(DisputeKey::MultiPartyDispute(escrow_id)))
-            .ok_or(Error::Action(ActionError::NotDisputed))
+            .ok_or(Error::Action(ActionError::NotDisputed))?;
+        if env.ledger().timestamp() >= dispute.commit_deadline
+            && matches!(&dispute.phase, MultiPartyDisputePhase::CommitPhase)
+        {
+            dispute.phase = MultiPartyDisputePhase::RevealPhase;
+            env.storage().instance().set(
+                &DataKey::Dispute(DisputeKey::MultiPartyDispute(escrow_id)),
+                &dispute,
+            );
+        }
+        Ok(dispute)
     }
 
     // ── BATCH ESCROW CREATION ─────────────────────────────────────────────
@@ -12326,8 +12512,8 @@ mod verification_test;
 // #[cfg(test)]
 // mod beneficiary_transfer_test;
 //
-// #[cfg(test)]
-// mod multi_party_dispute_test;
+#[cfg(test)]
+mod multi_party_dispute_test;
 //
 #[cfg(test)]
 mod pause_history_test;
