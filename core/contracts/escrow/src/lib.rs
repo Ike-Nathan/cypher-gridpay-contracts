@@ -109,6 +109,7 @@ pub enum DisputeKey {
     EscalationQueueIndex,
     EscalationDeadline(u64),
     AppealRecord(u64, u64),
+    State(u64),
 }
 
 #[derive(Clone)]
@@ -813,6 +814,36 @@ pub enum AppealStatus {
     Pending,
     Resolved,
     Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct DisputeState {
+    pub escrow_id: u64,
+    pub buyer_response_latency_secs: u64,
+    pub seller_response_latency_secs: u64,
+    pub missed_mediation_deadlines: u32,
+    pub uncooperative_fee_penalty_bps: u32,
+    pub buyer_missed_deadlines: u32,
+    pub seller_missed_deadlines: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeStateUpdated {
+    pub escrow_id: u64,
+    pub buyer_latency: u64,
+    pub seller_latency: u64,
+    pub missed_deadlines: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrationFeeReallocated {
+    pub escrow_id: u64,
+    pub uncooperative_party: Address,
+    pub penalty_bps: u32,
+    pub fee_penalty_amount: i128,
 }
 
 #[contractevent]
@@ -5007,6 +5038,36 @@ impl EscrowContract {
             a.total_resolutions += 1;
         });
 
+        // When allocating arbitration fees in resolve_dispute, shift up to uncooperative_fee_penalty_bps
+        // of the arbitration fee burden onto a party that missed mediation response deadlines,
+        // even if the dispute settlement is split 50/50
+        if let Some(dispute_state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeState>(&DataKey::Dispute(DisputeKey::State(escrow_id)))
+        {
+            if dispute_state.missed_mediation_deadlines > 0 {
+                let uncooperative_party = if dispute_state.buyer_missed_deadlines > dispute_state.seller_missed_deadlines {
+                    escrow.customer.clone()
+                } else if dispute_state.seller_missed_deadlines > dispute_state.buyer_missed_deadlines {
+                    escrow.merchant.clone()
+                } else if release_to_merchant {
+                    escrow.customer.clone()
+                } else {
+                    escrow.merchant.clone()
+                };
+                let penalty_bps = dispute_state.uncooperative_fee_penalty_bps.min(10000);
+                let fee_penalty = (escrow.amount * penalty_bps as i128) / 10000;
+                ArbitrationFeeReallocated {
+                    escrow_id,
+                    uncooperative_party,
+                    penalty_bps,
+                    fee_penalty_amount: fee_penalty,
+                }
+                .publish(&env);
+            }
+        }
+
         EscrowResolved {
             escrow_id,
             released_to_merchant: release_to_merchant,
@@ -5015,6 +5076,63 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Records latency and missed mediation response deadlines for tracking dispute cooperation.
+    pub fn update_dispute_state(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        buyer_latency: u64,
+        seller_latency: u64,
+        missed_deadlines: u32,
+        buyer_missed: u32,
+        seller_missed: u32,
+        uncooperative_fee_penalty_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "update_dispute_state")?;
+
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MultiSigConfig>(&DataKey::Config(ConfigKey::AdminMultiSig))
+        {
+            if !config.admins.contains(&admin) {
+                return Err(Error::Basic(BasicError::NotAnAdmin));
+            }
+        }
+
+        let state = DisputeState {
+            escrow_id,
+            buyer_response_latency_secs: buyer_latency,
+            seller_response_latency_secs: seller_latency,
+            missed_mediation_deadlines: missed_deadlines,
+            uncooperative_fee_penalty_bps,
+            buyer_missed_deadlines: buyer_missed,
+            seller_missed_deadlines: seller_missed,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute(DisputeKey::State(escrow_id)), &state);
+
+        DisputeStateUpdated {
+            escrow_id,
+            buyer_latency,
+            seller_latency,
+            missed_deadlines,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Retrieves tracked dispute latency and mediation cooperation state.
+    pub fn get_dispute_state(env: Env, escrow_id: u64) -> Option<DisputeState> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::State(escrow_id)))
     }
 
     /// Returns an advisory dispute recommendation derived from the customer's

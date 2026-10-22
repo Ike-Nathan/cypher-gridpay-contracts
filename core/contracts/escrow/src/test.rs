@@ -5437,3 +5437,47 @@ fn test_vesting_acceleration_cap_not_exceeded_on_second_complete() {
     let vested = client.get_vested_amount(&escrow_id);
     assert!(vested <= 10000);
 }
+
+#[test]
+fn test_dispute_state_latency_tracking_and_penalty_shifting() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &5000_i128, &token, &1000_u64, &0_u64);
+
+    // Update dispute state with latency and missed deadlines
+    client.update_dispute_state(
+        &admin,
+        &escrow_id,
+        &3600_u64, // buyer_latency
+        &7200_u64, // seller_latency
+        &2_u32,    // missed_deadlines
+        &0_u32,    // buyer_missed
+        &2_u32,    // seller_missed
+        &1500_u32, // uncooperative_fee_penalty_bps (15%)
+    ).unwrap();
+
+    let state = client.get_dispute_state(&escrow_id).unwrap();
+    assert_eq!(state.buyer_response_latency_secs, 3600);
+    assert_eq!(state.seller_response_latency_secs, 7200);
+    assert_eq!(state.missed_mediation_deadlines, 2);
+    assert_eq!(state.seller_missed_deadlines, 2);
+    assert_eq!(state.uncooperative_fee_penalty_bps, 1500);
+
+    // Dispute and resolve escrow
+    client.dispute_escrow(&customer, &escrow_id).unwrap();
+    client.resolve_dispute(&admin, &escrow_id, &false).unwrap();
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
