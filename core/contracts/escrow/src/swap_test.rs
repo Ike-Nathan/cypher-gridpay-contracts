@@ -1,7 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl,
+    testutils::{Address as _, Ledger as _},
+    token, Address, Env,
+};
 
 #[contract]
 pub struct MockSwapOracle;

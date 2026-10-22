@@ -295,10 +295,10 @@ fn test_stale_nonce_replay_rejected() {
     //   latest: nonce=5, merchant gets 800
     let sign_state = |nonce: u64, amount: i128| -> BytesN<64> {
         let mut msg = Bytes::new(&env);
-        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&channel_id.clone().to_xdr(&env));
         msg.append(&amount.to_xdr(&env));
         msg.append(&nonce.to_xdr(&env));
-        msg.append(&contract_id.to_xdr(&env));
+        msg.append(&contract_id.clone().to_xdr(&env));
         let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
         let sig = signing_key.sign(&msg_vec);
         BytesN::<64>::from_array(&env, &sig.to_bytes())
