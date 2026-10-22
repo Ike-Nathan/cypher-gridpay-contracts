@@ -5,6 +5,8 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+#[path = "../../escrow/src/fixed_math.rs"]
+pub mod fixed_math;
 
 #[cfg(test)]
 extern crate std;
@@ -3023,11 +3025,9 @@ impl RefundContract {
         }
 
         let payment = Self::get_external_payment(&env, trigger.payment_id)?;
-        let refund_amount = payment
-            .amount
-            .checked_mul(trigger.refund_bps as i128)
-            .and_then(|value| value.checked_div(10000))
-            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        let refund_amount =
+            fixed_math::mul_div_floor(&env, payment.amount, trigger.refund_bps as i128, 10000)
+                .map_err(|_| Error::Core(CoreError::InvalidAmount))?;
         if refund_amount <= 0 {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
@@ -3849,8 +3849,8 @@ impl RefundContract {
             {
                 // Calculate shares based on basis points
                 let arbitrator_amount =
-                    (case.fee_pool * config.arbitrator_share_bps as i128) / 10000;
-                let treasury_amount = (case.fee_pool * config.treasury_share_bps as i128) / 10000;
+                    fixed_math::mul_div_floor_or_panic(&env, case.fee_pool, config.arbitrator_share_bps as i128, 10000);
+                let treasury_amount = fixed_math::mul_div_floor_or_panic(&env, case.fee_pool, config.treasury_share_bps as i128, 10000);
                 (
                     arbitrator_amount,
                     treasury_amount,
@@ -4860,7 +4860,7 @@ impl RefundContract {
         env.storage().instance().remove(&award_key);
 
         let fee_bps = Self::get_arbitration_protocol_fee(env.clone()) as i128;
-        let fee = payout.saturating_mul(fee_bps) / 10_000;
+        let fee = fixed_math::mul_div_ceil_or_panic(env, payout, fee_bps, 10_000);
         if fee <= 0 {
             return payout;
         }

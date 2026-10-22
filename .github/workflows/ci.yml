@@ -65,6 +65,10 @@ jobs:
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: core
 
+      - name: Budget Regression Gate (core)
+        run: make budget-bench
+        working-directory: core
+
       - name: Run Tests (orchestrator)
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: orchestrator
