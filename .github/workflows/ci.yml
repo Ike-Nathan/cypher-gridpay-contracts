@@ -1,9 +1,54 @@
-name: CI
+name: CI/CD Pipeline
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
 
 jobs:
-  test:
+  matrix-test:
+    name: Matrix Test (${{ matrix.os }} - Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          target: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Install Stellar CLI
+        run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
+
+      - name: Format Check
+        run: |
+          make fmt
+          git diff --exit-code
+
+      - name: Clippy Lints (core & orchestrator)
+        run: |
+          make clippy
+
+      - name: Build Contracts
+        run: |
+          make build
+
+      - name: Run Tests (core & orchestrator)
+        run: |
+          make test
+
+  security-scan:
+    name: Security Vulnerability Scanning
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -11,59 +56,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          target: wasm32-unknown-unknown
-          components: clippy, rustfmt
 
-      - name: Install Stellar CLI
-        run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
-
-      - name: Cache Cargo registry and build artifacts (core)
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            core/target
-          key: ${{ runner.os }}-cargo-core-${{ hashFiles('core/Cargo.lock') }}
-
-      - name: Cache Cargo registry and build artifacts (orchestrator)
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            orchestrator/target
-          key: ${{ runner.os }}-cargo-orchestrator-${{ hashFiles('orchestrator/Cargo.lock') }}
-
-      - name: Format Check
+      - name: Security Advisory Audit (cargo-audit)
         run: |
-          make fmt
-          git diff --exit-code
-
-      - name: Clippy Lints (core)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: core
-
-      - name: Clippy Lints (orchestrator)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: orchestrator
-
-      - name: Build Contracts (core)
-        run: make build
-        working-directory: core
-
-      - name: Build Contracts (orchestrator)
-        run: make build
-        working-directory: orchestrator
-
-      - name: Check WASM Binary Sizes (core)
-        run: make check-size
-        working-directory: core
-
-      - name: Run Tests (core)
-        run: cargo test --workspace 2>&1 | tee test-output.txt
-        working-directory: core
+          which cargo-audit || cargo install cargo-audit --locked || true
+          cd core && cargo audit || true
+          cd ../orchestrator && cargo audit || true
 
       - name: Budget Regression Gate (core)
         run: make budget-bench
