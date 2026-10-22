@@ -14,8 +14,10 @@ pub mod storage;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
 mod archival;
+pub mod channels;
 mod finality;
 mod reconciliation;
+pub use channels::DomainSeparator;
 pub use archival::{ArchivalConfig, CompactArchivedPayment};
 pub use finality::{FinalityFlag, FinalityRiskConfig};
 
@@ -11996,6 +11998,26 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the channel is not found, closed, expired, nonce is stale,
     /// amount exceeds deposit, or signature verification fails.
+    /// The signing domain of this contract on the current network
+    /// (see `channels.rs`). Read-only.
+    pub fn get_domain_separator(env: Env) -> DomainSeparator {
+        DomainSeparator::current(&env)
+    }
+
+    /// The 32-byte digest a customer signs to authorize
+    /// `settle_channel(channel_id, merchant_amount, nonce)` on this contract
+    /// and network. Read-only; lets integrators check their own encoding.
+    pub fn channel_settle_digest(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+    ) -> BytesN<32> {
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::signing_digest(&env, channels::ACTION_CHANNEL_SETTLE, &struct_hash)
+    }
+
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -12030,16 +12052,20 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
-        // Issue #113: Verify signature over (channel_id, merchant_amount, nonce, contract_address)
-        // Including the contract address prevents cross-channel replay attacks.
-        let mut msg = Bytes::new(&env);
-        msg.append(&channel_id.to_xdr(&env));
-        msg.append(&merchant_amount.to_xdr(&env));
-        msg.append(&nonce.to_xdr(&env));
-        msg.append(&env.current_contract_address().to_xdr(&env));
-
-        env.crypto()
-            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+        // The customer signs the domain-separated digest of (channel_id,
+        // merchant_amount, nonce): bound to this network, this contract and
+        // the settle_channel action, so it can't be replayed on another
+        // network, another deployment or another entry point (see
+        // channels.rs and SECURITY.md for the byte layout).
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::verify_domain_signature(
+            &env,
+            &channel.customer_pk,
+            channels::ACTION_CHANNEL_SETTLE,
+            &struct_hash,
+            &signature,
+        );
 
         let customer_refund = channel.deposited - merchant_amount;
 
@@ -13816,6 +13842,8 @@ mod test_metadata;
 
 #[cfg(test)]
 mod test_payment_channel;
+#[cfg(test)]
+mod test_replay_prevention;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
