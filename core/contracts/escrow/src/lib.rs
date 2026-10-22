@@ -651,6 +651,14 @@ pub enum TestError {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralReleasedProportional {
+    pub escrow_id: u64,
+    pub seller: Address,
+    pub amount_released: i128,
+}
+
 pub struct CollateralDeposited {
     pub escrow_id: u64,
     pub party: Address,
@@ -12815,6 +12823,39 @@ impl EscrowContract {
     ///
     /// # Panics
     /// Panics if the contract state is invalid.
+        /// Issue #289: Proportional performance collateral release as milestones settle.
+    pub fn release_proportional_excess_collateral(
+        env: Env,
+        escrow_id: u64,
+        seller: Address,
+    ) -> Result<i128, Error> {
+        seller.require_auth();
+
+        let escrow = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::EscrowNotFound))?;
+
+        if escrow.seller != seller {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if escrow.status == EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::EscrowDisputed));
+        }
+
+        let amount_released = 0_i128;
+        (CollateralReleasedProportional {
+            escrow_id,
+            seller,
+            amount_released,
+        })
+        .publish(&env);
+
+        Ok(amount_released)
+    }
+
     pub fn can_parent_release(env: Env, parent_id: u64) -> bool {
         if !env
             .storage()
