@@ -117,6 +117,9 @@ mod tests {
     #[test]
     fn micro_split_never_extracts() {
         let env = Env::default();
+        // 2,000 U256 host operations: this checks rounding, not cost, so the
+        // default per-invocation budget does not apply.
+        env.cost_estimate().budget().reset_unlimited();
         // Splitting an inflow fee with ceil never yields less than the whole-amount fee,
         // and splitting a payout with floor never yields more.
         let (total, bps) = (1_000_003i128, 37i128);
