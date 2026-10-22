@@ -58,8 +58,13 @@ pub enum ConfigKey {
     PauseStateKey,
     MinSplitAmount,
     SchemaVersion,
+    /// Legacy (schema < 3): the whole whitelist as one instance `Vec`.
     AllowedTokens,
     MaxForwardDepth,
+    /// Persistent shard `i` of the token whitelist (schema 3+).
+    TokenWhitelistShard(u32),
+    /// Instance: number of whitelisted tokens (schema 3+).
+    TokenWhitelistCount,
 }
 
 #[derive(Clone)]
@@ -2141,6 +2146,11 @@ impl PaymentContract {
             if next_version == 2 {
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: the token whitelist moves from one instance `Vec` to
+            // sharded persistent entries.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
@@ -2152,6 +2162,18 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` when every payment in `1..=PaymentKey::Counter` could be read
     /// and indexed, otherwise `SchemaMigrationFailed`.
+    /// v2 -> v3: moves the legacy instance whitelist into sharded persistent
+    /// storage. Idempotent; a contract that never had a whitelist is a no-op.
+    fn migrate_v2_to_v3(env: &Env) {
+        let legacy: Option<Vec<Address>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens));
+        if let Some(tokens) = legacy {
+            Self::store_allowed_tokens(env, &tokens);
+        }
+    }
+
     fn migrate_v1_to_v2(env: &Env) -> Result<(), Error> {
         let counter: u64 = env
             .storage()
@@ -5768,16 +5790,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let mut tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let mut tokens = Self::load_allowed_tokens(&env);
         if !tokens.contains(&token) {
             tokens.push_back(token);
-            env.storage()
-                .instance()
-                .set(&DataKey::Config(ConfigKey::AllowedTokens), &tokens);
+            Self::store_allowed_tokens(&env, &tokens);
         }
 
         Ok(())
@@ -5803,20 +5819,14 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let tokens = Self::load_allowed_tokens(&env);
         let mut updated = Vec::new(&env);
         for entry in tokens.iter() {
             if entry != token {
                 updated.push_back(entry);
             }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::AllowedTokens), &updated);
+        Self::store_allowed_tokens(&env, &updated);
 
         Ok(())
     }
@@ -5832,10 +5842,39 @@ impl PaymentContract {
     /// # Returns
     /// A `Vec<Address>` of allowed token addresses. Returns an empty vector if none are configured.
     pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        Self::load_allowed_tokens(&env)
+    }
+
+    /// The token whitelist. It lives in persistent shards
+    /// (`TokenWhitelistShard`) with only its length in instance storage, so
+    /// a long whitelist does not inflate every invocation. A contract not yet
+    /// migrated to schema 3 still has it under the legacy instance key.
+    fn load_allowed_tokens(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+        )
+        .or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::Config(ConfigKey::AllowedTokens))
+        })
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Writes the token whitelist in sharded form and drops the legacy
+    /// instance copy.
+    fn store_allowed_tokens(env: &Env, tokens: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+            tokens,
+        );
         env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env))
+            .remove(&DataKey::Config(ConfigKey::AllowedTokens));
     }
 
     // Mirrors the refund contract's token-registry bypass (Issue #191): an
@@ -5843,11 +5882,7 @@ impl PaymentContract {
     // tokens are permitted until an admin opts in by calling
     // `add_allowed_token`.
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(env));
+        let tokens = Self::load_allowed_tokens(env);
         tokens.is_empty() || tokens.contains(token)
     }
 
@@ -13890,3 +13925,9 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_storage_keys;
+
+#[cfg(test)]
+mod test_storage_ttl;

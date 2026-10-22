@@ -823,3 +823,99 @@ fn test_key_encoding_is_keyed_on_variant_name() {
         );
     }
 }
+
+/// Instance-storage budget: the arbitrator registries and supported-token
+/// entries live in persistent storage, so instance storage stays under
+/// `MAX_INSTANCE_STORAGE_BYTES` at full configuration load.
+mod instance_budget {
+    use crate::storage::{
+        assert_instance_storage_within_budget, instance_storage_xdr_len, MAX_INSTANCE_STORAGE_BYTES,
+    };
+    use crate::{ArbitrationKey, RefundContract, RefundContractClient, SupportedRefundToken, TokenKey};
+    use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+
+    fn setup(env: &Env) -> (RefundContractClient<'_>, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(RefundContract, ());
+        let client = RefundContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        (client, contract_id, admin)
+    }
+
+    fn addresses(env: &Env, n: u32) -> Vec<Address> {
+        let mut v = Vec::new(env);
+        for _ in 0..n {
+            v.push_back(Address::generate(env));
+        }
+        v
+    }
+
+    #[test]
+    fn full_registries_keep_instance_storage_under_budget() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        let arbitrators = addresses(&env, 64);
+        let seniors = addresses(&env, 32);
+        let tokens = addresses(&env, 50);
+        for a in arbitrators.iter() {
+            client.register_arbitrator(&admin, &a);
+        }
+        for a in seniors.iter() {
+            client.add_senior_arbitrator(&admin, &a);
+        }
+        for t in tokens.iter() {
+            client.register_refund_token(&admin, &t);
+        }
+
+        assert_instance_storage_within_budget(&env, &contract_id);
+        env.as_contract(&contract_id, || {
+            assert_eq!(RefundContract::load_arbitrators(&env), arbitrators);
+            assert_eq!(RefundContract::load_senior_arbitrators(&env), seniors);
+            let instance = env.storage().instance();
+            assert!(!instance.has(&ArbitrationKey::ArbitratorList));
+            assert!(!instance.has(&ArbitrationKey::SeniorArbitratorList));
+            assert!(env.storage().persistent().has(&ArbitrationKey::ArbitratorShard(1)));
+            for t in tokens.iter() {
+                assert!(!instance.has(&TokenKey::SupportedToken(t.clone())));
+                assert!(env.storage().persistent().has(&TokenKey::SupportedToken(t)));
+            }
+        });
+        assert_eq!(client.get_supported_refund_tokens().len(), 50);
+    }
+
+    #[test]
+    fn migrate_schema_moves_legacy_instance_registries() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        let arbitrators = addresses(&env, 64);
+        let seniors = addresses(&env, 32);
+        let tokens = addresses(&env, 20);
+        // Pre-schema-3 layout: everything in instance storage.
+        env.as_contract(&contract_id, || {
+            let instance = env.storage().instance();
+            instance.set(&ArbitrationKey::ArbitratorList, &arbitrators);
+            instance.set(&ArbitrationKey::SeniorArbitratorList, &seniors);
+            for (i, t) in tokens.iter().enumerate() {
+                instance.set(&TokenKey::TokenByIndex(i as u64), &t);
+                instance.set(
+                    &TokenKey::SupportedToken(t.clone()),
+                    &SupportedRefundToken { token: t, active: true },
+                );
+            }
+            instance.set(&TokenKey::TokenCount, &(tokens.len() as u64));
+        });
+        assert!(instance_storage_xdr_len(&env, &contract_id) > MAX_INSTANCE_STORAGE_BYTES);
+        // Readable before migrating.
+        assert_eq!(client.get_supported_refund_tokens().len(), 20);
+
+        client.migrate_schema(&admin, &3);
+
+        assert_instance_storage_within_budget(&env, &contract_id);
+        env.as_contract(&contract_id, || {
+            assert_eq!(RefundContract::load_arbitrators(&env), arbitrators);
+            assert_eq!(RefundContract::load_senior_arbitrators(&env), seniors);
+        });
+        assert_eq!(client.get_supported_refund_tokens().len(), 20);
+    }
+}

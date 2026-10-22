@@ -113,6 +113,7 @@ pub enum DataKey {
     PendingEscrowRotation,
     PendingRefundRotation,
     SchemaVersion,
+    /// Persistent (instance before schema 3): one upgrade proposal.
     UpgradeProposal(u64),
     UpgradeProposalCounter,
     UpgradeTimelock,
@@ -192,6 +193,11 @@ pub struct UpgradeProposal {
     pub approvals: Vec<Address>,
     pub executed: bool,
 }
+
+/// TTL for persistent upgrade proposals (~30 days at ~5s per ledger), bumped
+/// whenever a proposal is read or written.
+const PROPOSAL_TTL_BUMP: u32 = 30 * 17_280;
+const PROPOSAL_TTL_THRESHOLD: u32 = PROPOSAL_TTL_BUMP - 17_280;
 
 /// Schema version written by `initialize`.
 const INITIAL_SCHEMA_VERSION: u32 = 1;
@@ -315,9 +321,57 @@ impl AdminContract {
             if next_version == 2 {
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: upgrade proposals move from instance to persistent storage.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
+    }
+
+    /// Upgrade proposals accumulate (one per proposal, never deleted), so
+    /// they live in persistent storage instead of the instance entry every
+    /// call loads. Proposals stored before schema 3 are still read from
+    /// instance storage.
+    fn load_upgrade_proposal(env: &Env, proposal_id: u64) -> Option<UpgradeProposal> {
+        let key = DataKey::UpgradeProposal(proposal_id);
+        let found: Option<UpgradeProposal> = env.storage().persistent().get(&key);
+        if found.is_some() {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+        }
+        found.or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_upgrade_proposal(env: &Env, proposal_id: u64, proposal: &UpgradeProposal) {
+        let key = DataKey::UpgradeProposal(proposal_id);
+        env.storage().persistent().set(&key, proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROPOSAL_TTL_THRESHOLD, PROPOSAL_TTL_BUMP);
+        env.storage().instance().remove(&key);
+    }
+
+    /// v2 -> v3: moves every upgrade proposal out of instance storage.
+    fn migrate_v2_to_v3(env: &Env) {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposalCounter)
+            .unwrap_or(0);
+        for proposal_id in 0..counter {
+            let legacy: Option<UpgradeProposal> = env
+                .storage()
+                .instance()
+                .get(&DataKey::UpgradeProposal(proposal_id));
+            if let Some(proposal) = legacy {
+                Self::store_upgrade_proposal(env, proposal_id, &proposal);
+            }
+        }
     }
 
     /// v1 -> v2 data migration: re-validates the stored orchestrator
@@ -935,9 +989,7 @@ impl AdminContract {
             executed: false,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal(counter), &proposal);
+        Self::store_upgrade_proposal(&env, counter, &proposal);
         env.storage()
             .instance()
             .set(&DataKey::UpgradeProposalCounter, &(counter + 1));
@@ -968,10 +1020,7 @@ impl AdminContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut proposal: UpgradeProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        let mut proposal: UpgradeProposal = Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)?;
 
         if proposal.executed {
@@ -986,9 +1035,7 @@ impl AdminContract {
         }
 
         proposal.approvals.push_back(admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal(proposal_id), &proposal);
+        Self::store_upgrade_proposal(&env, proposal_id, &proposal);
 
         Ok(())
     }
@@ -1018,10 +1065,7 @@ impl AdminContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut proposal: UpgradeProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        let mut proposal: UpgradeProposal = Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)?;
 
         if proposal.executed {
@@ -1054,9 +1098,7 @@ impl AdminContract {
 
         // Mark as executed
         proposal.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal(proposal_id), &proposal);
+        Self::store_upgrade_proposal(&env, proposal_id, &proposal);
 
         env.deployer()
             .update_current_contract_wasm(proposal.new_wasm_hash);
@@ -1285,9 +1327,7 @@ impl AdminContract {
     }
 
     pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Result<UpgradeProposal, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)
     }
 }

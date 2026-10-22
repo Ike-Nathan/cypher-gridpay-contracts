@@ -672,3 +672,75 @@ fn test_harvest_detects_fees_swept_elsewhere() {
         Err(Ok(Error::FeeHarvestNotReceived))
     );
 }
+
+// ── Instance-storage budget ──────────────────────────────────────────────────
+
+/// Instance storage must stay below this many serialized bytes (it is loaded
+/// on every invocation); see core/contracts/*/src/storage.rs.
+const MAX_INSTANCE_STORAGE_BYTES: u32 = 4_096;
+
+fn instance_storage_xdr_len(s: &Setup) -> u32 {
+    use soroban_sdk::xdr::ToXdr;
+    s.env.as_contract(&s.contract_id, || {
+        s.env.storage().instance().all().to_xdr(&s.env).len()
+    })
+}
+
+#[test]
+fn test_upgrade_proposals_keep_instance_storage_under_budget() {
+    let s = setup();
+    for i in 0..40u8 {
+        let hash = BytesN::<32>::from_array(&s.env, &[i + 1; 32]);
+        s.client().propose_upgrade(&s.admin, &s.contract_id, &hash);
+    }
+    let len = instance_storage_xdr_len(&s);
+    assert!(len < MAX_INSTANCE_STORAGE_BYTES, "instance storage is {len} bytes");
+
+    // Proposals are persistent and still readable.
+    assert_eq!(
+        s.client().get_upgrade_proposal(&39).new_wasm_hash,
+        BytesN::<32>::from_array(&s.env, &[40; 32])
+    );
+    s.env.as_contract(&s.contract_id, || {
+        assert!(s.env.storage().persistent().has(&DataKey::UpgradeProposal(0)));
+        assert!(!s.env.storage().instance().has(&DataKey::UpgradeProposal(0)));
+    });
+}
+
+#[test]
+fn test_migrate_schema_moves_legacy_upgrade_proposals() {
+    let s = setup();
+    // Pre-schema-3 layout: every proposal in instance storage.
+    s.env.as_contract(&s.contract_id, || {
+        for i in 0..40u64 {
+            let proposal = UpgradeProposal {
+                contract_address: s.contract_id.clone(),
+                new_wasm_hash: BytesN::from_array(&s.env, &[i as u8 + 1; 32]),
+                proposed_at: 0,
+                timelock_period: 0,
+                approvals: Vec::new(&s.env),
+                executed: false,
+            };
+            s.env
+                .storage()
+                .instance()
+                .set(&DataKey::UpgradeProposal(i), &proposal);
+        }
+        s.env
+            .storage()
+            .instance()
+            .set(&DataKey::UpgradeProposalCounter, &40u64);
+    });
+    assert!(instance_storage_xdr_len(&s) > MAX_INSTANCE_STORAGE_BYTES);
+    // Readable before migrating.
+    assert!(!s.client().get_upgrade_proposal(&7).executed);
+
+    s.client().migrate_schema(&s.admin, &3);
+
+    assert!(instance_storage_xdr_len(&s) < MAX_INSTANCE_STORAGE_BYTES);
+    assert_eq!(
+        s.client().get_upgrade_proposal(&7).new_wasm_hash,
+        BytesN::<32>::from_array(&s.env, &[8; 32])
+    );
+    assert_eq!(s.client().get_schema_version(), 3);
+}

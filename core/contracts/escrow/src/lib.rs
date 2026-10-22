@@ -31,6 +31,7 @@ pub enum ConfigKey {
     WatchdogConfig,
     BatchLimit,
     PauseStateKey,
+    /// Persistent (instance before): one pause-history ring-buffer slot.
     PauseHistoryEntry(u64),
     PauseHistoryCount,
     ActivePauseIndex(String),
@@ -8302,10 +8303,7 @@ impl EscrowContract {
         // Circular buffer: reuse the slot of the oldest entry once the
         // retention limit is reached, so history storage stays bounded.
         let slot = Self::pause_history_slot(history_count);
-        env.storage().instance().set(
-            &DataKey::Config(ConfigKey::PauseHistoryEntry(slot)),
-            &entry,
-        );
+        Self::store_pause_history(&env, slot, &entry);
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::PauseHistoryCount),
             &(history_count + 1),
@@ -8365,21 +8363,14 @@ impl EscrowContract {
         {
             let active_slot = Self::pause_history_slot(active_idx);
             if let Some(mut entry) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, PauseHistory>(&DataKey::Config(ConfigKey::PauseHistoryEntry(
-                        active_slot,
-                    )))
+                Self::load_pause_history(&env, active_slot)
             {
                 // The slot is recycled once the entry falls out of the
                 // rolling window; never mutate a different function's entry.
                 if entry.function_name == global_key {
                     entry.unpaused_by = Some(admin.clone());
                     entry.unpaused_at = Some(now);
-                    env.storage().instance().set(
-                        &DataKey::Config(ConfigKey::PauseHistoryEntry(active_slot)),
-                        &entry,
-                    );
+                    Self::store_pause_history(&env, active_slot, &entry);
                 }
             }
             env.storage()
@@ -8474,10 +8465,7 @@ impl EscrowContract {
         // Circular buffer: reuse the slot of the oldest entry once the
         // retention limit is reached, so history storage stays bounded.
         let slot = Self::pause_history_slot(history_count);
-        env.storage().instance().set(
-            &DataKey::Config(ConfigKey::PauseHistoryEntry(slot)),
-            &entry,
-        );
+        Self::store_pause_history(&env, slot, &entry);
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::PauseHistoryCount),
             &(history_count + 1),
@@ -8543,21 +8531,14 @@ impl EscrowContract {
         {
             let active_slot = Self::pause_history_slot(active_idx);
             if let Some(mut entry) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, PauseHistory>(&DataKey::Config(ConfigKey::PauseHistoryEntry(
-                        active_slot,
-                    )))
+                Self::load_pause_history(&env, active_slot)
             {
                 // The slot is recycled once the entry falls out of the
                 // rolling window; never mutate a different function's entry.
                 if entry.function_name == function_name {
                     entry.unpaused_by = Some(admin.clone());
                     entry.unpaused_at = Some(now);
-                    env.storage().instance().set(
-                        &DataKey::Config(ConfigKey::PauseHistoryEntry(active_slot)),
-                        &entry,
-                    );
+                    Self::store_pause_history(&env, active_slot, &entry);
                 }
             }
             env.storage()
@@ -8597,9 +8578,7 @@ impl EscrowContract {
         let end = core::cmp::min(start.saturating_add(limit as u64), window_end);
         let mut i = start;
         while i < end {
-            if let Some(entry) = env.storage().instance().get::<DataKey, PauseHistory>(
-                &DataKey::Config(ConfigKey::PauseHistoryEntry(Self::pause_history_slot(i))),
-            ) {
+            if let Some(entry) = Self::load_pause_history(&env, Self::pause_history_slot(i)) {
                 result.push_back(entry);
             }
             i += 1;
@@ -8623,9 +8602,7 @@ impl EscrowContract {
         let (window_start, window_end) = Self::pause_history_window(&env);
         let mut i = window_start;
         while i < window_end {
-            if let Some(entry) = env.storage().instance().get::<DataKey, PauseHistory>(
-                &DataKey::Config(ConfigKey::PauseHistoryEntry(Self::pause_history_slot(i))),
-            ) {
+            if let Some(entry) = Self::load_pause_history(&env, Self::pause_history_slot(i)) {
                 if entry.function_name == function_name {
                     result.push_back(entry);
                 }
@@ -8633,6 +8610,23 @@ impl EscrowContract {
             i += 1;
         }
         result
+    }
+
+    /// Reads one pause-history slot. Entries carry free-text reasons, so the
+    /// ring buffer lives in persistent storage rather than the instance entry
+    /// loaded on every call; slots written before that are still read from
+    /// instance storage until they are overwritten.
+    fn load_pause_history(env: &Env, slot: u64) -> Option<PauseHistory> {
+        let key = DataKey::Config(ConfigKey::PauseHistoryEntry(slot));
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    /// Writes one pause-history slot to persistent storage and drops any
+    /// legacy instance copy of it.
+    fn store_pause_history(env: &Env, slot: u64, entry: &PauseHistory) {
+        let key = DataKey::Config(ConfigKey::PauseHistoryEntry(slot));
+        storage::set_persistent(env, &key, entry);
+        env.storage().instance().remove(&key);
     }
 
     /// Returns the storage slot used for an absolute pause-history index.
@@ -12418,3 +12412,6 @@ mod health_check_test;
 
 #[cfg(test)]
 mod storage_ttl_test;
+
+#[cfg(test)]
+mod test_storage_keys;

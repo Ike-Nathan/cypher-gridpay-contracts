@@ -115,6 +115,7 @@ pub enum DataKey {
 pub enum ArbitrationKey {
     ArbitrationCase(u64),
     ArbitrationCounter,
+    /// Legacy (schema < 3): every arbitrator in one instance `Vec`.
     ArbitratorList,
     ArbitratorsVoted(u64),
     ArbitratorVote(u64, Address),
@@ -122,6 +123,7 @@ pub enum ArbitrationKey {
     AccumulatedTreasuryFees,
     ArbitrationStakeConfig,
     ArbitrationStake(u64),
+    /// Persistent (instance before schema 3): one per registered arbitrator.
     ArbitratorReputation(Address),
     ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
@@ -133,6 +135,14 @@ pub enum ArbitrationKey {
     // Uniqueness guard: maps refund_id -> case_id so the same refund
     // cannot be escalated into multiple parallel arbitration cases.
     CaseByRefund(u64),
+    /// Persistent shard `i` of the arbitrator registry (schema 3+).
+    ArbitratorShard(u32),
+    /// Instance: number of registered arbitrators (schema 3+).
+    ArbitratorCount,
+    /// Persistent shard `i` of the senior arbitrator list (schema 3+).
+    SeniorArbitratorShard(u32),
+    /// Instance: number of senior arbitrators (schema 3+).
+    SeniorArbitratorCount,
     // Time-decay settings for inactive arbitrators' reputation scores
     ReputationDecayConfig,
     // Participation stake deposited by an arbitrator (slashable by admin)
@@ -255,8 +265,11 @@ pub enum VoucherKey {
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum TokenKey {
+    /// Persistent (schema 3+; instance before): one entry per token.
     SupportedToken(Address),
+    /// Instance: number of registered tokens.
     TokenCount,
+    /// Persistent (schema 3+; instance before): the token at index `i`.
     TokenByIndex(u64),
 }
 
@@ -1964,6 +1977,11 @@ impl RefundContract {
                 Self::migrate_legacy_refunds(env)?;
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: arbitrator lists and supported-token entries move from
+            // instance to persistent storage.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
@@ -2214,10 +2232,7 @@ impl RefundContract {
             .get(&TokenKey::TokenCount)
             .unwrap_or(0);
         if token_count > 0 {
-            let supported: Option<SupportedRefundToken> = env
-                .storage()
-                .instance()
-                .get(&TokenKey::SupportedToken(token.clone()));
+            let supported: Option<SupportedRefundToken> = Self::load_supported_token(&env, &token);
             match supported {
                 Some(t) if t.active => {}
                 _ => return Err(Error::Ext(ExtError::UnsupportedRefundToken)),
@@ -3363,18 +3378,12 @@ impl RefundContract {
         if admin != stored_admin {
             return Err(Error::Core(CoreError::Unauthorized));
         }
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_arbitrators(&env);
         if list.contains(&arbitrator) {
             return Err(Error::Core(CoreError::Unauthorized));
         }
         list.push_back(arbitrator.clone());
-        env.storage()
-            .instance()
-            .set(&ArbitrationKey::ArbitratorList, &list);
+        Self::store_arbitrators(&env, &list);
 
         // Initialize reputation for new arbitrator
         let reputation = ArbitratorReputation {
@@ -3386,10 +3395,7 @@ impl RefundContract {
             score: 100, // Starting score
             last_active: env.ledger().timestamp(),
         };
-        env.storage().instance().set(
-            &ArbitrationKey::ArbitratorReputation(arbitrator),
-            &reputation,
-        );
+        Self::store_reputation(&env, &arbitrator, &reputation);
 
         Ok(())
     }
@@ -3444,11 +3450,7 @@ impl RefundContract {
             }
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -3535,11 +3537,7 @@ impl RefundContract {
             .unwrap_or(0);
         let case_id = counter + 1;
 
-        let arbitrators = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::load_arbitrators(&env);
         if arbitrators.len() < 3 {
             return Err(Error::Core(CoreError::QuorumNotReached));
         }
@@ -3949,10 +3947,7 @@ impl RefundContract {
             };
 
             // Get current reputation
-            let mut reputation: ArbitratorReputation = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(voter.clone()))
+            let mut reputation: ArbitratorReputation = Self::load_reputation(&env, &voter)
                 .unwrap_or(ArbitratorReputation {
                     arbitrator: voter.clone(),
                     total_cases: 0,
@@ -3994,10 +3989,7 @@ impl RefundContract {
             reputation.last_active = current_time;
 
             // Store updated reputation
-            env.storage().instance().set(
-                &ArbitrationKey::ArbitratorReputation(voter.clone()),
-                &reputation,
-            );
+            Self::store_reputation(&env, &voter, &reputation);
 
             // Emit score update event
             ArbitratorScoreUpdated {
@@ -4503,9 +4495,7 @@ impl RefundContract {
         env: Env,
         arbitrator: Address,
     ) -> Option<ArbitratorReputation> {
-        env.storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorReputation(arbitrator))
+        Self::load_reputation(&env, &arbitrator)
             .map(|rep| Self::decayed_reputation(&env, rep))
     }
 
@@ -4590,11 +4580,7 @@ impl RefundContract {
         let mut results = Vec::new(&env);
 
         // Get all arbitrators from the arbitrator list
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.len() == 0 {
             return results;
@@ -4603,12 +4589,7 @@ impl RefundContract {
         // Collect all reputations
         let mut reputations = Vec::new(&env);
         for arbitrator in arbitrators.iter() {
-            if let Some(reputation) = env
-                .storage()
-                .instance()
-                .get::<ArbitrationKey, ArbitratorReputation>(&ArbitrationKey::ArbitratorReputation(
-                    arbitrator.clone(),
-                ))
+            if let Some(reputation) = Self::load_reputation(&env, &arbitrator)
             {
                 // Rank by decayed score so long-inactive arbitrators drop.
                 reputations.push_back(Self::decayed_reputation(&env, reputation));
@@ -4660,20 +4641,13 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::InvalidScoreThreshold));
         }
 
-        let mut arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let mut removed_count: u32 = 0;
         let mut new_arbitrators = Vec::new(&env);
 
         for arbitrator in arbitrators.iter() {
-            let reputation: Option<ArbitratorReputation> = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+            let reputation: Option<ArbitratorReputation> = Self::load_reputation(&env, &arbitrator);
 
             let should_remove = if let Some(rep) = reputation {
                 Self::decayed_reputation(&env, rep).score < min_score
@@ -4683,9 +4657,7 @@ impl RefundContract {
 
             if should_remove {
                 // Remove reputation data
-                env.storage()
-                    .instance()
-                    .remove(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+                Self::remove_reputation(&env, &arbitrator);
 
                 // Emit deregistration event
                 ArbitratorDeregistered {
@@ -4702,9 +4674,7 @@ impl RefundContract {
         }
 
         // Update the arbitrator list
-        env.storage()
-            .instance()
-            .set(&ArbitrationKey::ArbitratorList, &new_arbitrators);
+        Self::store_arbitrators(&env, &new_arbitrators);
 
         Ok(removed_count)
     }
@@ -5243,11 +5213,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -7404,6 +7370,119 @@ impl RefundContract {
         Self::invoke_hooks(env, RefundEventType::Approved, refund_id);
 
         Ok(())
+    }
+
+    /// The arbitrator registry, kept in persistent shards with only its
+    /// length in instance storage; falls back to the legacy instance list on
+    /// a contract not yet migrated to schema 3.
+    fn load_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(env, &ArbitrationKey::ArbitratorCount, ArbitrationKey::ArbitratorShard)
+            .or_else(|| env.storage().instance().get(&ArbitrationKey::ArbitratorList))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// An arbitrator's reputation record: persistent, one per registered
+    /// arbitrator (legacy instance before schema 3).
+    fn load_reputation(env: &Env, arbitrator: &Address) -> Option<ArbitratorReputation> {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_reputation(env: &Env, arbitrator: &Address, reputation: &ArbitratorReputation) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::set_persistent(env, &key, reputation);
+        env.storage().instance().remove(&key);
+    }
+
+    fn remove_reputation(env: &Env, arbitrator: &Address) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        env.storage().persistent().remove(&key);
+        env.storage().instance().remove(&key);
+    }
+
+    fn store_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::ArbitratorCount,
+            ArbitrationKey::ArbitratorShard,
+            list,
+        );
+        env.storage().instance().remove(&ArbitrationKey::ArbitratorList);
+    }
+
+    fn load_senior_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+        )
+        .or_else(|| env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList))
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_senior_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+            list,
+        );
+        env.storage()
+            .instance()
+            .remove(&ArbitrationKey::SeniorArbitratorList);
+    }
+
+    /// A supported refund token's entry (persistent; legacy instance before
+    /// schema 3).
+    fn load_supported_token(env: &Env, token: &Address) -> Option<SupportedRefundToken> {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_supported_token(env: &Env, token: &Address, entry: &SupportedRefundToken) {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::set_persistent(env, &key, entry);
+        env.storage().instance().remove(&key);
+    }
+
+    fn load_token_by_index(env: &Env, index: u64) -> Option<Address> {
+        let key = TokenKey::TokenByIndex(index);
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_token_by_index(env: &Env, index: u64, token: &Address) {
+        let key = TokenKey::TokenByIndex(index);
+        storage::set_persistent(env, &key, token);
+        env.storage().instance().remove(&key);
+    }
+
+    /// v2 -> v3: moves the arbitrator lists and supported-token entries out
+    /// of instance storage. Idempotent.
+    fn migrate_v2_to_v3(env: &Env) {
+        let arbitrators: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::ArbitratorList);
+        if let Some(list) = arbitrators {
+            Self::store_arbitrators(env, &list);
+        }
+        for arbitrator in Self::load_arbitrators(env).iter() {
+            if let Some(reputation) = Self::load_reputation(env, &arbitrator) {
+                Self::store_reputation(env, &arbitrator, &reputation);
+            }
+        }
+        let seniors: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList);
+        if let Some(list) = seniors {
+            Self::store_senior_arbitrators(env, &list);
+        }
+        let count: u64 = env.storage().instance().get(&TokenKey::TokenCount).unwrap_or(0);
+        for index in 0..count {
+            if let Some(token) = Self::load_token_by_index(env, index) {
+                Self::store_token_by_index(env, index, &token);
+                if let Some(entry) = Self::load_supported_token(env, &token) {
+                    Self::store_supported_token(env, &token, &entry);
+                }
+            }
+        }
     }
 
     fn process_refund_internal(
@@ -9644,11 +9723,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -9688,11 +9763,7 @@ impl RefundContract {
             .get(&RefundExtKey::AssignmentConfig)
             .ok_or(Error::Core(CoreError::PolicyNotFound))?;
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -9746,11 +9817,7 @@ impl RefundContract {
             None => return Vec::new(&env),
         };
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let total = arbitrators.len() as u32;
         if total == 0 || count == 0 {
@@ -10077,21 +10144,15 @@ impl RefundContract {
             token: token.clone(),
             active: true,
         };
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token.clone()), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         let already_indexed = (0..count).any(|i| {
-            env.storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            Self::load_token_by_index(&env, i)
                 .map(|t| t == token)
                 .unwrap_or(false)
         });
         if !already_indexed {
-            env.storage()
-                .instance()
-                .set(&TokenKey::TokenByIndex(count), &token);
+            Self::store_token_by_index(&env, count, &token);
             env.storage()
                 .instance()
                 .set(&TokenKey::TokenCount, &(count + 1));
@@ -10122,16 +10183,11 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut entry: SupportedRefundToken = env
-            .storage()
-            .instance()
-            .get(&TokenKey::SupportedToken(token.clone()))
+        let mut entry: SupportedRefundToken = Self::load_supported_token(&env, &token)
             .ok_or(Error::Core(CoreError::RefundNotFound))?;
 
         entry.active = false;
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         Ok(())
     }
@@ -10149,15 +10205,9 @@ impl RefundContract {
         let mut results = Vec::new(&env);
         let mut i = 0u64;
         while i < count {
-            if let Some(token) = env
-                .storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            if let Some(token) = Self::load_token_by_index(&env, i)
             {
-                if let Some(entry) = env
-                    .storage()
-                    .instance()
-                    .get::<_, SupportedRefundToken>(&TokenKey::SupportedToken(token))
+                if let Some(entry) = Self::load_supported_token(&env, &token)
                 {
                     results.push_back(entry);
                 }
@@ -10483,16 +10533,10 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_senior_arbitrators(&env);
         if !list.contains(&arbitrator) {
             list.push_back(arbitrator);
-            env.storage()
-                .instance()
-                .set(&ArbitrationKey::SeniorArbitratorList, &list);
+            Self::store_senior_arbitrators(&env, &list);
         }
         Ok(())
     }
@@ -10572,11 +10616,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::CaseNotTimedOut));
         }
 
-        let senior_list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let senior_list: Vec<Address> = Self::load_senior_arbitrators(&env);
 
         if senior_list.len() == 0 {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -11103,3 +11143,6 @@ mod test_admin_rotation;
 
 #[cfg(test)]
 mod test_refund_events;
+
+#[cfg(test)]
+mod test_storage_ttl;
