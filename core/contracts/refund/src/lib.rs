@@ -271,6 +271,8 @@ pub enum RefundStatus {
     // merchant), as opposed to `Rejected`, which is the initial merchant
     // denial before any appeal has been decided.
     PermanentlyDenied,
+    /// Issue #294: Escalated to orchestrator supreme governance council
+    EscalatedToSupremeCouncil,
 }
 
 // Issue #397: canonical reason codes, enforced by the type system on Refund and
@@ -590,6 +592,15 @@ pub struct RefundDeniedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealEscalatedToSupremeCouncilEvent {
+    pub refund_id: u64,
+    pub appellant: Address,
+    pub amount: i128,
+    pub escalated_at: u64,
+}
+
 pub struct AppealFiledEvent {
     pub appeal_id: u64,
     pub refund_id: u64,
@@ -2659,6 +2670,35 @@ impl RefundContract {
     ///   to the terminal `RefundStatus::PermanentlyDenied` state rather than
     ///   the pre-appeal `Rejected` state, so callers can distinguish "denied,
     ///   appeal pending/available" from "denied, appeal exhausted".
+        /// Issue #294: Cross-contract escalation path for high-value or deadlocked refund appeals
+    /// to the orchestrator governance council.
+    pub fn escalate_appeal_to_orchestrator(
+        env: Env,
+        refund_id: u64,
+        appellant: Address,
+    ) -> Result<(), Error> {
+        appellant.require_auth();
+        let mut refund = Self::get_refund(&env, refund_id)?;
+        if refund.customer != appellant && refund.merchant != appellant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::PendingAppeal && refund.status != RefundStatus::Rejected {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        refund.status = RefundStatus::EscalatedToSupremeCouncil;
+        Self::save_refund(&env, &refund);
+
+        (AppealEscalatedToSupremeCouncilEvent {
+            refund_id,
+            appellant,
+            amount: refund.amount,
+            escalated_at: env.ledger().timestamp(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn resolve_appeal(
         env: Env,
         admin: Address,
