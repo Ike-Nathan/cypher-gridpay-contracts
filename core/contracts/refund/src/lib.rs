@@ -242,6 +242,10 @@ pub enum SystemKey {
     // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
     // processed refund can invalidate only the windows it actually falls within.
     AnalyticsCacheWindows,
+    /// Persistent: progress of a batched schema migration.
+    MigrationCursor,
+    /// Instance: true while a batched migration is running.
+    MigrationInProgress,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -458,6 +462,11 @@ pub enum ExtError {
     TooManyTriggerConditions = 70,
     // Slash amount exceeds the arbitrator's deposited stake
     InsufficientArbitratorStake = 71,
+    // A batched schema migration is running; state-changing entry points are
+    // blocked until migrate_schema_step completes it.
+    MigrationInProgress = 72,
+    // migrate_schema_step was called with a batch size of 0.
+    InvalidMigrationBatch = 73,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1800,6 +1809,24 @@ pub struct MigrationReport {
     pub dry_run: bool,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Refunds
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most refunds `migrate_schema_step` migrates per call.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct RefundContract;
 
@@ -1902,6 +1929,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
@@ -1950,6 +1978,111 @@ impl RefundContract {
             gas_estimate,
             dry_run: true,
         }
+    }
+
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of refunds at a
+    /// time, so contracts with many refunds stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over refund ids
+    /// `1..=refund counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` refunds
+    /// (capped at [`MAX_MIGRATION_BATCH`]). After the last one, the non-record
+    /// steps run, the schema version is written and the guard is lifted. Every
+    /// step is idempotent, so retrying a batch is safe; read-only queries keep
+    /// working throughout.
+    ///
+    /// # Errors
+    /// `Unauthorized`, `SchemaAlreadyAtTarget`, `InvalidMigrationBatch` for a
+    /// batch size of 0, `SchemaMigrationFailed` for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if batch_size == 0 {
+            return Err(Error::Ext(ExtError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::RefundCounter)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::MigrationInProgress, &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for refund_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                // Legacy records first: the v2 step reads them as `Refund`.
+                Self::migrate_legacy_refund(&env, refund_id)?;
+                Self::migrate_refund_v1_to_v2(&env, refund_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&SystemKey::SchemaVersion, &cursor.to_version);
+            env.storage().instance().remove(&SystemKey::MigrationInProgress);
+        }
+        storage::set_persistent(&env, &SystemKey::MigrationCursor, &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &SystemKey::MigrationCursor)
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&SystemKey::MigrationInProgress)
+            .unwrap_or(false)
+        {
+            return Err(Error::Ext(ExtError::MigrationInProgress));
+        }
+        Ok(())
     }
 
     /// Runs the data transformations registered for every schema version step
@@ -2001,43 +2134,50 @@ impl RefundContract {
             .unwrap_or(0);
 
         for refund_id in 1..=counter {
-            let refund: Refund = env
-                .storage()
-                .instance()
-                .get(&DataKey::Refund(refund_id))
-                .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
-
-            // Corrupted record: the id and the stored record must agree.
-            if refund.id != refund_id {
-                return Err(Error::Ext(ExtError::SchemaMigrationFailed));
-            }
-
-            // Status index membership (RefundsByStatus / RefundStatusIndex).
-            if !env
-                .storage()
-                .instance()
-                .has(&DataKey::RefundStatusIndex(refund_id))
-            {
-                Self::add_to_status_index(env, refund.status.clone(), refund_id);
-            }
-
-            // Rejection bookkeeping used by the appeal window checks.
-            if refund.status == RefundStatus::Rejected
-                && !env
-                    .storage()
-                    .instance()
-                    .has(&SystemKey::RefundRejectedAt(refund_id))
-            {
-                let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
-                env.storage()
-                    .instance()
-                    .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
-            }
-
-            // Per-customer history index.
-            Self::index_refund_for_customer(env, &refund.customer, refund_id);
+            Self::migrate_refund_v1_to_v2(env, refund_id)?;
         }
 
+        Ok(())
+    }
+
+    /// v1 -> v2 for one refund: status index, rejection timestamp, customer
+    /// history. Idempotent.
+    fn migrate_refund_v1_to_v2(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the stored record must agree.
+        if refund.id != refund_id {
+            return Err(Error::Ext(ExtError::SchemaMigrationFailed));
+        }
+
+        // Status index membership (RefundsByStatus / RefundStatusIndex).
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::RefundStatusIndex(refund_id))
+        {
+            Self::add_to_status_index(env, refund.status.clone(), refund_id);
+        }
+
+        // Rejection bookkeeping used by the appeal window checks.
+        if refund.status == RefundStatus::Rejected
+            && !env
+                .storage()
+                .instance()
+                .has(&SystemKey::RefundRejectedAt(refund_id))
+        {
+            let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
+            env.storage()
+                .instance()
+                .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
+        }
+
+        // Per-customer history index.
+        Self::index_refund_for_customer(env, &refund.customer, refund_id);
         Ok(())
     }
 
@@ -7646,21 +7786,27 @@ impl RefundContract {
             .get(&DataKey::RefundCounter)
             .unwrap_or(0);
         for refund_id in 1..=counter {
-            let key = DataKey::Refund(refund_id);
-            // Read as a raw field map: decoding a legacy record directly as
-            // `Refund` traps in the host on the field-count mismatch.
-            let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
-                Some(fields) => fields,
-                None => continue,
-            };
-            if fields.contains_key(Symbol::new(env, "reason_code")) {
-                continue;
-            }
-            let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
-                .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
-            let refund = legacy.into_refund(RefundReasonCode::Other);
-            env.storage().instance().set(&key, &refund);
+            Self::migrate_legacy_refund(env, refund_id)?;
         }
+        Ok(())
+    }
+
+    /// Rewrites one refund stored before `reason_code` existed. Idempotent.
+    fn migrate_legacy_refund(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let key = DataKey::Refund(refund_id);
+        // Read as a raw field map: decoding a legacy record directly as
+        // `Refund` traps in the host on the field-count mismatch.
+        let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
+            Some(fields) => fields,
+            None => return Ok(()),
+        };
+        if fields.contains_key(Symbol::new(env, "reason_code")) {
+            return Ok(());
+        }
+        let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
+            .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
+        let refund = legacy.into_refund(RefundReasonCode::Other);
+        env.storage().instance().set(&key, &refund);
         Ok(())
     }
 
@@ -8067,6 +8213,7 @@ impl RefundContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()

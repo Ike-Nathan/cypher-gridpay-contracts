@@ -65,6 +65,11 @@ pub enum ConfigKey {
     TokenWhitelistShard(u32),
     /// Instance: number of whitelisted tokens (schema 3+).
     TokenWhitelistCount,
+    /// Persistent: progress of a batched schema migration.
+    MigrationCursor,
+    /// Instance: true while a batched migration is running; checked by every
+    /// guarded entry point, so it is a cheap scalar rather than the cursor.
+    MigrationInProgress,
 }
 
 #[derive(Clone)]
@@ -199,6 +204,11 @@ pub enum BasicError {
     /// A merchant's aggregate volume for the day would exceed its verification
     /// tier limit (#23).
     DailyTierLimitExceeded = 128,
+    /// A batched schema migration is running; state-changing entry points are
+    /// blocked until `migrate_schema_step` completes it.
+    MigrationInProgress = 129,
+    /// `migrate_schema_step` was called with a batch size of 0.
+    InvalidMigrationBatch = 130,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -481,7 +491,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 127 {
+            if code >= 100 && code <= 130 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -1992,6 +2002,25 @@ pub struct PaymentInvoice {
     pub issued_at: u64,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Records
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most records `migrate_schema_step` migrates per call, keeping a step well
+/// inside Soroban's CPU-instruction and write-entry limits.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct PaymentContract;
 
@@ -2111,6 +2140,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
@@ -2182,21 +2212,28 @@ impl PaymentContract {
             .unwrap_or(0);
 
         for payment_id in 1..=counter {
-            let payment: Payment = env
-                .storage()
-                .instance()
-                .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
-                .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
-
-            // Corrupted record: the id and the indexed party must agree.
-            if payment.id != payment_id {
-                return Err(Error::Basic(BasicError::SchemaMigrationFailed));
-            }
-
-            Self::index_payment_for_customer(env, &payment.customer, payment_id);
-            Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
+            Self::migrate_payment_v1_to_v2(env, payment_id)?;
         }
 
+        Ok(())
+    }
+
+    /// v1 -> v2 for one payment: index it for its customer and merchant.
+    /// Idempotent (the index helpers skip ids already present).
+    fn migrate_payment_v1_to_v2(env: &Env, payment_id: u64) -> Result<(), Error> {
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the indexed party must agree.
+        if payment.id != payment_id {
+            return Err(Error::Basic(BasicError::SchemaMigrationFailed));
+        }
+
+        Self::index_payment_for_customer(env, &payment.customer, payment_id);
+        Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
         Ok(())
     }
 
@@ -2324,6 +2361,114 @@ impl PaymentContract {
             }
         }
         false
+    }
+
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of records at
+    /// a time, so contracts with many records stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over payment
+    /// ids `1..=payment counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` records
+    /// (capped at [`MAX_MIGRATION_BATCH`]) and advances the cursor. When the
+    /// cursor passes the last record, the non-record steps run, the schema
+    /// version is written and the guard is lifted. Every per-record step is
+    /// idempotent, so retrying a batch is safe. Read-only queries keep working
+    /// throughout.
+    ///
+    /// # Errors
+    /// `NotAnAdmin`, `SchemaAlreadyAtTarget` (nothing to migrate),
+    /// `InvalidMigrationBatch` for a batch size of 0, `SchemaMigrationFailed`
+    /// for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if batch_size == 0 {
+            return Err(Error::Basic(BasicError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Payment(PaymentKey::Counter))
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(ConfigKey::MigrationInProgress), &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for payment_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                Self::migrate_payment_v1_to_v2(&env, payment_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            // Steps that are not per record.
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::SchemaVersion), &cursor.to_version);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Config(ConfigKey::MigrationInProgress));
+        }
+        storage::set_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor), &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor))
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Config(ConfigKey::MigrationInProgress))
+            .unwrap_or(false)
+        {
+            return Err(Error::Basic(BasicError::MigrationInProgress));
+        }
+        Ok(())
     }
 
     /// Simulates a schema migration and returns an impact report without
@@ -11065,6 +11210,7 @@ impl PaymentContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()

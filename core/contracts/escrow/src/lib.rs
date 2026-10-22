@@ -49,6 +49,10 @@ pub enum ConfigKey {
     ProposalApprovalVersion(String),
     /// Minimum escrow deposit amount (#45).
     MinEscrowAmount,
+    /// Persistent: progress of a batched schema migration.
+    MigrationCursor,
+    /// Instance: true while a batched migration is running.
+    MigrationInProgress,
 }
 
 #[derive(Clone)]
@@ -170,6 +174,10 @@ pub enum BasicError {
     InvalidAddress = 113,
     /// Storage schema is already at or above the requested version. Resolution: specify newer version for migration.
     SchemaAlreadyAtTarget = 114,
+    /// A batched schema migration is running; state-changing entry points are blocked until `migrate_schema_step` completes it.
+    MigrationInProgress = 115,
+    /// `migrate_schema_step` was called with a batch size of 0.
+    InvalidMigrationBatch = 116,
 }
 
 /// Errors relating to escrow creation, status transitions, vesting, and expiration.
@@ -336,7 +344,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 232 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 114 {
+            if code >= 100 && code <= 116 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -1726,6 +1734,21 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
 
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
+/// Most escrows `migrate_schema_step` migrates per call.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
+/// Progress of a batched schema migration (`migrate_schema_step`). Escrows
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
 /// Number of pause-history entries retained; older entries are overwritten
 /// in a ring buffer.
@@ -8955,6 +8978,121 @@ impl EscrowContract {
     ///
     /// # Panics
     /// Panics if required state is missing.
+    /// Migrates the schema to [`MIGRATION_TARGET_SCHEMA_VERSION`] a batch of
+    /// escrows at a time, so contracts with many escrows stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over escrow ids
+    /// `1..=escrow counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` escrows
+    /// (capped at [`MAX_MIGRATION_BATCH`]), using the same per-escrow rewrite
+    /// as `migrate_escrow_batch`. After the last one the schema version is
+    /// written and the guard is lifted. Escrows already marked migrated are
+    /// skipped, so retrying a batch is safe; read-only queries keep working.
+    ///
+    /// # Errors
+    /// `NotAnAdmin`, `SchemaAlreadyAtTarget`, `InvalidMigrationBatch` for a
+    /// batch size of 0.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if batch_size == 0 {
+            return Err(Error::Basic(BasicError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= MIGRATION_TARGET_SCHEMA_VERSION {
+                    return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Escrow(EscrowKey::Counter))
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(ConfigKey::MigrationInProgress), &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: MIGRATION_TARGET_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for escrow_id in cursor.next_record_id..end {
+            Self::migrate_escrow_record(&env, escrow_id);
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::SchemaVersion), &cursor.to_version);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Config(ConfigKey::MigrationInProgress));
+        }
+        storage::set_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor), &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor))
+    }
+
+    /// Rewrites one escrow in the current format and marks it migrated.
+    /// Skips escrows already marked or missing; idempotent.
+    fn migrate_escrow_record(env: &Env, escrow_id: u64) {
+        let marker = DataKey::Dispute(DisputeKey::EscrowMigrated(escrow_id));
+        if env.storage().instance().get::<DataKey, bool>(&marker).unwrap_or(false) {
+            return;
+        }
+        if let Some(escrow) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+            env.storage().instance().set(&marker, &true);
+        }
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Config(ConfigKey::MigrationInProgress))
+            .unwrap_or(false)
+        {
+            return Err(Error::Basic(BasicError::MigrationInProgress));
+        }
+        Ok(())
+    }
+
     pub fn get_migration_status(env: Env) -> MigrationStatus {
         env.storage()
             .instance()
@@ -8969,6 +9107,7 @@ impl EscrowContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()

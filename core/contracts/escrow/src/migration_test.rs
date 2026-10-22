@@ -374,3 +374,103 @@ fn test_begin_migration_unauthorized() {
     let result = client.try_begin_migration(&not_admin);
     assert_eq!(result, Err(Ok(Error::Basic(BasicError::NotAnAdmin))));
 }
+
+// ── Batched migration (migrate_schema_step) ──────────────────────────────────
+
+fn create_escrows(
+    env: &Env,
+    n: u64,
+) -> (EscrowContractClient<'_>, Address, Address, Address, Address) {
+    let (client, admin, customer, merchant, token) = setup(env);
+    for _ in 0..n {
+        client.create_escrow(
+            &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+        );
+    }
+    (client, admin, customer, merchant, token)
+}
+
+fn migrated(env: &Env, client: &EscrowContractClient, escrow_id: u64) -> bool {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Dispute(DisputeKey::EscrowMigrated(escrow_id)))
+            .unwrap_or(false)
+    })
+}
+
+#[test]
+fn test_migrate_schema_step_migrates_100_escrows_in_5_batches() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let (client, admin, customer, merchant, token) = create_escrows(&env, 100);
+
+    for step in 1..=5_u64 {
+        let cursor = client.migrate_schema_step(&admin, &20);
+        assert_eq!(cursor.records_migrated, step * 20);
+        assert_eq!(cursor.next_record_id, step * 20 + 1);
+        assert_eq!(cursor.target_max_id, 100);
+        assert_eq!(cursor.completed, step == 5);
+        assert!(migrated(&env, &client, step * 20));
+        if step < 5 {
+            assert!(!migrated(&env, &client, step * 20 + 1));
+            assert_eq!(client.get_schema_version(), 1);
+            // User writes are blocked; reads keep working.
+            let blocked = client.try_create_escrow(
+                &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+            );
+            assert_eq!(blocked, Err(Ok(Error::Basic(BasicError::MigrationInProgress))));
+            assert_eq!(client.get_escrow_status(&1), EscrowStatus::Locked);
+        }
+    }
+
+    assert_eq!(client.get_schema_version(), 2);
+    for id in 1..=100 {
+        assert!(migrated(&env, &client, id));
+    }
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    assert_eq!(
+        client.try_migrate_schema_step(&admin, &20),
+        Err(Ok(Error::Basic(BasicError::SchemaAlreadyAtTarget)))
+    );
+}
+
+#[test]
+fn test_migrate_schema_step_caps_batch_and_retries_idempotently() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let (client, admin, ..) = create_escrows(&env, 60);
+
+    let cursor = client.migrate_schema_step(&admin, &100);
+    assert_eq!(cursor.records_migrated, MAX_MIGRATION_BATCH as u64);
+    assert_eq!(
+        client.try_migrate_schema_step(&admin, &0),
+        Err(Ok(Error::Basic(BasicError::InvalidMigrationBatch)))
+    );
+
+    // Replay from the start: already-migrated escrows are skipped, and the
+    // cursor still finishes cleanly.
+    env.as_contract(&client.address, || {
+        let key = DataKey::Config(ConfigKey::MigrationCursor);
+        let mut cursor: MigrationCursor = env.storage().persistent().get(&key).unwrap();
+        cursor.next_record_id = 1;
+        env.storage().persistent().set(&key, &cursor);
+    });
+    while !client.get_migration_cursor().unwrap().completed {
+        client.migrate_schema_step(&admin, &25);
+    }
+    assert_eq!(client.get_schema_version(), 2);
+    assert!((1..=60).all(|id| migrated(&env, &client, id)));
+}
+
+#[test]
+fn test_migrate_schema_step_requires_admin() {
+    let env = Env::default();
+    let (client, ..) = create_escrows(&env, 3);
+    assert_eq!(
+        client.try_migrate_schema_step(&Address::generate(&env), &10),
+        Err(Ok(Error::Basic(BasicError::NotAnAdmin)))
+    );
+}
