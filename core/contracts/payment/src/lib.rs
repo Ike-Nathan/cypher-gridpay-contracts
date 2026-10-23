@@ -517,6 +517,8 @@ pub enum CustomerDataKey {
     MerchantCount(Address),
     MonthlyVolume(Address, u64),
     HourCount(Address, u32),
+    /// Waived-transaction counter per promotional campaign and customer address.
+    FeeWaiverUses(u64, Address),
 }
 
 // Merchant-specific data keys
@@ -1545,6 +1547,17 @@ pub struct MerchantFeeRecord {
 pub struct FeeWaiver {
     pub merchant: Address,
     pub waiver_bps: u32, // reduction in basis points
+    /// Identifier of the promotional campaign this waiver belongs to.
+    pub campaign_id: u64,
+    /// Aggregate ceiling on fees the campaign may waive.
+    pub max_total_waived_fee: i128,
+    /// Fees waived so far under this campaign.
+    pub accumulated_waived_fee: i128,
+    /// Maximum number of waived transactions per customer address.
+    pub max_uses_per_address: u32,
+    /// Timestamp from which the waiver becomes active.
+    pub valid_from: u64,
+    /// Timestamp at which the waiver expires.
     pub valid_until: u64,
     pub reason: String,
     pub granted_by: Address,
@@ -1651,6 +1664,15 @@ pub struct FeeWaiverRevoked {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeWaiverExpired {
     pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWaiverApplied {
+    pub payment_id: u64,
+    pub campaign_id: u64,
+    pub waived_amount: i128,
+    pub remaining_budget: i128,
 }
 
 #[contractevent]
@@ -8405,23 +8427,32 @@ impl PaymentContract {
             Some(c) => c,
         };
 
-        // Get effective fee BPS including tier discounts and waivers
-        let effective_fee_bps =
-            PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
-
-        // Risk-based surcharge applied at completion time by `deduct_fee`.
+        // Mirror `deduct_fee` exactly: tier discount and risk surcharge are applied
+        // first, then the promotional fee waiver (budget-capped) is subtracted so the
+        // preview matches what completion actually deducts.
+        let record = PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
         let risk_surcharge_bps =
             PaymentContract::risk_surcharge_bps(&env, &customer, amount, &currency);
-
-        PaymentContract::compute_fee_amount(
+        let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
+        let fee = PaymentContract::compute_fee_amount(
             &env,
             amount,
-            effective_fee_bps,
-            &FeeTier::Standard, // Tier already applied in get_effective_fee_bps
+            effective_bps,
+            &record.fee_tier,
             config.min_fee,
             config.max_fee,
-            risk_surcharge_bps,
-        )
+            0, // risk surcharge already folded into `effective_bps`
+        );
+        if fee <= 0 {
+            return 0;
+        }
+
+        let waived =
+            match PaymentContract::fee_waiver_eligibility(&env, &merchant, &customer, fee) {
+                Some((_, waived)) => waived,
+                None => 0,
+            };
+        fee - waived
     }
 
     /// Returns the fee record for a given merchant.
@@ -8583,10 +8614,23 @@ impl PaymentContract {
             &record.fee_tier,
             config.min_fee,
             config.max_fee,
-            risk_surcharge_bps,
+            0, // risk surcharge already folded into `effective_bps`
         );
 
         if fee <= 0 {
+            return (amount, 0);
+        }
+
+        // Apply the merchant's promotional fee waiver (campaign budget cap,
+        // per-address usage cap, validity window). The waiver state is persisted
+        // here — before any external token transfer — so the counters cannot be
+        // re-entered or double-spent by a token hook.
+        let waived =
+            PaymentContract::apply_fee_waiver(env, payment_id, &merchant, customer, fee);
+        let fee = fee - waived;
+
+        if fee <= 0 {
+            // Fully waived: nothing to collect from the customer.
             return (amount, 0);
         }
 
@@ -8853,22 +8897,35 @@ impl PaymentContract {
 
     /// Grants a fee waiver to a merchant, reducing their platform fee by the specified BPS.
     ///
-    /// The waiver applies to all future payments until it expires or is revoked.
+    /// The waiver applies to all future payments until it expires or is revoked, and is
+    /// additionally bounded by the promotional campaign's aggregate budget
+    /// (`max_total_waived_fee`), a per-address usage cap (`max_uses_per_address`) and a
+    /// `valid_from`–`valid_until` time window.
     ///
     /// # Arguments
     /// * `admin` - The admin authorizing this operation (must be a multisig admin).
     /// * `merchant` - The merchant to grant the waiver to.
     /// * `waiver_bps` - The fee reduction in basis points (0–10000, where 10000 = 100% waiver).
+    /// * `campaign_id` - Identifier of the promotional campaign this waiver belongs to.
+    /// * `max_total_waived_fee` - Aggregate ceiling of fees the campaign may waive.
+    /// * `max_uses_per_address` - Maximum number of waived payments per customer address.
+    /// * `valid_from` - The ledger timestamp from which the waiver is active.
     /// * `valid_until` - The ledger timestamp at which the waiver expires.
     /// * `reason` - A human-readable reason for granting the waiver.
     ///
     /// # Returns
-    /// `Ok(())` on success, or an error if unauthorized or the BPS value is invalid.
+    /// `Ok(())` on success, or an error if unauthorized, the BPS value is invalid, or one
+    /// of the campaign bounds is invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_fee_waiver(
         env: Env,
         admin: Address,
         merchant: Address,
         waiver_bps: u32,
+        campaign_id: u64,
+        max_total_waived_fee: i128,
+        max_uses_per_address: u32,
+        valid_from: u64,
         valid_until: u64,
         reason: String,
     ) -> Result<(), Error> {
@@ -8889,9 +8946,20 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidTierThresholds));
         }
 
+        // Campaign bounds: a non-empty budget, at least one permitted use per
+        // address, and a well-formed validity window.
+        if max_total_waived_fee <= 0 || max_uses_per_address == 0 || valid_from > valid_until {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
         let waiver = FeeWaiver {
             merchant: merchant.clone(),
             waiver_bps,
+            campaign_id,
+            max_total_waived_fee,
+            accumulated_waived_fee: 0,
+            max_uses_per_address,
+            valid_from,
             valid_until,
             reason,
             granted_by: admin.clone(),
@@ -8962,7 +9030,8 @@ impl PaymentContract {
 
     /// Returns the active fee waiver for a merchant, if any.
     ///
-    /// Automatically removes and returns `None` if the waiver has expired.
+    /// Automatically removes and returns `None` if the waiver has expired, and returns
+    /// `None` while the campaign's `valid_from` boundary has not been reached.
     ///
     /// # Arguments
     /// * `merchant` - The merchant to query.
@@ -8988,6 +9057,9 @@ impl PaymentContract {
                     )));
 
                 (FeeWaiverExpired { merchant }).publish(&env);
+                None
+            } else if env.ledger().timestamp() < w.valid_from {
+                // Not yet active: keep the record but report no waiver.
                 None
             } else {
                 Some(w)
@@ -9023,15 +9095,150 @@ impl PaymentContract {
         let tier_discount = PaymentContract::get_tier_discount_bps(&record.fee_tier);
         let tier_adjusted_bps = config.fee_bps - (config.fee_bps * tier_discount) / 10000;
 
-        // Get waiver discount
+        // Get waiver discount (only while the campaign still has budget left)
         let waiver = PaymentContract::get_fee_waiver(env.clone(), merchant);
         if let Some(w) = waiver {
-            let waiver_adjusted_bps =
-                tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
-            waiver_adjusted_bps
+            if w.max_total_waived_fee.saturating_sub(w.accumulated_waived_fee) > 0 {
+                let waiver_adjusted_bps =
+                    tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
+                waiver_adjusted_bps
+            } else {
+                tier_adjusted_bps
+            }
         } else {
             tier_adjusted_bps
         }
+    }
+
+    /// Read-only fee-waiver eligibility check shared by the preview path
+    /// (`calculate_fee`) and the deduction path (`deduct_fee`).
+    ///
+    /// Returns the eligible waiver together with the amount it may waive for
+    /// `fee`, honouring:
+    /// * the `valid_from`/`valid_until` time window,
+    /// * the remaining campaign budget (`max_total_waived_fee - accumulated_waived_fee`),
+    ///   capping the waiver so a partially exhausted campaign waives only what remains,
+    /// * the per-address usage cap (`max_uses_per_address`).
+    ///
+    /// Returns `None` when no waiver applies.
+    fn fee_waiver_eligibility(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+        fee: i128,
+    ) -> Option<(FeeWaiver, i128)> {
+        if fee <= 0 {
+            return None;
+        }
+
+        let waiver: FeeWaiver = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::FeeWaiver(
+                merchant.clone(),
+            )))?;
+
+        let now = env.ledger().timestamp();
+        if now < waiver.valid_from || now > waiver.valid_until {
+            return None;
+        }
+
+        let remaining_budget = waiver
+            .max_total_waived_fee
+            .saturating_sub(waiver.accumulated_waived_fee);
+        if remaining_budget <= 0 {
+            return None;
+        }
+
+        let uses: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::FeeWaiverUses(
+                waiver.campaign_id,
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        if uses >= waiver.max_uses_per_address {
+            return None;
+        }
+
+        let waived = core::cmp::min(
+            fee.saturating_mul(waiver.waiver_bps as i128) / 10_000,
+            remaining_budget,
+        );
+        if waived <= 0 {
+            return None;
+        }
+
+        Some((waiver, waived))
+    }
+
+    /// Applies the merchant's active fee waiver for `payment_id`.
+    ///
+    /// The campaign's `accumulated_waived_fee` and the per-address usage counter are
+    /// incremented atomically **before** any external token transfer, the campaign is
+    /// automatically deactivated once the budget is exactly consumed, and a
+    /// `FeeWaiverApplied` event carrying the remaining budget is emitted.
+    ///
+    /// Returns the amount waived (0 when no waiver applies).
+    fn apply_fee_waiver(
+        env: &Env,
+        payment_id: u64,
+        merchant: &Address,
+        customer: &Address,
+        fee: i128,
+    ) -> i128 {
+        let waiver_key = DataKey::Customer(CustomerDataKey::FeeWaiver(merchant.clone()));
+
+        let (waiver, waived) =
+            match PaymentContract::fee_waiver_eligibility(env, merchant, customer, fee) {
+                Some(v) => v,
+                None => {
+                    // Deactivate a campaign whose budget is already fully consumed.
+                    if let Some(w) = env.storage().instance().get::<DataKey, FeeWaiver>(&waiver_key)
+                    {
+                        if w.max_total_waived_fee.saturating_sub(w.accumulated_waived_fee) <= 0 {
+                            env.storage().instance().remove(&waiver_key);
+                        }
+                    }
+                    return 0;
+                }
+            };
+
+        let uses_key = DataKey::Customer(CustomerDataKey::FeeWaiverUses(
+            waiver.campaign_id,
+            customer.clone(),
+        ));
+        let uses: u32 = env.storage().instance().get(&uses_key).unwrap_or(0);
+
+        // Effects first: budget and per-address counters are persisted before the
+        // caller performs any external token transfer (checks-effects-interactions).
+        let mut updated = waiver.clone();
+        updated.accumulated_waived_fee = updated
+            .accumulated_waived_fee
+            .saturating_add(waived);
+        env.storage().instance().set(&waiver_key, &updated);
+        env.storage()
+            .instance()
+            .set(&uses_key, &(uses.saturating_add(1)));
+
+        let remaining_budget = updated
+            .max_total_waived_fee
+            .saturating_sub(updated.accumulated_waived_fee);
+        if remaining_budget == 0 {
+            // Budget fully consumed → campaign deactivated automatically.
+            env.storage().instance().remove(&waiver_key);
+        }
+
+        (FeeWaiverApplied {
+            payment_id,
+            campaign_id: updated.campaign_id,
+            waived_amount: waived,
+            remaining_budget,
+        })
+        .publish(env);
+
+        waived
     }
 
     // ── FEE REBATE FUNCTIONS ──────────────────────────────────────────────────
@@ -13862,3 +14069,6 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_completion_fee_parity;

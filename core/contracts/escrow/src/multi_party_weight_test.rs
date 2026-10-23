@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, token, Address, Env, Vec};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, token, xdr::ToXdr, Address, BytesN, Env, Vec,
+};
 
 #[test]
 fn test_multi_party_escrow_weight_governance() {
@@ -265,4 +267,73 @@ fn test_multi_party_escrow_odd_voter_weight_aggregation() {
     assert_eq!(token_user_client.balance(&p1), 3333);
     assert_eq!(token_user_client.balance(&p2), 3333);
     assert_eq!(token_user_client.balance(&p3), 3334);
+}
+
+#[test]
+fn test_multi_party_dispute_uses_updated_voting_weights() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let customer = Address::generate(&env);
+    token_client.mint(&customer, &10000);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1.clone(),
+        role: ParticipantRole::Merchant,
+        share_bps: 5000,
+        weight_bps: 6000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2.clone(),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 5000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+    env.ledger().set_timestamp(500);
+    let escrow_id =
+        client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+
+    client.set_participant_weight(&admin, &escrow_id, &p1, &6000);
+    client.set_participant_weight(&admin, &escrow_id, &p2, &4000);
+    client.dispute_multi_party_escrow(&p1, &escrow_id);
+
+    let salt1 = BytesN::from_array(&env, &[11; 32]);
+    let salt2 = BytesN::from_array(&env, &[12; 32]);
+    let mut preimage1 = escrow_id.to_xdr(&env);
+    preimage1.append(&p1.clone().to_xdr(&env));
+    preimage1.append(&1_u32.to_xdr(&env));
+    preimage1.append(&salt1.clone().to_xdr(&env));
+    let commitment1 = env.crypto().sha256(&preimage1).to_bytes();
+    let mut preimage2 = escrow_id.to_xdr(&env);
+    preimage2.append(&p2.clone().to_xdr(&env));
+    preimage2.append(&0_u32.to_xdr(&env));
+    preimage2.append(&salt2.clone().to_xdr(&env));
+    let commitment2 = env.crypto().sha256(&preimage2).to_bytes();
+
+    client.commit_dispute_vote(&escrow_id, &p1, &commitment1);
+    client.commit_dispute_vote(&escrow_id, &p2, &commitment2);
+    client.reveal_dispute_vote(&escrow_id, &p1, &1, &salt1);
+    client.reveal_dispute_vote(&escrow_id, &p2, &0, &salt2);
+    client.resolve_multi_party_dispute(&escrow_id);
+
+    assert_eq!(
+        client.get_multi_party_escrow(&escrow_id).status,
+        EscrowStatus::Released
+    );
 }
