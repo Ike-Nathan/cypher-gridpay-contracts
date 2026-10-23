@@ -467,6 +467,11 @@ pub enum ExtError {
     // A denial or arbitration vote before the merchant's rebuttal deadline
     // (and without a waiver).
     RebuttalWindowOpen = 75,
+    // The same refund id appears more than once in a batch.
+    DuplicateBatchEntry = 76,
+    // The refund contract's balance of a token can't cover the batch's
+    // refunds in that token.
+    InsufficientBatchLiquidity = 77,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1329,13 +1334,49 @@ pub struct RefundPolicyTemplateApplied {
 }
 
 // ── Issue #135: Batch refund result struct ─────────────────────────────────
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct BatchRefundResult {
     pub refund_id: u64,
     pub success: bool,
     pub error_code: u32,
     pub amount_refunded: i128,
+}
+
+/// Most refunds `batch_process_refunds` takes in one call, keeping it within
+/// Soroban's CPU and read/write-entry budgets.
+pub const MAX_BATCH_PROCESS_REFUNDS: u32 = 25;
+
+/// One processed refund in the coalesced payment-contract notification.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundSyncEntry {
+    pub payment_id: u64,
+    pub refund_id: u64,
+    pub amount: i128,
+}
+
+/// What a batch paid out for one (merchant, token) group.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchGroupTotal {
+    pub merchant: Address,
+    pub token: Address,
+    pub processed_count: u32,
+    pub total_amount: i128,
+}
+
+/// Emitted once per `batch_process_refunds` call.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundBatchProcessed {
+    pub atomic: bool,
+    pub processed_count: u32,
+    pub failed_count: u32,
+    pub groups: Vec<BatchGroupTotal>,
+    /// Whether the single `record_refund_batch` call to the configured
+    /// payment contract succeeded (false when none is configured).
+    pub payment_synced: bool,
 }
 
 #[derive(Clone)]
@@ -6932,6 +6973,214 @@ impl RefundContract {
             }
         }
         results
+    }
+
+    /// Process up to `MAX_BATCH_PROCESS_REFUNDS` approved refunds, grouped by
+    /// (merchant, token), with a liquidity check before any transfer.
+    ///
+    /// Refunds pay out of this contract's balance of each token. Before
+    /// anything moves, the amounts are summed per token and compared with
+    /// that balance (the gross amount, so fees only add headroom).
+    ///
+    /// * `atomic == true`: all or nothing. Any invalid item or a shortfall in
+    ///   any token returns an error, and the whole call is rolled back.
+    /// * `atomic == false`: items are paid in priority order. `Unauthorized`
+    ///   and `DuplicateCharge` go first, then `ProductDefect`, `NonDelivery`
+    ///   and `Other`, then `CustomerRequest`; ties keep input order. An item
+    ///   that no longer fits the remaining balance of its token fails with
+    ///   `InsufficientBatchLiquidity` while later, smaller ones may still fit.
+    ///
+    /// The payment contract (if configured) gets one coalesced
+    /// `record_refund_batch(Vec<RefundSyncEntry>)` call for the whole batch
+    /// instead of one per refund. The call is best effort: its outcome is
+    /// reported in the `RefundBatchProcessed` event and never undoes payouts.
+    ///
+    /// Results come back in input order.
+    ///
+    /// # Errors
+    /// `Unauthorized` (not the admin), `BatchRefundTooLarge`,
+    /// `DuplicateBatchEntry`; in atomic mode also the first item's error or
+    /// `InsufficientBatchLiquidity`.
+    pub fn batch_process_refunds(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u64>,
+        atomic: bool,
+    ) -> Result<Vec<BatchRefundResult>, Error> {
+        Self::require_not_paused(&env, "batch_process_refunds")?;
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let len = refund_ids.len();
+        if len > MAX_BATCH_PROCESS_REFUNDS {
+            return Err(Error::Core(CoreError::BatchRefundTooLarge));
+        }
+        for i in 1..len {
+            let id = refund_ids.get_unchecked(i);
+            for j in 0..i {
+                if refund_ids.get_unchecked(j) == id {
+                    return Err(Error::Ext(ExtError::DuplicateBatchEntry));
+                }
+            }
+        }
+
+        let failure = |refund_id: u64, e: Error| BatchRefundResult {
+            refund_id,
+            success: false,
+            error_code: e.to_u32(),
+            amount_refunded: 0,
+        };
+
+        // Load and pre-validate; results start as failures and are
+        // overwritten on success.
+        let mut results: Vec<BatchRefundResult> = Vec::new(&env);
+        let mut eligible: Vec<(u32, u32)> = Vec::new(&env); // (priority, position)
+        let mut required: Map<Address, i128> = Map::new(&env);
+        let mut refunds: Map<u32, Refund> = Map::new(&env);
+        for pos in 0..len {
+            let refund_id = refund_ids.get_unchecked(pos);
+            let loaded = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+                .ok_or(Error::Core(CoreError::RefundNotFound))
+                .and_then(|r| {
+                    if r.status == RefundStatus::Approved {
+                        Ok(r)
+                    } else {
+                        Err(Error::Core(CoreError::InvalidStatus))
+                    }
+                });
+            match loaded {
+                Ok(refund) => {
+                    let total = required.get(refund.token.clone()).unwrap_or(0);
+                    required.set(refund.token.clone(), total.saturating_add(refund.amount));
+                    eligible.push_back((Self::batch_priority(&refund.reason_code), pos));
+                    refunds.set(pos, refund);
+                    results.push_back(failure(refund_id, Error::Core(CoreError::InvalidStatus)));
+                }
+                Err(e) if atomic => return Err(e),
+                Err(e) => results.push_back(failure(refund_id, e)),
+            }
+        }
+
+        // Liquidity available per token, read once.
+        let this = env.current_contract_address();
+        let mut available: Map<Address, i128> = Map::new(&env);
+        for (token_addr, needed) in required.iter() {
+            let balance = token::Client::new(&env, &token_addr).balance(&this);
+            if atomic && balance < needed {
+                return Err(Error::Ext(ExtError::InsufficientBatchLiquidity));
+            }
+            available.set(token_addr, balance);
+        }
+
+        // Atomic: input order. Otherwise by priority, then input order
+        // (insertion sort, n <= 25).
+        if !atomic {
+            for i in 1..eligible.len() {
+                let mut j = i;
+                while j > 0 && eligible.get_unchecked(j - 1) > eligible.get_unchecked(j) {
+                    let a = eligible.get_unchecked(j - 1);
+                    eligible.set(j - 1, eligible.get_unchecked(j));
+                    eligible.set(j, a);
+                    j -= 1;
+                }
+            }
+        }
+
+        let mut groups: Map<(Address, Address), (u32, i128)> = Map::new(&env);
+        let mut sync: Vec<RefundSyncEntry> = Vec::new(&env);
+        let (mut processed_count, mut failed_count) = (0u32, len - eligible.len());
+        for (_, pos) in eligible.iter() {
+            let refund = refunds.get_unchecked(pos);
+            let refund_id = refund_ids.get_unchecked(pos);
+            let remaining = available.get(refund.token.clone()).unwrap_or(0);
+            let outcome = if refund.amount > remaining {
+                Err(Error::Ext(ExtError::InsufficientBatchLiquidity))
+            } else {
+                Self::process_refund_internal(&env, admin.clone(), refund_id)
+            };
+            match outcome {
+                Ok(()) => {
+                    available.set(refund.token.clone(), remaining - refund.amount);
+                    let key = (refund.merchant.clone(), refund.token.clone());
+                    let (count, total) = groups.get(key.clone()).unwrap_or((0, 0));
+                    groups.set(key, (count + 1, total.saturating_add(refund.amount)));
+                    sync.push_back(RefundSyncEntry {
+                        payment_id: refund.payment_id,
+                        refund_id,
+                        amount: refund.amount,
+                    });
+                    results.set(
+                        pos,
+                        BatchRefundResult {
+                            refund_id,
+                            success: true,
+                            error_code: 0,
+                            amount_refunded: refund.amount,
+                        },
+                    );
+                    processed_count += 1;
+                }
+                Err(e) if atomic => return Err(e),
+                Err(e) => {
+                    results.set(pos, failure(refund_id, e));
+                    failed_count += 1;
+                }
+            }
+        }
+
+        // One coalesced accounting update for the whole batch.
+        let payment_contract: Option<Address> =
+            env.storage().instance().get(&DataKey::PaymentContractAddress);
+        let payment_synced = match payment_contract {
+            Some(payment_contract) if !sync.is_empty() => matches!(
+                env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                    &payment_contract,
+                    &Symbol::new(&env, "record_refund_batch"),
+                    (sync,).into_val(&env),
+                ),
+                Ok(Ok(()))
+            ),
+            _ => false,
+        };
+
+        let mut group_totals = Vec::new(&env);
+        for ((merchant, token_addr), (count, total)) in groups.iter() {
+            group_totals.push_back(BatchGroupTotal {
+                merchant,
+                token: token_addr,
+                processed_count: count,
+                total_amount: total,
+            });
+        }
+        RefundBatchProcessed {
+            atomic,
+            processed_count,
+            failed_count,
+            groups: group_totals,
+            payment_synced,
+        }
+        .publish(&env);
+
+        Ok(results)
+    }
+
+    /// Payout priority under partial liquidity (lower goes first).
+    fn batch_priority(reason: &RefundReasonCode) -> u32 {
+        match reason {
+            RefundReasonCode::Unauthorized | RefundReasonCode::DuplicateCharge => 0,
+            RefundReasonCode::CustomerRequest => 2,
+            _ => 1,
+        }
     }
 
     // ── Issue #143: Cross-contract payment verification ───────────────────────

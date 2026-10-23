@@ -496,3 +496,254 @@ fn batch_limit_increase_allows_previously_oversized_batch() {
     assert_eq!(refund_status(&client, r2), RefundStatus::Approved);
     assert_eq!(refund_status(&client, r3), RefundStatus::Approved);
 }
+
+// ── batch_process_refunds: grouping, liquidity, priority, atomicity ─────────
+
+mod batch_process {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token};
+
+    /// Stand-in payment contract that records the coalesced sync calls.
+    #[contract]
+    pub struct SyncRecorder;
+
+    #[contracttype]
+    enum SyncKey {
+        Calls,
+        LastEntries,
+    }
+
+    #[contractimpl]
+    impl SyncRecorder {
+        pub fn record_refund_batch(env: Env, entries: Vec<RefundSyncEntry>) {
+            let calls: u32 = env.storage().instance().get(&SyncKey::Calls).unwrap_or(0);
+            env.storage().instance().set(&SyncKey::Calls, &(calls + 1));
+            env.storage().instance().set(&SyncKey::LastEntries, &entries);
+        }
+
+        pub fn calls(env: Env) -> u32 {
+            env.storage().instance().get(&SyncKey::Calls).unwrap_or(0)
+        }
+
+        pub fn last_entries(env: Env) -> Vec<RefundSyncEntry> {
+            env.storage()
+                .instance()
+                .get(&SyncKey::LastEntries)
+                .unwrap_or(Vec::new(&env))
+        }
+    }
+
+    struct Desk<'a> {
+        env: &'a Env,
+        client: RefundContractClient<'a>,
+        admin: Address,
+        next_payment: core::cell::Cell<u64>,
+    }
+
+    impl<'a> Desk<'a> {
+        fn new(env: &'a Env) -> Self {
+            let (client, admin) = setup(env);
+            Desk { env, client, admin, next_payment: core::cell::Cell::new(1) }
+        }
+
+        /// A SAC token with `funding` in the refund contract's balance.
+        fn token(&self, funding: i128) -> Address {
+            let token = self
+                .env
+                .register_stellar_asset_contract_v2(self.admin.clone())
+                .address();
+            if funding > 0 {
+                token::StellarAssetClient::new(self.env, &token).mint(&self.client.address, &funding);
+            }
+            token
+        }
+
+        /// An approved refund of `amount`.
+        fn approved(&self, merchant: &Address, token: &Address, reason: RefundReasonCode, amount: i128) -> u64 {
+            let payment_id = self.next_payment.get();
+            self.next_payment.set(payment_id + 1);
+            let id = self.client.request_refund(
+                merchant,
+                &payment_id,
+                &Address::generate(self.env),
+                &amount,
+                &1_000i128,
+                token,
+                &String::from_str(self.env, "reason"),
+                &reason,
+                &0u64,
+            );
+            self.client.approve_refund(&self.admin, &id);
+            id
+        }
+
+        fn ids(&self, ids: &[u64]) -> Vec<u64> {
+            let mut v = Vec::new(self.env);
+            for id in ids {
+                v.push_back(*id);
+            }
+            v
+        }
+
+        fn status(&self, id: u64) -> RefundStatus {
+            self.client.get_refund(&id).status
+        }
+
+        fn balance(&self, token: &Address) -> i128 {
+            token::Client::new(self.env, token).balance(&self.client.address)
+        }
+    }
+
+    #[test]
+    fn duplicate_ids_reject_the_whole_batch() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let t = d.token(1_000);
+        let m = Address::generate(&env);
+        let a = d.approved(&m, &t, RefundReasonCode::Other, 100);
+        let b = d.approved(&m, &t, RefundReasonCode::Other, 100);
+        for atomic in [true, false] {
+            assert_eq!(
+                d.client.try_batch_process_refunds(&d.admin, &d.ids(&[a, b, a]), &atomic),
+                Err(Ok(Error::Ext(ExtError::DuplicateBatchEntry)))
+            );
+        }
+        assert_eq!((d.status(a), d.status(b)), (RefundStatus::Approved, RefundStatus::Approved));
+    }
+
+    #[test]
+    fn batch_size_and_admin_are_enforced() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let mut ids = Vec::new(&env);
+        for i in 0..=MAX_BATCH_PROCESS_REFUNDS as u64 {
+            ids.push_back(i + 1);
+        }
+        assert_eq!(
+            d.client.try_batch_process_refunds(&d.admin, &ids, &false),
+            Err(Ok(Error::Core(CoreError::BatchRefundTooLarge)))
+        );
+        assert_eq!(
+            d.client
+                .try_batch_process_refunds(&Address::generate(&env), &d.ids(&[1]), &false),
+            Err(Ok(Error::Core(CoreError::Unauthorized)))
+        );
+    }
+
+    #[test]
+    fn partial_liquidity_pays_high_priority_reasons_first() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let t = d.token(250);
+        let m = Address::generate(&env);
+        let request = d.approved(&m, &t, RefundReasonCode::CustomerRequest, 100);
+        let other = d.approved(&m, &t, RefundReasonCode::Other, 100);
+        let fraud = d.approved(&m, &t, RefundReasonCode::Unauthorized, 100);
+        let dup = d.approved(&m, &t, RefundReasonCode::DuplicateCharge, 100);
+        let small = d.approved(&m, &t, RefundReasonCode::CustomerRequest, 40);
+
+        let results = d
+            .client
+            .batch_process_refunds(&d.admin, &d.ids(&[request, other, fraud, dup, small]), &false);
+
+        // Results stay in input order.
+        let ids: std::vec::Vec<u64> = results.iter().map(|r| r.refund_id).collect();
+        assert_eq!(ids, [request, other, fraud, dup, small]);
+        let ok: std::vec::Vec<bool> = results.iter().map(|r| r.success).collect();
+        // 250: Unauthorized and DuplicateCharge first (200), then Other (100)
+        // doesn't fit, the 100 CustomerRequest doesn't either, the 40 does.
+        assert_eq!(ok, [false, false, true, true, true]);
+        let short = Error::Ext(ExtError::InsufficientBatchLiquidity).to_u32();
+        assert_eq!(results.get(0).unwrap().error_code, short);
+        assert_eq!(results.get(1).unwrap().error_code, short);
+
+        assert_eq!(d.status(fraud), RefundStatus::Processed);
+        assert_eq!(d.status(dup), RefundStatus::Processed);
+        assert_eq!(d.status(small), RefundStatus::Processed);
+        assert_eq!(d.status(request), RefundStatus::Approved);
+        assert_eq!(d.status(other), RefundStatus::Approved);
+        assert_eq!(d.balance(&t), 10);
+    }
+
+    #[test]
+    fn atomic_batch_rolls_back_on_shortfall() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let rich = d.token(1_000);
+        let poor = d.token(150);
+        let m1 = Address::generate(&env);
+        let m2 = Address::generate(&env);
+        let a = d.approved(&m1, &rich, RefundReasonCode::Unauthorized, 300);
+        let b = d.approved(&m2, &poor, RefundReasonCode::Other, 100);
+        let c = d.approved(&m2, &poor, RefundReasonCode::Other, 100);
+
+        // `poor` can't cover 200: nothing moves, in any token.
+        assert_eq!(
+            d.client.try_batch_process_refunds(&d.admin, &d.ids(&[a, b, c]), &true),
+            Err(Ok(Error::Ext(ExtError::InsufficientBatchLiquidity)))
+        );
+        for id in [a, b, c] {
+            assert_eq!(d.status(id), RefundStatus::Approved);
+        }
+        assert_eq!((d.balance(&rich), d.balance(&poor)), (1_000, 150));
+
+        // Non-atomic, the same batch pays what fits.
+        let results = d.client.batch_process_refunds(&d.admin, &d.ids(&[a, b, c]), &false);
+        let ok: std::vec::Vec<bool> = results.iter().map(|r| r.success).collect();
+        assert_eq!(ok, [true, true, false]);
+    }
+
+    #[test]
+    fn atomic_batch_rolls_back_on_an_invalid_item() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let t = d.token(1_000);
+        let m = Address::generate(&env);
+        let a = d.approved(&m, &t, RefundReasonCode::Other, 100);
+        let b = d.approved(&m, &t, RefundReasonCode::Other, 100);
+        d.client.process_refund(&d.admin, &b); // no longer Approved
+
+        assert_eq!(
+            d.client.try_batch_process_refunds(&d.admin, &d.ids(&[a, b]), &true),
+            Err(Ok(Error::Core(CoreError::InvalidStatus)))
+        );
+        assert_eq!(d.status(a), RefundStatus::Approved);
+
+        // Non-atomic isolates the bad item.
+        let results = d.client.batch_process_refunds(&d.admin, &d.ids(&[a, b]), &false);
+        assert!(results.get(0).unwrap().success);
+        assert_eq!(
+            results.get(1).unwrap().error_code,
+            Error::Core(CoreError::InvalidStatus).to_u32()
+        );
+    }
+
+    #[test]
+    fn payment_contract_gets_one_coalesced_sync_call() {
+        let env = Env::default();
+        let d = Desk::new(&env);
+        let t1 = d.token(1_000);
+        let t2 = d.token(1_000);
+        let m1 = Address::generate(&env);
+        let m2 = Address::generate(&env);
+        let ids = [
+            d.approved(&m1, &t1, RefundReasonCode::Other, 100),
+            d.approved(&m1, &t1, RefundReasonCode::Other, 50),
+            d.approved(&m2, &t1, RefundReasonCode::Other, 70),
+            d.approved(&m2, &t2, RefundReasonCode::Other, 30),
+        ];
+        let recorder = env.register(SyncRecorder, ());
+        d.client.set_payment_contract_address(&d.admin, &recorder);
+
+        let results = d.client.batch_process_refunds(&d.admin, &d.ids(&ids), &true);
+        assert!(results.iter().all(|r| r.success));
+
+        let sync = SyncRecorderClient::new(&env, &recorder);
+        assert_eq!(sync.calls(), 1);
+        let entries = sync.last_entries();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.get(1).unwrap().amount, 50);
+        assert_eq!(entries.get(1).unwrap().refund_id, ids[1]);
+        assert_eq!((d.balance(&t1), d.balance(&t2)), (780, 970));
+    }
+}
