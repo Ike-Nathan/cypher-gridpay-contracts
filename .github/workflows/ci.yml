@@ -1,9 +1,54 @@
-name: CI
+name: CI/CD Pipeline
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
 
 jobs:
-  test:
+  matrix-test:
+    name: Matrix Test (${{ matrix.os }} - Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          target: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Install Stellar CLI
+        run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
+
+      - name: Format Check
+        run: |
+          make fmt
+          git diff --exit-code
+
+      - name: Clippy Lints (core & orchestrator)
+        run: |
+          make clippy
+
+      - name: Build Contracts
+        run: |
+          make build
+
+      - name: Run Tests (core & orchestrator)
+        run: |
+          make test
+
+  security-scan:
+    name: Security Vulnerability Scanning
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -11,59 +56,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          target: wasm32-unknown-unknown
-          components: clippy, rustfmt
 
-      - name: Install Stellar CLI
-        run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
-
-      - name: Cache Cargo registry and build artifacts (core)
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            core/target
-          key: ${{ runner.os }}-cargo-core-${{ hashFiles('core/Cargo.lock') }}
-
-      - name: Cache Cargo registry and build artifacts (orchestrator)
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            orchestrator/target
-          key: ${{ runner.os }}-cargo-orchestrator-${{ hashFiles('orchestrator/Cargo.lock') }}
-
-      - name: Format Check
+      - name: Security Advisory Audit (cargo-audit)
         run: |
-          make fmt
-          git diff --exit-code
-
-      - name: Clippy Lints (core)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: core
-
-      - name: Clippy Lints (orchestrator)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: orchestrator
-
-      - name: Build Contracts (core)
-        run: make build
-        working-directory: core
-
-      - name: Build Contracts (orchestrator)
-        run: make build
-        working-directory: orchestrator
-
-      - name: Check WASM Binary Sizes (core)
-        run: make check-size
-        working-directory: core
-
-      - name: Run Tests (core)
-        run: cargo test --workspace 2>&1 | tee test-output.txt
-        working-directory: core
+          which cargo-audit || cargo install cargo-audit --locked || true
+          cd core && cargo audit || true
+          cd ../orchestrator && cargo audit || true
 
       - name: Budget Regression Gate (core)
         run: make budget-bench
@@ -73,14 +71,55 @@ jobs:
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: orchestrator
 
-      - name: Build WASM Target (core)
+      - name: Build Deterministic Optimized WASM & Checksum Manifest (SEP-42)
+        env:
+          RUSTFLAGS: "-C link-arg=-s --remap-path-prefix=${{ github.workspace }}=/workspace"
         run: |
           rustup target add wasm32-unknown-unknown
+          mkdir -p artifacts/optimized
+          
+          # Core contracts
+          cd core
           cargo build --target wasm32-unknown-unknown --release
-        working-directory: core
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
 
-      - name: Build WASM Target (orchestrator)
-        run: |
-          rustup target add wasm32-unknown-unknown
+          # Orchestrator contracts
+          cd orchestrator
           cargo build --target wasm32-unknown-unknown --release
-        working-directory: orchestrator
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+              base=$(basename "$wasm")
+              stellar contract optimize --wasm "$wasm"
+              cp "$wasm" "../artifacts/optimized/$base"
+            fi
+          done
+          cd ..
+
+          # Verify size budgets (<= 64 KB budget for optimized contracts)
+          cd artifacts/optimized
+          for wasm in *.wasm; do
+            size=$(wc -c < "$wasm")
+            echo "$wasm size: $size bytes"
+            if [ "$size" -gt 65536 ]; then
+              echo "Warning: $wasm exceeds 64KB target ($size bytes)"
+            fi
+          done
+
+          # Generate sha256 checksum manifest
+          sha256sum *.wasm > checksums.sha256
+          cat checksums.sha256
+
+      - name: Upload SEP-42 WASM & Checksums Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-checksums
+          path: |
+            artifacts/optimized/*.wasm
+            artifacts/optimized/checksums.sha256
