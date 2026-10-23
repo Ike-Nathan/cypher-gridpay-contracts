@@ -2295,3 +2295,282 @@ fn test_appeal_rejected_after_window_even_once_denial_finalized() {
         Err(Ok(Error::Core(CoreError::AppealWindowExpired)))
     );
 }
+
+// ── Hash-chained evidence transcript ─────────────────────────────────────────
+
+mod evidence_chain {
+    use super::*;
+    use soroban_sdk::xdr::ToXdr;
+    use soroban_sdk::{token, Bytes, BytesN};
+
+    struct Case {
+        env: Env,
+        client: RefundContractClient<'static>,
+        admin: Address,
+        merchant: Address,
+        customer: Address,
+        refund_id: u64,
+    }
+
+    fn case() -> Case {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+        let client = RefundContractClient::new(&env, &env.register(RefundContract, ()));
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        let merchant = Address::generate(&env);
+        let customer = Address::generate(&env);
+        let refund_id = client.request_refund(
+            &merchant,
+            &1u64,
+            &customer,
+            &1000i128,
+            &1000i128,
+            &Address::generate(&env),
+            &String::from_str(&env, "reason"),
+            &RefundReasonCode::Other,
+            &0_u64,
+        );
+        Case { env, client, admin, merchant, customer, refund_id }
+    }
+
+    fn h(env: &Env, b: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[b; 32])
+    }
+
+    impl Case {
+        fn submit(&self, who: &Address, stage: EvidenceStage, b: u8) {
+            self.client
+                .submit_refund_evidence(who, &self.refund_id, &stage, &h(&self.env, b));
+        }
+
+        fn try_submit(&self, who: &Address, stage: EvidenceStage) -> Option<Error> {
+            match self
+                .client
+                .try_submit_refund_evidence(who, &self.refund_id, &stage, &h(&self.env, 9))
+            {
+                Ok(_) => None,
+                Err(Ok(e)) => Some(e),
+                Err(Err(_)) => panic!("undecodable error"),
+            }
+        }
+
+        fn advance(&self, secs: u64) {
+            self.env.ledger().set_timestamp(self.env.ledger().timestamp() + secs);
+        }
+
+        fn deadline(&self) -> u64 {
+            self.client.get_rebuttal_deadline(&self.refund_id).unwrap()
+        }
+    }
+
+    #[test]
+    fn transcript_is_ordered_and_hash_chained() {
+        let c = case();
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        c.advance(60);
+        c.submit(&c.merchant, EvidenceStage::MerchantRebuttal, 2);
+        c.advance(60);
+        c.submit(&c.customer, EvidenceStage::CustomerSurrebuttal, 3);
+
+        let items = c.client.get_all_refund_evidence(&c.refund_id);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items.get(0).unwrap().stage, EvidenceStage::InitialClaim);
+        assert_eq!(items.get(1).unwrap().stage, EvidenceStage::MerchantRebuttal);
+        assert_eq!(items.get(2).unwrap().stage, EvidenceStage::CustomerSurrebuttal);
+
+        // The first link starts from zero and matches the documented preimage.
+        let first = items.get(0).unwrap();
+        assert_eq!(first.prev_chain_hash, h(&c.env, 0));
+        let mut pre = Bytes::from(h(&c.env, 0));
+        pre.append(&c.customer.clone().to_xdr(&c.env));
+        pre.append(&(EvidenceStage::InitialClaim as u32).to_xdr(&c.env));
+        pre.append(&Bytes::from(h(&c.env, 1)));
+        pre.append(&first.submitted_at.to_xdr(&c.env));
+        assert_eq!(first.chain_hash, c.env.crypto().sha256(&pre).to_bytes());
+
+        // Each item links to its predecessor; the head is the last link.
+        for i in 1..items.len() {
+            assert_eq!(
+                items.get(i).unwrap().prev_chain_hash,
+                items.get(i - 1).unwrap().chain_hash
+            );
+        }
+        assert_eq!(
+            c.client.get_evidence_chain_head(&c.refund_id),
+            items.get(2).unwrap().chain_hash
+        );
+        assert!(c.client.verify_evidence_chain(&c.refund_id));
+        // The latest-per-party lookup still works.
+        assert_eq!(
+            c.client
+                .get_refund_evidence(&c.refund_id, &c.customer)
+                .unwrap()
+                .stage,
+            EvidenceStage::CustomerSurrebuttal
+        );
+    }
+
+    #[test]
+    fn tampering_with_a_stored_item_breaks_verification() {
+        let c = case();
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        c.submit(&c.merchant, EvidenceStage::MerchantRebuttal, 2);
+        let contract = c.client.address.clone();
+        c.env.as_contract(&contract, || {
+            let key = EvidenceKey::EvidenceIndex(c.refund_id, 0);
+            let mut item: RefundEvidence = c.env.storage().instance().get(&key).unwrap();
+            item.content_hash = h(&c.env, 7);
+            c.env.storage().instance().set(&key, &item);
+        });
+        assert!(!c.client.verify_evidence_chain(&c.refund_id));
+    }
+
+    #[test]
+    fn stages_must_follow_turn_order_and_party() {
+        let c = case();
+        let ooo = Some(Error::Ext(ExtError::EvidenceOutOfOrder));
+        // Nothing before the customer's claim.
+        assert_eq!(c.try_submit(&c.merchant, EvidenceStage::MerchantRebuttal), ooo);
+        assert_eq!(c.try_submit(&c.customer, EvidenceStage::CustomerSurrebuttal), ooo);
+        // Only the customer files a claim; outsiders are rejected outright.
+        assert_eq!(c.try_submit(&c.merchant, EvidenceStage::InitialClaim), ooo);
+        assert_eq!(
+            c.try_submit(&Address::generate(&c.env), EvidenceStage::InitialClaim),
+            Some(Error::Core(CoreError::Unauthorized))
+        );
+
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        // No surrebuttal until the merchant has rebutted; only the merchant rebuts.
+        assert_eq!(c.try_submit(&c.customer, EvidenceStage::CustomerSurrebuttal), ooo);
+        assert_eq!(c.try_submit(&c.customer, EvidenceStage::MerchantRebuttal), ooo);
+        c.submit(&c.merchant, EvidenceStage::MerchantRebuttal, 2);
+        assert_eq!(c.try_submit(&c.customer, EvidenceStage::CustomerSurrebuttal), None);
+    }
+
+    #[test]
+    fn customer_evidence_in_the_final_tenth_extends_the_window() {
+        let c = case();
+        c.client.set_evidence_config(
+            &c.admin,
+            &EvidenceConfig { rebuttal_window_secs: 1_000, rebuttal_extension_secs: 500 },
+        );
+        let t0 = c.env.ledger().timestamp();
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        assert_eq!(c.deadline(), t0 + 1_000);
+
+        // Before the final 10%: no extension.
+        c.advance(899);
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 2);
+        assert_eq!(c.deadline(), t0 + 1_000);
+
+        // The merchant submitting late does not extend its own window.
+        c.advance(51);
+        c.submit(&c.merchant, EvidenceStage::MerchantRebuttal, 3);
+        assert_eq!(c.deadline(), t0 + 1_000);
+
+        // A customer snipe in the final stretch pushes the deadline back.
+        c.submit(&c.customer, EvidenceStage::CustomerSurrebuttal, 4);
+        assert_eq!(c.deadline(), t0 + 1_500);
+
+        // After the (extended) deadline nothing more is accepted.
+        c.env.ledger().set_timestamp(t0 + 1_501);
+        assert_eq!(
+            c.try_submit(&c.merchant, EvidenceStage::MerchantRebuttal),
+            Some(Error::Ext(ExtError::EvidenceWindowClosed))
+        );
+    }
+
+    #[test]
+    fn transcript_is_capped_at_twelve_items() {
+        let c = case();
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 0);
+        for i in 1..MAX_EVIDENCE_ITEMS {
+            let (who, stage) = if i % 2 == 1 {
+                (&c.merchant, EvidenceStage::MerchantRebuttal)
+            } else {
+                (&c.customer, EvidenceStage::CustomerSurrebuttal)
+            };
+            c.submit(who, stage, i as u8);
+        }
+        assert_eq!(
+            c.client.get_all_refund_evidence(&c.refund_id).len() as u64,
+            MAX_EVIDENCE_ITEMS
+        );
+        assert_eq!(
+            c.try_submit(&c.merchant, EvidenceStage::MerchantRebuttal),
+            Some(Error::Ext(ExtError::EvidenceLimitExceeded))
+        );
+        assert!(c.client.verify_evidence_chain(&c.refund_id));
+    }
+
+    #[test]
+    fn denial_waits_for_the_rebuttal_deadline_or_a_waiver() {
+        let c = case();
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        let reason = String::from_str(&c.env, "denied");
+        assert_eq!(
+            c.client.try_reject_refund(&c.admin, &c.refund_id, &reason),
+            Err(Ok(Error::Ext(ExtError::RebuttalWindowOpen)))
+        );
+        c.env.ledger().set_timestamp(c.deadline());
+        c.client.reject_refund(&c.admin, &c.refund_id, &reason);
+
+        // A merchant waiver lifts the guard immediately; only the merchant can waive.
+        let w = case();
+        w.submit(&w.customer, EvidenceStage::InitialClaim, 1);
+        assert!(w.client.try_waive_rebuttal(&w.customer, &w.refund_id).is_err());
+        w.client.waive_rebuttal(&w.merchant, &w.refund_id);
+        w.client
+            .reject_refund(&w.admin, &w.refund_id, &String::from_str(&w.env, "denied"));
+    }
+
+    #[test]
+    fn arbitration_vote_waits_for_the_rebuttal_deadline() {
+        let c = case();
+        let arb = Address::generate(&c.env);
+        c.client.register_arbitrator(&c.admin, &arb);
+        // Escalation needs a full panel of three.
+        for _ in 0..2 {
+            c.client.register_arbitrator(&c.admin, &Address::generate(&c.env));
+        }
+        c.client
+            .reject_refund(&c.admin, &c.refund_id, &String::from_str(&c.env, "denied"));
+
+        let token = c.env.register_stellar_asset_contract_v2(c.admin.clone()).address();
+        token::StellarAssetClient::new(&c.env, &token).mint(&c.customer, &1_000);
+        let case_id = c.client.escalate_to_arbitration(&c.customer, &c.refund_id, &token, &300);
+
+        // The customer's claim opens the merchant's window: no votes yet.
+        c.submit(&c.customer, EvidenceStage::InitialClaim, 1);
+        assert_eq!(
+            c.client
+                .try_cast_arbitration_vote(&arb, &case_id, &true, &h(&c.env, 0)),
+            Err(Ok(Error::Ext(ExtError::RebuttalWindowOpen)))
+        );
+        c.client.waive_rebuttal(&c.merchant, &c.refund_id);
+        c.client.cast_arbitration_vote(&arb, &case_id, &true, &h(&c.env, 0));
+    }
+
+    #[test]
+    fn evidence_config_is_admin_only_and_validated() {
+        let c = case();
+        assert_eq!(
+            c.client.get_evidence_config(),
+            EvidenceConfig {
+                rebuttal_window_secs: DEFAULT_REBUTTAL_WINDOW_SECS,
+                rebuttal_extension_secs: DEFAULT_REBUTTAL_EXTENSION_SECS
+            }
+        );
+        let bad = EvidenceConfig { rebuttal_window_secs: 0, rebuttal_extension_secs: 1 };
+        assert!(c.client.try_set_evidence_config(&c.admin, &bad).is_err());
+        let cfg = EvidenceConfig { rebuttal_window_secs: 10, ..bad };
+        assert_eq!(
+            c.client.try_set_evidence_config(&c.merchant, &cfg),
+            Err(Ok(Error::Core(CoreError::Unauthorized)))
+        );
+        c.client.set_evidence_config(&c.admin, &cfg);
+        assert_eq!(c.client.get_evidence_config(), cfg);
+    }
+}
