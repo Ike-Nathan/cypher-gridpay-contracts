@@ -11,6 +11,7 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+use storage::StorageTier;
 pub mod fixed_math;
 
 #[derive(Clone)]
@@ -1733,6 +1734,8 @@ pub const PAUSE_HISTORY_LIMIT: u64 = 20;
 /// accepted only while `now < dispute_started_at + APPEAL_WINDOW_SECONDS`, so
 /// the boundary is deterministic rather than depending on `<` vs `≤` drift.
 const APPEAL_WINDOW_SECONDS: u64 = 259_200;
+/// Most ids `batch_bump_critical` accepts per call.
+pub const MAX_TTL_BUMP_BATCH: u32 = 50;
 
 #[contract]
 pub struct EscrowContract;
@@ -3025,6 +3028,9 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Funds are now locked: storage must outlive the escrow's deadlines.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
+
         Ok(escrow_id)
     }
 
@@ -3573,6 +3579,9 @@ impl EscrowContract {
             release_timestamp,
         }
         .publish(&env);
+
+        // Funds are now locked: storage must outlive the escrow's deadlines.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
 
         Ok(escrow_id)
     }
@@ -4325,7 +4334,83 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // A dispute extends the lock: keep storage alive through its grace.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
+
         Ok(())
+    }
+
+    /// Keeper maintenance (the issue's `batch_bump_critical_escrows_and_payments`;
+    /// Soroban caps contract function names at 32 characters): extends
+    /// storage for every escrow in `ids` that
+    /// still locks funds (`Locked` or `Disputed`) so it outlives that
+    /// escrow's deadline plus its dispute grace period. Unknown and finished
+    /// escrows are skipped. Anyone may call it; it only extends TTLs.
+    ///
+    /// Returns how many escrows were critical and bumped.
+    ///
+    /// # Errors
+    /// `BatchTooLarge` for more than [`MAX_TTL_BUMP_BATCH`] ids.
+    pub fn batch_bump_critical(env: Env, ids: Vec<u64>) -> Result<u32, Error> {
+        if ids.len() > MAX_TTL_BUMP_BATCH {
+            return Err(Error::Escrow(EscrowError::BatchTooLarge));
+        }
+        let mut bumped = 0u32;
+        for escrow_id in ids.iter() {
+            if let Some(escrow) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            {
+                if Self::keep_escrow_alive(&env, &escrow) > 0 {
+                    bumped += 1;
+                }
+            }
+        }
+        Ok(bumped)
+    }
+
+    /// Storage tier of an escrow: funds-locking states are
+    /// `CriticalActiveLock`, finished ones `TerminalAuditRecord`.
+    fn escrow_storage_tier(status: &EscrowStatus) -> StorageTier {
+        match status {
+            EscrowStatus::Locked | EscrowStatus::Disputed => StorageTier::CriticalActiveLock,
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => StorageTier::TerminalAuditRecord,
+        }
+    }
+
+    /// Latest business deadline of an escrow: release, expiry or hold end.
+    fn escrow_deadline(escrow: &Escrow) -> u64 {
+        escrow
+            .release_timestamp
+            .max(escrow.expiry_timestamp)
+            .max(escrow.hold_period_until)
+    }
+
+    /// Time after the deadline during which the escrow can still be
+    /// disputed, escalated or appealed.
+    fn escrow_dispute_grace(escrow: &Escrow) -> u64 {
+        escrow.escalation_timeout.max(APPEAL_WINDOW_SECONDS)
+    }
+
+    /// Escrows are kept in instance storage, which shares one TTL. For a
+    /// funds-locking escrow, extend that TTL so it outlives the escrow's
+    /// deadline plus dispute grace. Returns the TTL target, or 0 for a
+    /// finished escrow (left to the normal instance bump).
+    fn keep_escrow_alive(env: &Env, escrow: &Escrow) -> u32 {
+        let tier = Self::escrow_storage_tier(&escrow.status);
+        if tier != StorageTier::CriticalActiveLock {
+            return 0;
+        }
+        storage::extend_instance_until(
+            env,
+            tier,
+            Self::escrow_deadline(escrow),
+            Self::escrow_dispute_grace(escrow),
+        )
     }
 
     /// Submits evidence.

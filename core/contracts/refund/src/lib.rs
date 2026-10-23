@@ -10231,6 +10231,15 @@ impl RefundContract {
             &(customer_count + 1),
         );
 
+        // An unredeemed voucher is a funds-backed claim kept in instance
+        // storage: it must not expire in storage before its own expiry.
+        storage::extend_instance_until(
+            &env,
+            storage::StorageTier::CriticalActiveLock,
+            voucher.expires_at,
+            0,
+        );
+
         Ok(voucher_id)
     }
 
@@ -11065,3 +11074,6 @@ mod test_admin_rotation;
 
 #[cfg(test)]
 mod test_refund_events;
+
+#[cfg(test)]
+mod test_storage_ttl;

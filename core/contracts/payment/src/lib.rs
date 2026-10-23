@@ -11,6 +11,7 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+use storage::StorageTier;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
 mod archival;
@@ -1985,6 +1986,12 @@ pub struct PaymentInvoice {
     pub issued_at: u64,
 }
 
+/// After a pending payment's expiry, how long it can still be disputed or
+/// refunded; its storage must last at least this much longer.
+pub const PAYMENT_DISPUTE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Most ids `batch_bump_critical` accepts per call.
+pub const MAX_TTL_BUMP_BATCH: u32 = 50;
+
 #[contract]
 pub struct PaymentContract;
 
@@ -2063,6 +2070,62 @@ impl PaymentContract {
             &INITIAL_SCHEMA_VERSION,
         );
         (AdminAdded { admin }).publish(&env);
+    }
+
+    /// Keeper maintenance (the issue's `batch_bump_critical_escrows_and_payments`;
+    /// Soroban caps contract function names at 32 characters): extends storage
+    /// for every payment in `ids` that still holds funds (`Pending`) so it
+    /// outlives the payment's expiry plus the dispute grace period. Unknown and
+    /// finished payments are skipped. Anyone may call it; it only extends TTLs.
+    ///
+    /// Returns how many payments were critical and bumped.
+    ///
+    /// # Errors
+    /// `InvalidBatchSize` for more than [`MAX_TTL_BUMP_BATCH`] ids.
+    pub fn batch_bump_critical(env: Env, ids: Vec<u64>) -> Result<u32, Error> {
+        if ids.len() > MAX_TTL_BUMP_BATCH {
+            return Err(Error::Basic(BasicError::InvalidBatchSize));
+        }
+        let mut bumped = 0u32;
+        for payment_id in ids.iter() {
+            if Self::keep_payment_alive(&env, payment_id) > 0 {
+                bumped += 1;
+            }
+        }
+        Ok(bumped)
+    }
+
+    /// Storage tier of a payment: `Pending` holds funds
+    /// (`CriticalActiveLock`), a partial refund is still live
+    /// (`StandardActive`), the rest are finished (`TerminalAuditRecord`).
+    fn payment_storage_tier(status: &PaymentStatus) -> StorageTier {
+        match status {
+            PaymentStatus::Pending => StorageTier::CriticalActiveLock,
+            PaymentStatus::PartialRefunded => StorageTier::StandardActive,
+            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::Cancelled => {
+                StorageTier::TerminalAuditRecord
+            }
+        }
+    }
+
+    /// Payments are kept in instance storage, which shares one TTL. For a
+    /// payment that still holds funds, extend that TTL so it outlives the
+    /// payment's expiry plus [`PAYMENT_DISPUTE_GRACE_SECS`]. Returns the TTL
+    /// target, or 0 when the payment is unknown or not critical.
+    fn keep_payment_alive(env: &Env, payment_id: u64) -> u32 {
+        let payment: Payment = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+        {
+            Some(payment) => payment,
+            None => return 0,
+        };
+        let tier = Self::payment_storage_tier(&payment.status);
+        if tier != StorageTier::CriticalActiveLock {
+            return 0;
+        }
+        storage::extend_instance_until(env, tier, payment.expires_at, PAYMENT_DISPUTE_GRACE_SECS)
     }
 
     /// Returns the current schema version of the contract storage.
@@ -2918,6 +2981,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -3511,6 +3577,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -3690,6 +3759,9 @@ impl PaymentContract {
             escrow_contract,
         })
         .publish(&env);
+
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
 
         Ok((payment_id, escrow_id))
     }
@@ -9807,6 +9879,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -12487,6 +12562,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -13862,3 +13940,6 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_storage_ttl;
