@@ -661,3 +661,227 @@ fn test_non_admin_cannot_set_merchant_status() {
         MerchantStatus::Active
     );
 }
+
+// ── Refund-risk auto-throttling ──────────────────────────────────────────────
+
+mod auto_throttle {
+    use super::*;
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::{token, Map, Symbol, TryFromVal, Val};
+
+    struct Shop {
+        env: Env,
+        admin: Address,
+        client: RefundContractClient<'static>,
+        merchant: Address,
+        token: Address,
+        next_payment: core::cell::Cell<u64>,
+    }
+
+    impl Shop {
+        /// A refund for a fresh customer and payment (no rate limit applies).
+        fn request(&self, reason: RefundReasonCode) -> u64 {
+            let payment_id = self.next_payment.get();
+            self.next_payment.set(payment_id + 1);
+            self.client.request_refund(
+                &self.merchant,
+                &payment_id,
+                &Address::generate(&self.env),
+                &100,
+                &1_000,
+                &self.token,
+                &String::from_str(&self.env, "r"),
+                &reason,
+                &0,
+            )
+        }
+
+        /// A refund that is approved and paid out (substantiated).
+        fn substantiate(&self, reason: RefundReasonCode) -> u64 {
+            let id = self.request(reason);
+            self.client.approve_refund(&self.admin, &id);
+            self.client.process_refund(&self.admin, &id);
+            id
+        }
+
+        fn status(&self) -> MerchantStatus {
+            self.client.get_merchant_status(&self.merchant)
+        }
+
+        /// `ratio_bps` and whether `from == to`, for each MerchantAutoThrottled
+        /// event of the last invocation.
+        fn throttle_events(&self) -> soroban_sdk::Vec<(u32, bool)> {
+            let mut found = soroban_sdk::Vec::new(&self.env);
+            let name = Symbol::new(&self.env, "merchant_auto_throttled");
+            for (_, topics, data) in self.env.events().all().iter() {
+                let topic = topics.get(0).and_then(|t| Symbol::try_from_val(&self.env, &t).ok());
+                if topic != Some(name.clone()) {
+                    continue;
+                }
+                let fields = Map::<Symbol, Val>::try_from_val(&self.env, &data).unwrap();
+                let get = |k: &str| fields.get(Symbol::new(&self.env, k)).unwrap();
+                let ratio = u32::try_from_val(&self.env, &get("ratio_bps")).unwrap();
+                let from = MerchantStatus::try_from_val(&self.env, &get("from")).unwrap();
+                let to = MerchantStatus::try_from_val(&self.env, &get("to")).unwrap();
+                found.push_back((ratio, from == to));
+            }
+            found
+        }
+    }
+
+    fn shop() -> Shop {
+        let (env, admin, client) = setup();
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        // Fund the refund pool so processed refunds can pay out.
+        token::StellarAssetClient::new(&env, &token).mint(&client.address, &1_000_000);
+        client.set_merchant_risk_thresholds(
+            &admin,
+            &MerchantRiskThresholds {
+                warning_ratio_bps: 2_000,
+                restricted_ratio_bps: 4_000,
+                suspended_ratio_bps: 7_000,
+                min_sample_tx_count: 20,
+            },
+        );
+        let merchant = Address::generate(&env);
+        Shop {
+            env,
+            admin,
+            client,
+            merchant,
+            token,
+            next_payment: core::cell::Cell::new(1),
+        }
+    }
+
+    #[test]
+    fn no_throttling_below_the_sample_floor() {
+        let s = shop();
+        // 19 substantiated refunds, every one high-risk: 100% ratio, but the
+        // sample is below the 20-transaction floor.
+        for _ in 0..19 {
+            s.substantiate(RefundReasonCode::Unauthorized);
+        }
+        assert_eq!(s.status(), MerchantStatus::Active);
+        assert_eq!(s.client.get_merchant_risk_window(&s.merchant).refund_count, 19);
+
+        // The 20th meets the floor and suspends.
+        s.substantiate(RefundReasonCode::Unauthorized);
+        assert_eq!(s.status(), MerchantStatus::Suspended);
+    }
+
+    #[test]
+    fn high_risk_ratio_restricts_then_suspends() {
+        let s = shop();
+        for i in 0..20 {
+            let reason = if i % 2 == 0 {
+                RefundReasonCode::ProductDefect
+            } else {
+                RefundReasonCode::CustomerRequest
+            };
+            s.substantiate(reason);
+        }
+        // 10 / 20 = 50%: restricted (>= 40%), not suspended (< 70%).
+        assert_eq!(s.status(), MerchantStatus::Restricted);
+        let window = s.client.get_merchant_risk_window(&s.merchant);
+        assert_eq!((window.refund_count, window.high_risk_refund_count), (20, 10));
+        assert_eq!(window.total_refund_volume, 20 * 100);
+
+        // Restricted: customers can still request, and the admin's processing
+        // is the sign-off that lets a refund settle...
+        let id = s.substantiate(RefundReasonCode::CustomerRequest);
+        assert_eq!(s.client.get_refund(&id).status, RefundStatus::Processed);
+        // ...but the merchant's own overrides are blocked.
+        let denied = s.request(RefundReasonCode::Other);
+        s.client
+            .reject_refund(&s.admin, &denied, &String::from_str(&s.env, "no"));
+        assert_eq!(
+            s.client.try_merchant_override_denial(&s.merchant, &denied),
+            Err(Ok(Error::Ext(ExtError::MerchantNotEligible)))
+        );
+
+        // More high-risk refunds push it past 70%: suspended.
+        for _ in 0..30 {
+            if s.status() == MerchantStatus::Suspended {
+                break;
+            }
+            s.substantiate(RefundReasonCode::NonDelivery);
+        }
+        assert_eq!(s.status(), MerchantStatus::Suspended);
+    }
+
+    #[test]
+    fn unsubstantiated_requests_cannot_grief_a_merchant() {
+        let s = shop();
+        // 40 high-risk requests: half denied, half left pending.
+        for i in 0..40 {
+            let id = s.request(RefundReasonCode::Unauthorized);
+            if i % 2 == 0 {
+                s.client
+                    .reject_refund(&s.admin, &id, &String::from_str(&s.env, "spam"));
+            }
+        }
+        assert_eq!(s.client.get_merchant_risk_window(&s.merchant).refund_count, 0);
+        assert_eq!(s.status(), MerchantStatus::Active);
+    }
+
+    #[test]
+    fn warning_ratio_emits_an_event_without_changing_status() {
+        let s = shop();
+        // 20 low-risk refunds (DuplicateCharge is not high-risk)...
+        for i in 0..20 {
+            let reason = if i < 4 {
+                RefundReasonCode::DuplicateCharge
+            } else {
+                RefundReasonCode::CustomerRequest
+            };
+            s.substantiate(reason);
+        }
+        // ...then 5 high-risk: 5 / 25 = 20%, the warning ratio.
+        for _ in 0..5 {
+            s.substantiate(RefundReasonCode::Unauthorized);
+        }
+        // Read the events before any other invocation replaces them.
+        assert_eq!(s.throttle_events().last(), Some((2_000, true)));
+        assert_eq!(s.status(), MerchantStatus::Active);
+    }
+
+    #[test]
+    fn counters_reset_when_the_30_day_window_rolls_over() {
+        let s = shop();
+        for _ in 0..10 {
+            s.substantiate(RefundReasonCode::Unauthorized);
+        }
+        s.env
+            .ledger()
+            .set_timestamp(s.env.ledger().timestamp() + MERCHANT_RISK_WINDOW_SECS);
+        for _ in 0..10 {
+            s.substantiate(RefundReasonCode::Unauthorized);
+        }
+        // Only the new window's 10 count: below the floor, still active.
+        assert_eq!(s.client.get_merchant_risk_window(&s.merchant).refund_count, 10);
+        assert_eq!(s.status(), MerchantStatus::Active);
+    }
+
+    #[test]
+    fn thresholds_are_validated_and_admin_only() {
+        let s = shop();
+        let bad = MerchantRiskThresholds {
+            warning_ratio_bps: 5_000,
+            restricted_ratio_bps: 4_000,
+            suspended_ratio_bps: 7_000,
+            min_sample_tx_count: 20,
+        };
+        assert!(s.client.try_set_merchant_risk_thresholds(&s.admin, &bad).is_err());
+        let ok = MerchantRiskThresholds {
+            warning_ratio_bps: 1_000,
+            ..bad
+        };
+        assert_eq!(
+            s.client
+                .try_set_merchant_risk_thresholds(&Address::generate(&s.env), &ok),
+            Err(Ok(Error::Core(CoreError::Unauthorized)))
+        );
+        s.client.set_merchant_risk_thresholds(&s.admin, &ok);
+    }
+}

@@ -927,6 +927,10 @@ pub enum EligibilityKey {
     MerchantCustomerCount(Address),
     /// Admin-assigned standing of a merchant. Absent means `Active`.
     MerchantStatus(Address),
+    /// Auto-throttling thresholds (unset: auto-throttling is off).
+    RiskThresholds,
+    /// A merchant's refund-risk counters for the current 30-day window.
+    MerchantRisk(Address),
 }
 
 /// Standing of a merchant with the platform. Only `Active` merchants may
@@ -938,7 +942,53 @@ pub enum MerchantStatus {
     Active,
     Suspended,
     Sanctioned,
+    /// Refunds can still be requested, but they only settle when the admin
+    /// processes them (manual sign-off), and the merchant's own overrides
+    /// are blocked. Set automatically by refund-risk throttling, or by admin.
+    Restricted,
 }
+
+/// Refund-risk thresholds for automatic merchant throttling, in basis points
+/// of a merchant's substantiated refunds in the current 30-day window.
+///
+/// The ratio is `high_risk_refund_count * 10_000 / refund_count`, where
+/// high-risk means `Unauthorized`, `NonDelivery` or `ProductDefect`. Nothing
+/// happens until the window holds at least `min_sample_tx_count` refunds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRiskThresholds {
+    pub warning_ratio_bps: u32,
+    pub restricted_ratio_bps: u32,
+    pub suspended_ratio_bps: u32,
+    pub min_sample_tx_count: u32,
+}
+
+/// A merchant's substantiated refunds in the current 30-day window. Only
+/// processed refunds (approved, auto-refunded, or upheld in arbitration) are
+/// counted; requests that were denied or never approved are not.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRiskWindow {
+    pub window_start: u64,
+    pub refund_count: u32,
+    pub high_risk_refund_count: u32,
+    pub total_refund_volume: i128,
+}
+
+/// Emitted when refund-risk throttling changes a merchant's standing, or (with
+/// `to == from`) when a merchant crosses the warning ratio.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAutoThrottled {
+    pub merchant: Address,
+    pub from: MerchantStatus,
+    pub to: MerchantStatus,
+    pub ratio_bps: u32,
+    pub sample_size: u32,
+}
+
+/// Length of the refund-risk window.
+pub const MERCHANT_RISK_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7119,7 +7169,7 @@ impl RefundContract {
         }
 
         // Suspended or sanctioned merchants may not issue refunds.
-        Self::require_merchant_active(&env, &merchant)?;
+        Self::require_merchant_not_suspended(&env, &merchant)?;
 
         Self::check_customer_refund_cooldown(&env, &customer)?;
 
@@ -7394,8 +7444,9 @@ impl RefundContract {
         }
 
         // Re-check standing at payout time: a merchant suspended after the
-        // refund was requested/approved must not have it paid out.
-        Self::require_merchant_active(env, &refund.merchant)?;
+        // refund was requested/approved must not have it paid out, and a
+        // restricted one only with the admin's sign-off.
+        Self::require_merchant_settleable(env, &refund.merchant, &processed_by)?;
 
         Self::can_refund_payment(
             env,
@@ -7429,6 +7480,9 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
+        // Only a processed refund is substantiated: it counts toward the
+        // merchant's refund-risk ratio (denied or pending requests never do).
+        Self::record_substantiated_refund(env, &refund);
         // Issue #382: this refund's requested_at may fall within a previously
         // cached analytics window, so drop that cache entry.
         Self::invalidate_analytics_cache_for(env, refund.requested_at);
@@ -9160,6 +9214,156 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::MerchantNotEligible));
         }
         Ok(())
+    }
+
+    /// Customers may still request refunds from a `Restricted` merchant;
+    /// `Suspended` and `Sanctioned` merchants are blocked.
+    fn require_merchant_not_suspended(env: &Env, merchant: &Address) -> Result<(), Error> {
+        match Self::get_merchant_status(env.clone(), merchant.clone()) {
+            MerchantStatus::Active | MerchantStatus::Restricted => Ok(()),
+            _ => Err(Error::Ext(ExtError::MerchantNotEligible)),
+        }
+    }
+
+    /// A refund pays out for an `Active` merchant, or for a `Restricted` one
+    /// when the stored admin processes it (manual sign-off).
+    fn require_merchant_settleable(env: &Env, merchant: &Address, processed_by: &Address) -> Result<(), Error> {
+        match Self::get_merchant_status(env.clone(), merchant.clone()) {
+            MerchantStatus::Active => Ok(()),
+            MerchantStatus::Restricted => {
+                let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+                if admin.as_ref() == Some(processed_by) {
+                    Ok(())
+                } else {
+                    Err(Error::Ext(ExtError::MerchantNotEligible))
+                }
+            }
+            _ => Err(Error::Ext(ExtError::MerchantNotEligible)),
+        }
+    }
+
+    // ── Refund-risk auto-throttling ───────────────────────────────────────
+
+    /// Sets the refund-risk thresholds. Admin only. Ratios must satisfy
+    /// `warning <= restricted <= suspended <= 10_000`, and the sample floor
+    /// must be at least 1.
+    pub fn set_merchant_risk_thresholds(
+        env: Env,
+        admin: Address,
+        thresholds: MerchantRiskThresholds,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if thresholds.warning_ratio_bps > thresholds.restricted_ratio_bps
+            || thresholds.restricted_ratio_bps > thresholds.suspended_ratio_bps
+            || thresholds.suspended_ratio_bps > 10_000
+            || thresholds.min_sample_tx_count == 0
+        {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&EligibilityKey::RiskThresholds, &thresholds);
+        Ok(())
+    }
+
+    /// The configured thresholds, if auto-throttling is on.
+    pub fn get_merchant_risk_thresholds(env: Env) -> Option<MerchantRiskThresholds> {
+        env.storage().instance().get(&EligibilityKey::RiskThresholds)
+    }
+
+    /// The merchant's refund-risk counters for the current window.
+    pub fn get_merchant_risk_window(env: Env, merchant: Address) -> MerchantRiskWindow {
+        Self::load_risk_window(&env, &merchant)
+    }
+
+    fn load_risk_window(env: &Env, merchant: &Address) -> MerchantRiskWindow {
+        let now = env.ledger().timestamp();
+        match storage::get_persistent::<_, MerchantRiskWindow>(
+            env,
+            &EligibilityKey::MerchantRisk(merchant.clone()),
+        ) {
+            Some(window) if now < window.window_start.saturating_add(MERCHANT_RISK_WINDOW_SECS) => {
+                window
+            }
+            // No window yet, or it has elapsed: start a fresh one.
+            _ => MerchantRiskWindow {
+                window_start: now,
+                refund_count: 0,
+                high_risk_refund_count: 0,
+                total_refund_volume: 0,
+            },
+        }
+    }
+
+    fn is_high_risk(reason: &RefundReasonCode) -> bool {
+        matches!(
+            reason,
+            RefundReasonCode::Unauthorized
+                | RefundReasonCode::NonDelivery
+                | RefundReasonCode::ProductDefect
+        )
+    }
+
+    /// Counts a substantiated (processed) refund against its merchant and,
+    /// when thresholds are configured and the sample floor is met, escalates
+    /// the merchant's standing: `Active` -> `Restricted` -> `Suspended`.
+    /// It never lowers a standing and never touches `Sanctioned`.
+    fn record_substantiated_refund(env: &Env, refund: &Refund) {
+        let mut window = Self::load_risk_window(env, &refund.merchant);
+        window.refund_count = window.refund_count.saturating_add(1);
+        if Self::is_high_risk(&refund.reason_code) {
+            window.high_risk_refund_count = window.high_risk_refund_count.saturating_add(1);
+        }
+        window.total_refund_volume = window.total_refund_volume.saturating_add(refund.amount);
+        storage::set_persistent(env, &EligibilityKey::MerchantRisk(refund.merchant.clone()), &window);
+
+        let thresholds: MerchantRiskThresholds =
+            match env.storage().instance().get(&EligibilityKey::RiskThresholds) {
+                Some(t) => t,
+                None => return,
+            };
+        if window.refund_count < thresholds.min_sample_tx_count {
+            return;
+        }
+        let ratio_bps =
+            (window.high_risk_refund_count as u64 * 10_000 / window.refund_count as u64) as u32;
+        let from = Self::get_merchant_status(env.clone(), refund.merchant.clone());
+        let to = if ratio_bps >= thresholds.suspended_ratio_bps {
+            MerchantStatus::Suspended
+        } else if ratio_bps >= thresholds.restricted_ratio_bps {
+            MerchantStatus::Restricted
+        } else {
+            from.clone()
+        };
+        let escalates = matches!(
+            (&from, &to),
+            (MerchantStatus::Active, MerchantStatus::Restricted)
+                | (MerchantStatus::Active, MerchantStatus::Suspended)
+                | (MerchantStatus::Restricted, MerchantStatus::Suspended)
+        );
+        if escalates {
+            env.storage()
+                .instance()
+                .set(&EligibilityKey::MerchantStatus(refund.merchant.clone()), &to);
+        } else if ratio_bps < thresholds.warning_ratio_bps || from != MerchantStatus::Active {
+            return;
+        }
+        MerchantAutoThrottled {
+            merchant: refund.merchant.clone(),
+            from: from.clone(),
+            to: if escalates { to } else { from },
+            ratio_bps,
+            sample_size: window.refund_count,
+        }
+        .publish(env);
     }
 
     // ── Issue #148: Customer eligibility registry ─────────────────────────
