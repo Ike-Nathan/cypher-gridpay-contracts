@@ -303,6 +303,20 @@ pub enum RefundReasonCode {
     Other,
 }
 
+/// Refund activity for one reason code in one 30-day epoch, for a merchant or
+/// platform-wide. `count` is refunds requested in the epoch; `approved_count`
+/// and `total_amount` are those of them that were paid out (attributed to
+/// the epoch the refund was requested in, so `approved_count <= count`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochReasonCodeStats {
+    pub epoch_id: u32,
+    pub reason_code: RefundReasonCode,
+    pub count: u64,
+    pub total_amount: i128,
+    pub approved_count: u64,
+}
+
 // Issue #138 (recurred): the flat `Error` enum grew past Soroban's 50-variant
 // XDR spec limit (`VecM<ScSpecUdtErrorEnumCaseV0, 50>`), which makes the
 // `#[contracterror]` macro panic with `LengthExceedsMax` at compile time.
@@ -5688,6 +5702,86 @@ impl RefundContract {
         results
     }
 
+    /// The analytics epoch a timestamp falls in (30-day epochs).
+    pub fn get_reason_epoch(_env: Env, timestamp: u64) -> u32 {
+        storage::reason_epoch(timestamp)
+    }
+
+    /// A merchant's refund activity in `epoch_id`, one entry per reason code
+    /// in a fixed order (zeroed where nothing happened). Reads exactly six
+    /// entries, however much history there is.
+    pub fn get_merchant_reason_analytics(
+        env: Env,
+        merchant: Address,
+        epoch_id: u32,
+    ) -> Vec<EpochReasonCodeStats> {
+        Self::epoch_reason_stats(&env, Some(merchant), epoch_id)
+    }
+
+    /// Platform-wide refund activity in `epoch_id`, one entry per reason code.
+    pub fn get_platform_reason_analytics(env: Env, epoch_id: u32) -> Vec<EpochReasonCodeStats> {
+        Self::epoch_reason_stats(&env, None, epoch_id)
+    }
+
+    fn epoch_reason_stats(
+        env: &Env,
+        merchant: Option<Address>,
+        epoch_id: u32,
+    ) -> Vec<EpochReasonCodeStats> {
+        let mut out = Vec::new(env);
+        for reason in storage::ALL_REASON_CODES {
+            out.push_back(storage::read_epoch_reason_stats(env, merchant.clone(), epoch_id, reason));
+        }
+        out
+    }
+
+    /// Epoch-over-epoch change in a merchant's requested refunds per reason
+    /// code, in basis points: `(current - prior) * 10_000 / prior`.
+    ///
+    /// A zero prior epoch (including `current_epoch == 0`, which has none) is
+    /// treated as a prior of one, so a reason appearing from nothing reports
+    /// `current * 10_000` instead of dividing by zero; zero in both epochs
+    /// is `0`. Reads twelve entries (six per epoch).
+    pub fn get_reason_code_velocity_delta(
+        env: Env,
+        merchant: Address,
+        current_epoch: u32,
+    ) -> Vec<(RefundReasonCode, i64)> {
+        let mut out = Vec::new(&env);
+        for reason in storage::ALL_REASON_CODES {
+            let current = storage::read_epoch_reason_stats(
+                &env,
+                Some(merchant.clone()),
+                current_epoch,
+                reason.clone(),
+            )
+            .count;
+            let prior = match current_epoch.checked_sub(1) {
+                Some(prior_epoch) => {
+                    storage::read_epoch_reason_stats(
+                        &env,
+                        Some(merchant.clone()),
+                        prior_epoch,
+                        reason.clone(),
+                    )
+                    .count
+                }
+                None => 0,
+            };
+            out.push_back((reason, Self::velocity_bps(current, prior)));
+        }
+        out
+    }
+
+    fn velocity_bps(current: u64, prior: u64) -> i64 {
+        let current = current.min(i64::MAX as u64 / 10_000) as i64;
+        let prior = prior.min(i64::MAX as u64 / 10_000) as i64;
+        if prior == 0 {
+            return current * 10_000;
+        }
+        (current - prior) * 10_000 / prior
+    }
+
     /// Get analytics showing the count of refunds for each reason code, sorted by frequency,
     /// restricted to refunds created within `[window_start, window_end]` (inclusive).
     ///
@@ -7576,6 +7670,13 @@ impl RefundContract {
             .instance()
             .set(&DataKey::RefundCounter, &refund_id);
         Self::add_to_status_index(&env, initial_status.clone(), refund_id);
+        storage::record_epoch_reason_stats(
+            &env,
+            &merchant,
+            storage::reason_epoch(refund.requested_at),
+            &reason_code,
+            None,
+        );
 
         let merchant_count: u64 = env
             .storage()
@@ -7739,6 +7840,13 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
+        storage::record_epoch_reason_stats(
+            env,
+            &refund.merchant,
+            storage::reason_epoch(refund.requested_at),
+            &refund.reason_code,
+            Some(refund.amount),
+        );
         // Issue #382: this refund's requested_at may fall within a previously
         // cached analytics window, so drop that cache entry.
         Self::invalidate_analytics_cache_for(env, refund.requested_at);
@@ -11540,3 +11648,6 @@ mod test_admin_rotation;
 
 #[cfg(test)]
 mod test_refund_events;
+
+#[cfg(test)]
+mod test_refund_analytics;

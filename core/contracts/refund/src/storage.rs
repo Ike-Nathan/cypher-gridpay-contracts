@@ -5,7 +5,9 @@
 //! restores them. Every active read or write goes through these helpers so the
 //! touched entry's TTL is extended automatically.
 
-use soroban_sdk::{Env, IntoVal, TryFromVal, Val};
+use soroban_sdk::{contracttype, Address, Env, IntoVal, TryFromVal, Val};
+
+use crate::{EpochReasonCodeStats, RefundReasonCode};
 
 /// Approximate number of ledgers closed per day (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
@@ -72,4 +74,79 @@ where
 {
     env.storage().persistent().set(key, value);
     extend_persistent(env, key);
+}
+
+// ── Per-merchant, per-epoch reason-code analytics ───────────────────────────
+
+/// Length of an analytics epoch (30 days, roughly a month).
+pub const REASON_EPOCH_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Every reason code, in a fixed order. Queries walk this list, so they always
+/// touch exactly `ALL_REASON_CODES.len()` (6) keys per epoch.
+pub const ALL_REASON_CODES: [RefundReasonCode; 6] = [
+    RefundReasonCode::ProductDefect,
+    RefundReasonCode::NonDelivery,
+    RefundReasonCode::DuplicateCharge,
+    RefundReasonCode::Unauthorized,
+    RefundReasonCode::CustomerRequest,
+    RefundReasonCode::Other,
+];
+
+#[contracttype]
+#[derive(Clone)]
+pub enum AnalyticsKey {
+    /// Stats for (merchant, epoch, reason); `None` is the platform-wide total.
+    EpochReasonStats(Option<Address>, u32, RefundReasonCode),
+}
+
+/// The epoch a timestamp falls in.
+pub fn reason_epoch(timestamp: u64) -> u32 {
+    (timestamp / REASON_EPOCH_SECS) as u32
+}
+
+/// Stats for one (scope, epoch, reason); zeroed when nothing was recorded.
+pub fn read_epoch_reason_stats(
+    env: &Env,
+    merchant: Option<Address>,
+    epoch_id: u32,
+    reason_code: RefundReasonCode,
+) -> EpochReasonCodeStats {
+    get_persistent(
+        env,
+        &AnalyticsKey::EpochReasonStats(merchant, epoch_id, reason_code.clone()),
+    )
+    .unwrap_or(EpochReasonCodeStats {
+        epoch_id,
+        reason_code,
+        count: 0,
+        total_amount: 0,
+        approved_count: 0,
+    })
+}
+
+/// Records a refund event against both the merchant's and the platform-wide
+/// stats for its epoch: a request (`count`), or a payout (`approved_count`
+/// and `total_amount`). Two reads and two writes.
+pub fn record_epoch_reason_stats(
+    env: &Env,
+    merchant: &Address,
+    epoch_id: u32,
+    reason_code: &RefundReasonCode,
+    paid_amount: Option<i128>,
+) {
+    for scope in [Some(merchant.clone()), None] {
+        let mut stats = read_epoch_reason_stats(env, scope.clone(), epoch_id, reason_code.clone());
+        match paid_amount {
+            None => stats.count = stats.count.saturating_add(1),
+            Some(amount) => {
+                stats.approved_count = stats.approved_count.saturating_add(1);
+                stats.total_amount = stats.total_amount.saturating_add(amount);
+            }
+        }
+        set_persistent(
+            env,
+            &AnalyticsKey::EpochReasonStats(scope, epoch_id, reason_code.clone()),
+            &stats,
+        );
+    }
 }
