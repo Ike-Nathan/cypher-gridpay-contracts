@@ -10,6 +10,7 @@ use soroban_sdk::{
     Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
+pub mod reentrancy;
 pub mod storage;
 use storage::StorageTier;
 #[path = "../../escrow/src/fixed_math.rs"]
@@ -193,6 +194,9 @@ pub enum BasicError {
     /// A merchant's aggregate volume for the day would exceed its verification
     /// tier limit (#23).
     DailyTierLimitExceeded = 128,
+    /// A fund-moving entry point was entered while another was still running
+    /// (see reentrancy.rs).
+    ReentrantCallDetected = 129,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -475,7 +479,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 128 {
+            if code >= 100 && code <= 129 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -2934,6 +2938,7 @@ impl PaymentContract {
         amount: i128,
         scheduled_at: u64,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "schedule_payment")?;
         customer.require_auth();
         if amount <= 0 {
@@ -3044,6 +3049,7 @@ impl PaymentContract {
         caller: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "cancel_scheduled_payment")?;
         caller.require_auth();
         let mut scheduled: ScheduledPayment = env
@@ -3185,6 +3191,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payout schedule is not found, the payout
     /// period has not elapsed, or there is nothing to settle.
     pub fn trigger_scheduled_payout(env: Env, merchant: Address) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         merchant.require_auth();
         let mut schedule: PayoutSchedule = env
             .storage()
@@ -3715,6 +3722,7 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
@@ -3811,14 +3819,18 @@ impl PaymentContract {
         // bridge and allow an immediate release. See
         // EscrowContract::add_trusted_bridge / is_trusted_bridge.
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
-        if escrow_client
-            .try_release_escrow(
-                &env.current_contract_address(),
-                &bridge.escrow_id,
-                &bridge.auto_release_on_complete,
-            )
-            .is_err()
-        {
+        // Only the registered escrow sibling may call back while it runs.
+        reentrancy::expect_callback(
+            &env,
+            reentrancy::CallContextState::AwaitingEscrowCallback(bridge.escrow_contract.clone()),
+        );
+        let released = escrow_client.try_release_escrow(
+            &env.current_contract_address(),
+            &bridge.escrow_id,
+            &bridge.auto_release_on_complete,
+        );
+        reentrancy::end_callback(&env);
+        if released.is_err() {
             return Err(Error::Feature(FeatureError::EscrowBridgeFailed));
         }
 
@@ -4256,6 +4268,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not found, is not in Pending
     /// status, has no expiration set, or has not yet expired.
     pub fn expire_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         // Retrieve payment from storage
         if !env
             .storage()
@@ -4339,6 +4352,7 @@ impl PaymentContract {
     /// found, is not in Pending status, is expired, or the multisig threshold is not met.
     /// Returns `ProposalError::RequiresMultiSig` if a multisig proposal was auto-created.
     pub fn complete_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "complete_payment")?;
         admin.require_auth();
 
@@ -5051,6 +5065,7 @@ impl PaymentContract {
         payment_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "pay_installment")?;
         customer.require_auth();
 
@@ -5559,6 +5574,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not found, is not in Pending
     /// status, or the caller is not the customer or merchant.
     pub fn cancel_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "cancel_payment")?;
         caller.require_auth();
         PaymentContract::do_cancel_payment(&env, caller, payment_id)
@@ -6450,6 +6466,7 @@ impl PaymentContract {
     /// Anyone (typically an off-chain keeper / cron) may call this once the
     /// payment is due. It handles retry logic internally.
     pub fn execute_recurring_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if !env
             .storage()
             .instance()
@@ -6912,6 +6929,7 @@ impl PaymentContract {
     /// - `MeteredNotFound` if the subscription does not exist.
     /// - `BillingOverflow` if the multiplication of units × price overflows.
     pub fn execute_metered_billing(env: Env, subscription_id: u64) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         let mut sub: MeteredSubscription = env
             .storage()
             .instance()
@@ -7094,6 +7112,7 @@ impl PaymentContract {
         customer: Address,
         subscription_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
 
         if !env
@@ -7343,6 +7362,7 @@ impl PaymentContract {
     /// Retry a failed payment for a subscription in dunning.
     /// Validates that the retry is due before attempting.
     pub fn retry_failed_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if !env
             .storage()
             .instance()
@@ -7475,6 +7495,7 @@ impl PaymentContract {
 
     /// Admin resolves dunning for a subscription, returning it to active state.
     pub fn resolve_dunning(env: Env, admin: Address, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
 
         let config: MultiSigConfig = env
@@ -8575,6 +8596,7 @@ impl PaymentContract {
 
     /// Admin withdraws accumulated fees to the treasury address.
     pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         let multisig: MultiSigConfig = env
             .storage()
@@ -9167,6 +9189,7 @@ impl PaymentContract {
     /// - `RebateThresholdNotMet` if no accrual data exists for the merchant.
     /// - `RebateAlreadyClaimed` if the accrued rebate is zero (already claimed).
     pub fn claim_fee_rebate(env: Env, merchant: Address) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         merchant.require_auth();
 
         let config: FeeRebateConfig = env
@@ -9486,6 +9509,7 @@ impl PaymentContract {
         admin: Address,
         entries: Vec<BatchPaymentEntry>,
     ) -> Result<Vec<BatchResult>, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "create_payment_batch_optimized")?;
         admin.require_auth();
 
@@ -11928,6 +11952,7 @@ impl PaymentContract {
         expires_at: u64,
         customer_pk: BytesN<32>,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
@@ -12008,6 +12033,7 @@ impl PaymentContract {
         channel_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "top_up_channel")?;
         customer.require_auth();
         if amount <= 0 {
@@ -12078,6 +12104,7 @@ impl PaymentContract {
         nonce: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "settle_channel")?;
 
         let mut channel: PaymentChannel = env
@@ -12173,6 +12200,7 @@ impl PaymentContract {
     /// Returns an error if the caller is not a channel participant, the channel
     /// is not found, already closed, or not yet expired.
     pub fn close_channel_expired(env: Env, caller: Address, channel_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "close_channel_expired")?;
         caller.require_auth();
 
@@ -12288,6 +12316,7 @@ impl PaymentContract {
         token: Address,
         recipients: Vec<SplitRecipient>,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
 
@@ -12588,6 +12617,7 @@ impl PaymentContract {
         admin: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
 
         let mut config: PaymentSplitConfig = env
@@ -12751,6 +12781,7 @@ impl PaymentContract {
     /// is not set, accumulated fees are empty, `sweep_amount` exceeds accumulated fees,
     /// or multisig approval is required for amounts above threshold.
     pub fn sweep_fees(env: Env, admin: Address, sweep_amount: i128) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -13341,6 +13372,7 @@ impl PaymentContract {
     /// Returns an error if the settlement is already finalized, not found,
     /// or the release time has not yet passed.
     pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if finality::is_flagged(&env, payment_id) {
             return Err(Error::Payment(PaymentError::PaymentFlagged));
         }
@@ -13570,6 +13602,7 @@ impl PaymentContract {
         route: RouteOption,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
 
         // Validate route is still valid at execution time
@@ -13943,3 +13976,6 @@ mod test_paginated_queries;
 
 #[cfg(test)]
 mod test_storage_ttl;
+
+#[cfg(test)]
+mod test_cross_contract_verification;

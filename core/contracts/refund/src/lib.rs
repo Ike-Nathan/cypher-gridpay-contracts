@@ -4,6 +4,7 @@ use soroban_sdk::{
     BytesN, Env, FromVal, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
+pub mod reentrancy;
 pub mod storage;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
@@ -445,6 +446,9 @@ pub enum ExtError {
     TooManyTriggerConditions = 70,
     // Slash amount exceeds the arbitrator's deposited stake
     InsufficientArbitratorStake = 71,
+    // A fund-moving entry point was entered while another was still running
+    // (see reentrancy.rs).
+    ReentrantCallDetected = 72,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2902,6 +2906,7 @@ impl RefundContract {
     /// Returns `InvalidStatus` if the refund is not in `Approved` status.
     /// Returns `TotalRefundsExceedPayment` if processing would exceed the original payment.
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "process_refund")?;
         admin.require_auth();
 
@@ -3489,6 +3494,7 @@ impl RefundContract {
         fee_token: Address,
         fee_amount: i128,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         caller.require_auth();
 
         let refund: Refund = env
@@ -3743,6 +3749,7 @@ impl RefundContract {
     /// Returns `RefundNotFound` if the case does not exist.
     /// Returns `InvalidStatus` if the case is not open or quorum (3 votes) has not been reached.
     pub fn close_arbitration_case(env: Env, case_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         let mut case: ArbitrationCase = env
             .storage()
             .instance()
@@ -4818,6 +4825,7 @@ impl RefundContract {
         token: Address,
         recipient: Address,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -5200,6 +5208,7 @@ impl RefundContract {
         arbitrator: Address,
         amount: i128,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         arbitrator.require_auth();
         if amount <= 0 {
             return Err(Error::Core(CoreError::InvalidAmount));
@@ -5276,6 +5285,7 @@ impl RefundContract {
         slash_amount: i128,
         recipient: Address,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -10261,6 +10271,7 @@ impl RefundContract {
         voucher_id: u64,
         _payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         customer.require_auth();
 
         let mut voucher: RefundVoucher = env
@@ -10314,6 +10325,7 @@ impl RefundContract {
         voucher_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         customer.require_auth();
 
         if amount <= 0 {
