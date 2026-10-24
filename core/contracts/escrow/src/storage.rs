@@ -5,7 +5,10 @@
 //! restores them. Every active read or write goes through these helpers so the
 //! touched entry's TTL is extended automatically.
 
-use soroban_sdk::{Env, IntoVal, TryFromVal, Val, Vec};
+use soroban_sdk::{
+    contracttype, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, Val,
+    Vec,
+};
 
 /// Approximate number of ledgers closed per day (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
@@ -74,80 +77,109 @@ where
     extend_persistent(env, key);
 }
 
-/// Contract-instance storage is loaded (and paid for) on every invocation, and
-/// a ledger entry can't exceed 64 KiB. Configuration kept there must stay
-/// below this many serialized bytes even when fully loaded; collections that
-/// grow live in sharded persistent entries instead (see [`write_sharded`]).
-pub const MAX_INSTANCE_STORAGE_BYTES: u32 = 4_096;
+/// Depth of the archived-record Merkle accumulator (Issue #243): up to 2^20
+/// leaves, with a frontier of 20 * 32 = 640 bytes.
+pub const MERKLE_TREE_DEPTH: u32 = 20;
 
-/// Elements per persistent shard of a sharded collection.
-pub const SHARD_CAPACITY: u32 = 32;
+const MERKLE_FRONTIER_KEY: Symbol = symbol_short!("arch_imt");
 
-/// Number of shards needed for `count` elements.
-fn shard_count(count: u32) -> u32 {
-    count.div_ceil(SHARD_CAPACITY)
+/// Incremental Merkle tree over the SHA-256 digests of finalized/archived
+/// records (Issue #243). Only the rightmost filled node of each level is kept,
+/// so off-chain copies of archived records can be proven against `root`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct IncrementalMerkleFrontier {
+    pub frontier: Vec<BytesN<32>>,
+    pub leaf_count: u64,
+    pub root: BytesN<32>,
 }
 
-/// Reads every element of a sharded collection, in order.
+fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    let mut data = Bytes::from_array(env, &left.to_array());
+    data.extend_from_array(&right.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Returns the stored frontier, or the empty tree (all-zero leaves).
+pub fn get_merkle_frontier(env: &Env) -> IncrementalMerkleFrontier {
+    if let Some(imt) = get_persistent(env, &MERKLE_FRONTIER_KEY) {
+        return imt;
+    }
+    let mut frontier = Vec::new(env);
+    let mut zero = BytesN::from_array(env, &[0u8; 32]);
+    for _ in 0..MERKLE_TREE_DEPTH {
+        frontier.push_back(zero.clone());
+        zero = hash_pair(env, &zero, &zero);
+    }
+    IncrementalMerkleFrontier {
+        frontier,
+        leaf_count: 0,
+        root: zero,
+    }
+}
+
+/// SHA-256 digest of a record's XDR encoding, used as its Merkle leaf.
+pub fn archived_record_leaf<T>(env: &Env, record: &T) -> BytesN<32>
+where
+    T: IntoVal<Env, Val> + Clone,
+{
+    env.crypto().sha256(&record.clone().to_xdr(env)).to_bytes()
+}
+
+/// Appends a leaf to the accumulator and returns its index.
 ///
-/// The element count is a scalar header in instance storage under
-/// `count_key`; shard `i` is a persistent entry at `shard_key(i)` holding
-/// elements `i * SHARD_CAPACITY ..`. Returns `None` if the collection has
-/// never been written in sharded form (callers fall back to a legacy key).
-pub fn read_sharded<T, CK, SK, F>(env: &Env, count_key: &CK, shard_key: F) -> Option<Vec<T>>
-where
-    T: IntoVal<Env, Val> + TryFromVal<Env, Val>,
-    CK: IntoVal<Env, Val>,
-    SK: IntoVal<Env, Val>,
-    F: Fn(u32) -> SK,
-{
-    let count: u32 = env.storage().instance().get(count_key)?;
-    let mut items = Vec::new(env);
-    for shard in 0..shard_count(count) {
-        if let Some(part) = get_persistent::<SK, Vec<T>>(env, &shard_key(shard)) {
-            items.append(&part);
+/// # Panics
+/// Panics once all 2^`MERKLE_TREE_DEPTH` leaves are used.
+pub fn append_archived_leaf(env: &Env, leaf: BytesN<32>) -> u64 {
+    let mut imt = get_merkle_frontier(env);
+    let index = imt.leaf_count;
+    if index >= 1u64 << MERKLE_TREE_DEPTH {
+        panic!("archived record accumulator is full");
+    }
+
+    let mut node = leaf;
+    let mut zero = BytesN::from_array(env, &[0u8; 32]);
+    let mut position = index;
+    for level in 0..MERKLE_TREE_DEPTH {
+        if position & 1 == 0 {
+            imt.frontier.set(level, node.clone());
+            node = hash_pair(env, &node, &zero);
+        } else {
+            node = hash_pair(env, &imt.frontier.get_unchecked(level), &node);
         }
+        zero = hash_pair(env, &zero, &zero);
+        position >>= 1;
     }
-    Some(items)
+
+    imt.root = node;
+    imt.leaf_count += 1;
+    set_persistent(env, &MERKLE_FRONTIER_KEY, &imt);
+    index
 }
 
-/// Replaces a sharded collection with `items`: writes the shards it needs,
-/// removes shards it no longer needs, and updates the count header.
-pub fn write_sharded<T, CK, SK, F>(env: &Env, count_key: &CK, shard_key: F, items: &Vec<T>)
-where
-    T: IntoVal<Env, Val> + TryFromVal<Env, Val>,
-    CK: IntoVal<Env, Val>,
-    SK: IntoVal<Env, Val>,
-    F: Fn(u32) -> SK,
-{
-    let old_count: u32 = env.storage().instance().get(count_key).unwrap_or(0);
-    let count = items.len();
-    for shard in 0..shard_count(count) {
-        let start = shard * SHARD_CAPACITY;
-        let end = (start + SHARD_CAPACITY).min(count);
-        set_persistent(env, &shard_key(shard), &items.slice(start..end));
+/// Checks that `leaf_hash` sits at `index` under the current root, given its
+/// `MERKLE_TREE_DEPTH` sibling hashes ordered from the leaf level upwards.
+/// Indices at or beyond `leaf_count` are rejected.
+pub fn verify_archived_record_inclusion(
+    env: &Env,
+    leaf_hash: BytesN<32>,
+    index: u64,
+    proof: Vec<BytesN<32>>,
+) -> bool {
+    let imt = get_merkle_frontier(env);
+    if index >= imt.leaf_count || proof.len() != MERKLE_TREE_DEPTH {
+        return false;
     }
-    for shard in shard_count(count)..shard_count(old_count) {
-        env.storage().persistent().remove(&shard_key(shard));
+
+    let mut node = leaf_hash;
+    let mut position = index;
+    for sibling in proof.iter() {
+        node = if position & 1 == 0 {
+            hash_pair(env, &node, &sibling)
+        } else {
+            hash_pair(env, &sibling, &node)
+        };
+        position >>= 1;
     }
-    env.storage().instance().set(count_key, &count);
-}
-
-/// Serialized XDR size of everything in `contract`'s instance storage. Test
-/// helper for asserting the [`MAX_INSTANCE_STORAGE_BYTES`] budget.
-#[cfg(test)]
-pub fn instance_storage_xdr_len(env: &Env, contract: &soroban_sdk::Address) -> u32 {
-    use soroban_sdk::{testutils::storage::Instance as _, xdr::ToXdr};
-    env.as_contract(contract, || env.storage().instance().all().to_xdr(env).len())
-}
-
-/// Panics unless `contract`'s instance storage is below
-/// [`MAX_INSTANCE_STORAGE_BYTES`] serialized.
-#[cfg(test)]
-pub fn assert_instance_storage_within_budget(env: &Env, contract: &soroban_sdk::Address) {
-    let len = instance_storage_xdr_len(env, contract);
-    assert!(
-        len < MAX_INSTANCE_STORAGE_BYTES,
-        "instance storage is {len} bytes, budget is {MAX_INSTANCE_STORAGE_BYTES}"
-    );
+    node == imt.root
 }

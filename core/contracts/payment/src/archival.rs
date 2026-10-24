@@ -147,6 +147,8 @@ pub fn compact_settled_payments(env: &Env, payment_ids: Vec<u64>) -> Result<u32,
             state_hash: state_hash(env, &payment),
         };
         env.storage().instance().set(&(ARCH_KEY, payment_id), &record);
+        // Issue #243: commit the archived payment to the Merkle accumulator.
+        crate::storage::append_archived_leaf(env, record.state_hash.clone());
 
         // Replace the verbose record with a stub that keeps the guard fields.
         let mut stub = payment;

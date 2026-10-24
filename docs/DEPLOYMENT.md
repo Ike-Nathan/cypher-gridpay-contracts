@@ -212,6 +212,24 @@ export ADMIN_SECRET=<YOUR_SECRET_KEY>
 
 This script handles all build, deploy, initialization, and cross-registration steps automatically.
 
+The script writes a deployment manifest to `deployment-manifest.json` containing the network, timestamp, admin address, and all four contract IDs:
+
+```json
+{
+  "network": "testnet",
+  "deployed_at": "2026-01-01T00:00:00Z",
+  "admin_address": "G...",
+  "contracts": {
+    "payment": "C...",
+    "escrow": "C...",
+    "refund": "C...",
+    "admin": "C..."
+  }
+}
+```
+
+The manifest JSON is validated by the script before it exits successfully. Pass `futurenet` as the argument to deploy to Futurenet instead of Testnet.
+
 ---
 
 ## Admin Setup

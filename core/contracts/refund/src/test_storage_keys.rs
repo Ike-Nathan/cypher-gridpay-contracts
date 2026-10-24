@@ -17,9 +17,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     xdr::{FromXdr, ToXdr},
-    Address, Env, Symbol, TryFromVal, Val,
+    Address, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Number of variants in each key enum. Update alongside the enumerations.
@@ -824,98 +824,132 @@ fn test_key_encoding_is_keyed_on_variant_name() {
     }
 }
 
-/// Instance-storage budget: the arbitrator registries and supported-token
-/// entries live in persistent storage, so instance storage stays under
-/// `MAX_INSTANCE_STORAGE_BYTES` at full configuration load.
-mod instance_budget {
-    use crate::storage::{
-        assert_instance_storage_within_budget, instance_storage_xdr_len, MAX_INSTANCE_STORAGE_BYTES,
-    };
-    use crate::{ArbitrationKey, RefundContract, RefundContractClient, SupportedRefundToken, TokenKey};
-    use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+// ── Issue #243: archived-record Merkle accumulator ──────────────────────────
 
-    fn setup(env: &Env) -> (RefundContractClient<'_>, Address, Address) {
-        env.mock_all_auths();
-        let contract_id = env.register(RefundContract, ());
-        let client = RefundContractClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        client.initialize(&admin);
-        (client, contract_id, admin)
+fn merkle_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    let mut data = Bytes::from_array(env, &left.to_array());
+    data.extend_from_array(&right.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Builds every level of the full depth-20 tree over `leaves` (missing
+/// nodes are the all-zero subtree hashes) and returns `(levels, zeros)`.
+fn merkle_levels(
+    env: &Env,
+    leaves: &[BytesN<32>],
+) -> (
+    std::vec::Vec<std::vec::Vec<BytesN<32>>>,
+    std::vec::Vec<BytesN<32>>,
+) {
+    let mut zeros = std::vec![BytesN::from_array(env, &[0u8; 32])];
+    let mut levels = std::vec![leaves.to_vec()];
+    for depth in 0..storage::MERKLE_TREE_DEPTH as usize {
+        let current = &levels[depth];
+        let mut next = std::vec::Vec::new();
+        for i in (0..current.len()).step_by(2) {
+            let right = current.get(i + 1).unwrap_or(&zeros[depth]);
+            next.push(merkle_pair(env, &current[i], right));
+        }
+        zeros.push(merkle_pair(env, &zeros[depth], &zeros[depth]));
+        levels.push(next);
+    }
+    (levels, zeros)
+}
+
+fn merkle_proof(
+    env: &Env,
+    levels: &[std::vec::Vec<BytesN<32>>],
+    zeros: &[BytesN<32>],
+    index: u64,
+) -> Vec<BytesN<32>> {
+    let mut proof = Vec::new(env);
+    for depth in 0..storage::MERKLE_TREE_DEPTH as usize {
+        let sibling = ((index >> depth) ^ 1) as usize;
+        proof.push_back(levels[depth].get(sibling).unwrap_or(&zeros[depth]).clone());
+    }
+    proof
+}
+
+#[test]
+fn test_merkle_accumulator_1000_leaves_and_inclusion_proofs() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let leaves: std::vec::Vec<BytesN<32>> = (0..1_000u32)
+        .map(|i| {
+            env.crypto()
+                .sha256(&Bytes::from_array(&env, &i.to_be_bytes()))
+                .to_bytes()
+        })
+        .collect();
+    env.as_contract(&contract_id, || {
+        for (i, leaf) in leaves.iter().enumerate() {
+            assert_eq!(storage::append_archived_leaf(&env, leaf.clone()), i as u64);
+        }
+    });
+
+    let (levels, zeros) = merkle_levels(&env, &leaves);
+    let imt = env.as_contract(&contract_id, || storage::get_merkle_frontier(&env));
+    assert_eq!(imt.leaf_count, 1_000);
+    assert_eq!(imt.frontier.len(), storage::MERKLE_TREE_DEPTH);
+    assert_eq!(imt.root, levels[storage::MERKLE_TREE_DEPTH as usize][0]);
+
+    for (i, leaf) in leaves.iter().enumerate() {
+        let proof = merkle_proof(&env, &levels, &zeros, i as u64);
+        assert!(client.verify_archived_record_inclusion(leaf, &(i as u64), &proof));
     }
 
-    fn addresses(env: &Env, n: u32) -> Vec<Address> {
-        let mut v = Vec::new(env);
-        for _ in 0..n {
-            v.push_back(Address::generate(env));
-        }
-        v
-    }
+    // Wrong leaf, wrong position, out-of-range index and short proofs fail.
+    let proof = merkle_proof(&env, &levels, &zeros, 7);
+    assert!(!client.verify_archived_record_inclusion(&leaves[8], &7, &proof));
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &6, &proof));
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &1_000, &proof));
+    let mut short = proof.clone();
+    short.pop_back();
+    assert!(!client.verify_archived_record_inclusion(&leaves[7], &7, &short));
+}
 
-    #[test]
-    fn full_registries_keep_instance_storage_under_budget() {
-        let env = Env::default();
-        let (client, contract_id, admin) = setup(&env);
-        let arbitrators = addresses(&env, 64);
-        let seniors = addresses(&env, 32);
-        let tokens = addresses(&env, 50);
-        for a in arbitrators.iter() {
-            client.register_arbitrator(&admin, &a);
-        }
-        for a in seniors.iter() {
-            client.add_senior_arbitrator(&admin, &a);
-        }
-        for t in tokens.iter() {
-            client.register_refund_token(&admin, &t);
-        }
+#[test]
+fn test_merkle_accumulator_empty_rejects_index_zero() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let (levels, zeros) = merkle_levels(&env, &[]);
+    let proof = merkle_proof(&env, &levels, &zeros, 0);
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(!client.verify_archived_record_inclusion(&zero, &0, &proof));
+}
 
-        assert_instance_storage_within_budget(&env, &contract_id);
-        env.as_contract(&contract_id, || {
-            assert_eq!(RefundContract::load_arbitrators(&env), arbitrators);
-            assert_eq!(RefundContract::load_senior_arbitrators(&env), seniors);
-            let instance = env.storage().instance();
-            assert!(!instance.has(&ArbitrationKey::ArbitratorList));
-            assert!(!instance.has(&ArbitrationKey::SeniorArbitratorList));
-            assert!(env.storage().persistent().has(&ArbitrationKey::ArbitratorShard(1)));
-            for t in tokens.iter() {
-                assert!(!instance.has(&TokenKey::SupportedToken(t.clone())));
-                assert!(env.storage().persistent().has(&TokenKey::SupportedToken(t)));
-            }
-        });
-        assert_eq!(client.get_supported_refund_tokens().len(), 50);
-    }
+#[test]
+fn test_finalized_refund_is_committed_to_accumulator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
 
-    #[test]
-    fn migrate_schema_moves_legacy_instance_registries() {
-        let env = Env::default();
-        let (client, contract_id, admin) = setup(&env);
-        let arbitrators = addresses(&env, 64);
-        let seniors = addresses(&env, 32);
-        let tokens = addresses(&env, 20);
-        // Pre-schema-3 layout: everything in instance storage.
-        env.as_contract(&contract_id, || {
-            let instance = env.storage().instance();
-            instance.set(&ArbitrationKey::ArbitratorList, &arbitrators);
-            instance.set(&ArbitrationKey::SeniorArbitratorList, &seniors);
-            for (i, t) in tokens.iter().enumerate() {
-                instance.set(&TokenKey::TokenByIndex(i as u64), &t);
-                instance.set(
-                    &TokenKey::SupportedToken(t.clone()),
-                    &SupportedRefundToken { token: t, active: true },
-                );
-            }
-            instance.set(&TokenKey::TokenCount, &(tokens.len() as u64));
-        });
-        assert!(instance_storage_xdr_len(&env, &contract_id) > MAX_INSTANCE_STORAGE_BYTES);
-        // Readable before migrating.
-        assert_eq!(client.get_supported_refund_tokens().len(), 20);
+    let refund_id = client.request_refund(
+        &Address::generate(&env),
+        &1,
+        &Address::generate(&env),
+        &1000,
+        &5000,
+        &Address::generate(&env),
+        &String::from_str(&env, "archive"),
+        &RefundReasonCode::CustomerRequest,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "denied"));
+    let deadline = client.get_refund(&refund_id).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&refund_id);
 
-        client.migrate_schema(&admin, &3);
-
-        assert_instance_storage_within_budget(&env, &contract_id);
-        env.as_contract(&contract_id, || {
-            assert_eq!(RefundContract::load_arbitrators(&env), arbitrators);
-            assert_eq!(RefundContract::load_senior_arbitrators(&env), seniors);
-        });
-        assert_eq!(client.get_supported_refund_tokens().len(), 20);
-    }
+    let refund = client.get_refund(&refund_id);
+    let leaf = env.crypto().sha256(&refund.to_xdr(&env)).to_bytes();
+    let (levels, zeros) = merkle_levels(&env, &[leaf.clone()]);
+    let proof = merkle_proof(&env, &levels, &zeros, 0);
+    assert!(client.verify_archived_record_inclusion(&leaf, &0, &proof));
 }

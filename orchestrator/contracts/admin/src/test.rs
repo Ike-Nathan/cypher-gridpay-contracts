@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{storage::Instance as _, Address as _, Ledger};
+use soroban_sdk::testutils::{storage::Instance as _, Address as _, Events, Ledger};
 
 struct Setup {
     env: Env,
@@ -388,359 +388,254 @@ fn test_admin_calls_extend_instance_ttl() {
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
 }
 
-// ── harvest_all_protocol_fees ────────────────────────────────────────────────
+// ── Canary upgrade verification (Issue #235) ────────────────────────────────
 
-struct Harvest {
-    env: Env,
-    contract_id: Address,
-    admin: Address,
-    payment: Address,
-    escrow: Address,
-    refund: Address,
-    token: Address,
-    recipients: TreasuryRecipients,
-}
+mod canary {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 
-impl Harvest {
-    fn client(&self) -> AdminContractClient<'_> {
-        AdminContractClient::new(&self.env, &self.contract_id)
+    #[contracttype]
+    enum Key {
+        Version,
+        Paused,
+        Faulty,
+        Hash,
     }
 
-    fn balance(&self, token: &Address, who: &Address) -> i128 {
-        soroban_sdk::token::Client::new(&self.env, token).balance(who)
-    }
+    /// Stand-in upgrade target exposing the entry points `execute_upgrade`
+    /// drives. A faulty target ignores `migrate_schema`.
+    #[contract]
+    pub struct MockTarget;
 
-    /// Credits `amount` of protocol fees to each child's accumulator and gives
-    /// the child the tokens backing it, as fee collection would.
-    fn accrue(&self, token: &Address, payment: i128, escrow: i128, refund: i128) {
-        let mint = soroban_sdk::token::StellarAssetClient::new(&self.env, token);
-        if payment > 0 {
-            mint.mint(&self.payment, &payment);
-            self.env.as_contract(&self.payment, || {
-                self.env.storage().instance().set(
-                    &payments::DataKey::Payment(payments::PaymentKey::AccumulatedFees),
-                    &payment,
-                );
-            });
+    #[contractimpl]
+    impl MockTarget {
+        pub fn configure(env: Env, version: u32, paused: bool, faulty: bool) {
+            env.storage().instance().set(&Key::Version, &version);
+            env.storage().instance().set(&Key::Paused, &paused);
+            env.storage().instance().set(&Key::Faulty, &faulty);
         }
-        if escrow > 0 {
-            mint.mint(&self.escrow, &escrow);
-            self.env.as_contract(&self.escrow, || {
-                self.env.storage().instance().set(
-                    &escrow::DataKey::Participant(escrow::ParticipantKey::AccumulatedFees(
-                        token.clone(),
-                    )),
-                    &escrow,
-                );
-            });
+
+        pub fn get_schema_version(env: Env) -> u32 {
+            env.storage().instance().get(&Key::Version).unwrap_or(1)
         }
-        if refund > 0 {
-            mint.mint(&self.refund, &refund);
-            self.env.as_contract(&self.refund, || {
-                self.env
-                    .storage()
-                    .instance()
-                    .set(&refund::ConfigKey::AccumulatedFees(token.clone()), &refund);
-            });
+
+        pub fn get_pause_state(env: Env) -> payments::PauseState {
+            payments::PauseState {
+                globally_paused: env.storage().instance().get(&Key::Paused).unwrap_or(false),
+                paused_functions: Vec::new(&env),
+                paused_at: 0,
+                paused_by: env.current_contract_address(),
+                pause_reason: String::from_str(&env, ""),
+            }
+        }
+
+        pub fn upgrade(env: Env, _caller: Address, new_wasm_hash: BytesN<32>) -> BytesN<32> {
+            env.storage().instance().set(&Key::Hash, &new_wasm_hash);
+            new_wasm_hash
+        }
+
+        pub fn migrate_schema(env: Env, _caller: Address, target_version: u32) {
+            let faulty: bool = env.storage().instance().get(&Key::Faulty).unwrap_or(false);
+            if !faulty {
+                env.storage().instance().set(&Key::Version, &target_version);
+            }
+        }
+
+        pub fn installed_hash(env: Env) -> Option<BytesN<32>> {
+            env.storage().instance().get(&Key::Hash)
         }
     }
 }
 
-fn new_token(env: &Env) -> Address {
-    env.register_stellar_asset_contract_v2(Address::generate(env))
-        .address()
+fn setup_canary(s: &Setup, version: u32, paused: bool, faulty: bool) -> Address {
+    let id = s.env.register(canary::MockTarget, ());
+    canary::MockTargetClient::new(&s.env, &id).configure(&version, &paused, &faulty);
+    id
 }
 
-/// Admin contract that administers all three children, the payment contract
-/// sweeping its fee token to the admin contract, and a 25/15/50/10 split.
-fn harvest_setup() -> Harvest {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(AdminContract, ());
-    let admin = Address::generate(&env);
-    let pauser = Address::generate(&env);
-    // The admin contract is the children's admin, so it can sweep them.
-    let payment = setup_payment(&env, &contract_id);
-    let escrow = setup_escrow(&env, &contract_id);
-    let refund = setup_refund(&env, &contract_id);
-    let token = new_token(&env);
+fn wasm_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7u8; 32])
+}
 
-    let payment_client = PaymentContractClient::new(&env, &payment);
-    payment_client.set_fee_config(
-        &contract_id,
-        &payments::FeeConfig {
-            fee_bps: 100,
-            min_fee: 0,
-            max_fee: 0,
-            treasury: Address::generate(&env),
-            fee_token: token.clone(),
-            active: true,
-        },
-    );
-    payment_client.set_sweep_recipient(&contract_id, &contract_id);
+#[test]
+fn test_upgrade_with_migration_verifies_post_schema_version() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, false);
 
-    let client = AdminContractClient::new(&env, &contract_id);
-    client.initialize(&admin, &pauser, &payment, &escrow, &refund);
-    let recipients = TreasuryRecipients {
-        insurance_pool: Address::generate(&env),
-        arbitrator_pool: Address::generate(&env),
-        protocol_treasury: Address::generate(&env),
-        operations: Address::generate(&env),
-    };
-    client.set_treasury_allocation(
-        &admin,
-        &TreasuryAllocationConfig {
-            insurance_pool_bps: 2_500,
-            arbitrator_incentive_bps: 1_500,
-            protocol_treasury_bps: 5_000,
-            operations_bps: 1_000,
-        },
-        &recipients,
-    );
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    c.execute_upgrade(&s.admin, &id);
 
-    Harvest {
-        env,
-        contract_id,
-        admin,
-        payment,
-        escrow,
-        refund,
-        token,
-        recipients,
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.get_schema_version(), 2);
+    assert_eq!(mock.installed_hash(), Some(wasm_hash(&s.env)));
+    assert!(c.get_upgrade_proposal(&id).executed);
+}
+
+#[test]
+fn test_upgrade_rolls_back_on_post_schema_mismatch() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, true);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::PostUpgradeVerificationFailed)));
+
+    // Upgrade, migration and the executed flag are all rolled back.
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.installed_hash(), None);
+    assert_eq!(mock.get_schema_version(), 1);
+    assert!(!c.get_upgrade_proposal(&id).executed);
+}
+
+#[test]
+fn test_migrating_upgrade_requires_paused_target() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::TargetNotPaused)));
+}
+
+#[test]
+fn test_expired_upgrade_proposal_cannot_execute() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &3_600, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    s.env.ledger().set_timestamp(1_000);
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &1, &None);
+    c.approve_upgrade(&s.admin, &id);
+
+    let expires_at = c.get_upgrade_proposal(&id).expires_at;
+    assert_eq!(expires_at, 1_000 + 3_600 + UPGRADE_PROPOSAL_VALIDITY);
+
+    s.env.ledger().set_timestamp(expires_at + 1);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::UpgradeProposalExpired)));
+
+    // Still executable right up to the expiry.
+    s.env.ledger().set_timestamp(expires_at);
+    c.execute_upgrade(&s.admin, &id);
+}
+
+// ── Protocol parameter guardrails (Issue #240) ──────────────────────────────
+
+fn empty_patch() -> ProtocolParameterPatch {
+    ProtocolParameterPatch {
+        max_fee_bps: None,
+        min_finality_delay_secs: None,
+        max_slippage_bps: None,
+        min_escrow_hold_secs: None,
     }
 }
 
 #[test]
-fn test_harvest_collects_all_three_and_splits_by_bps() {
-    let h = harvest_setup();
-    h.accrue(&h.token, 10_000, 5_000, 3_333);
+fn test_sync_parameters_rejects_out_of_bounds() {
+    let s = setup();
+    let c = s.client();
 
-    let reports = h
-        .client()
-        .harvest_all_protocol_fees(&h.admin, &soroban_sdk::vec![&h.env, h.token.clone()]);
-
-    assert_eq!(reports.len(), 1);
-    let r = reports.get(0).unwrap();
-    assert_eq!((r.from_payment, r.from_escrow, r.from_refund), (10_000, 5_000, 3_333));
-    assert_eq!(r.total, 18_333);
-    // 25% / 15% / 10% rounded down; the treasury takes 50% plus the remainder.
-    assert_eq!(r.insurance_pool, 4_583);
-    assert_eq!(r.arbitrator_incentive, 2_749);
-    assert_eq!(r.operations, 1_833);
-    assert_eq!(r.protocol_treasury, 9_168);
-
-    // Conservation: everything harvested was paid out, nothing left behind.
-    let recipients = &h.recipients;
-    let paid = h.balance(&h.token, &recipients.insurance_pool)
-        + h.balance(&h.token, &recipients.arbitrator_pool)
-        + h.balance(&h.token, &recipients.protocol_treasury)
-        + h.balance(&h.token, &recipients.operations);
-    assert_eq!(paid, r.total);
-    assert_eq!(h.balance(&h.token, &recipients.protocol_treasury), 9_168);
-    assert_eq!(h.balance(&h.token, &h.contract_id), 0);
-    for child in [&h.payment, &h.escrow, &h.refund] {
-        assert_eq!(h.balance(&h.token, child), 0);
-    }
-
-    // The children's accumulators are cleared.
-    assert_eq!(PaymentContractClient::new(&h.env, &h.payment).get_accumulated_fees(), 0);
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(9_900);
     assert_eq!(
-        EscrowContractClient::new(&h.env, &h.escrow).get_accumulated_escrow_fees(&h.token),
-        0
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
     );
+
+    let mut patch = empty_patch();
+    patch.min_finality_delay_secs = Some(0);
     assert_eq!(
-        RefundContractClient::new(&h.env, &h.refund).get_accumulated_protocol_fees(&h.token),
-        0
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
     );
+
+    // Nothing was applied.
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 100);
 }
 
 #[test]
-fn test_harvest_skips_a_contract_with_no_fees() {
-    let h = harvest_setup();
-    // Escrow has nothing accrued; payment and refund still get harvested.
-    h.accrue(&h.token, 4_000, 0, 1_000);
+fn test_sync_parameters_rejects_large_step() {
+    let s = setup();
+    let c = s.client();
 
-    let reports = h
-        .client()
-        .harvest_all_protocol_fees(&h.admin, &soroban_sdk::vec![&h.env, h.token.clone()]);
-    let r = reports.get(0).unwrap();
-    assert_eq!((r.from_payment, r.from_escrow, r.from_refund), (4_000, 0, 1_000));
-    assert_eq!(r.total, 5_000);
+    // Default fee is 100 bps; a 25% step allows at most 125.
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(126);
     assert_eq!(
-        r.insurance_pool + r.arbitrator_incentive + r.protocol_treasury + r.operations,
-        5_000
-    );
-}
-
-#[test]
-fn test_harvest_handles_several_tokens_and_empty_ones() {
-    let h = harvest_setup();
-    let other = new_token(&h.env);
-    let empty = new_token(&h.env);
-    h.accrue(&h.token, 1_000, 0, 0);
-    // A second token only accrues in escrow and refund: the payment contract's
-    // fee token is `h.token`, so it is not swept for `other`.
-    h.accrue(&other, 0, 700, 300);
-
-    let reports = h.client().harvest_all_protocol_fees(
-        &h.admin,
-        &soroban_sdk::vec![&h.env, h.token.clone(), empty.clone(), other.clone()],
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterStepTooLarge))
     );
 
-    // `empty` had nothing anywhere, so it has no report and moved no funds.
-    assert_eq!(reports.len(), 2);
-    let first = reports.get(0).unwrap();
-    assert_eq!((first.token.clone(), first.total), (h.token.clone(), 1_000));
-    let second = reports.get(1).unwrap();
-    assert_eq!(second.token, other);
-    assert_eq!((second.from_payment, second.from_escrow, second.from_refund), (0, 700, 300));
-    assert_eq!(h.balance(&other, &h.recipients.protocol_treasury), 500);
-    assert_eq!(h.balance(&empty, &h.recipients.protocol_treasury), 0);
-}
-
-#[test]
-fn test_harvest_with_nothing_accrued_returns_no_reports() {
-    let h = harvest_setup();
-    let reports = h
-        .client()
-        .harvest_all_protocol_fees(&h.admin, &soroban_sdk::vec![&h.env, h.token.clone()]);
-    assert_eq!(reports.len(), 0);
-}
-
-#[test]
-fn test_treasury_allocation_must_sum_to_10000() {
-    let h = harvest_setup();
-    for (a, b, c, d) in [(2_500, 1_500, 5_000, 999), (2_500, 1_500, 5_000, 1_001), (0, 0, 0, 0)] {
-        let result = h.client().try_set_treasury_allocation(
-            &h.admin,
-            &TreasuryAllocationConfig {
-                insurance_pool_bps: a,
-                arbitrator_incentive_bps: b,
-                protocol_treasury_bps: c,
-                operations_bps: d,
-            },
-            &h.recipients,
-        );
-        assert_eq!(result, Err(Ok(Error::InvalidTreasuryAllocation)));
-    }
-    // All to one bucket is fine.
-    h.client().set_treasury_allocation(
-        &h.admin,
-        &TreasuryAllocationConfig {
-            insurance_pool_bps: 0,
-            arbitrator_incentive_bps: 0,
-            protocol_treasury_bps: 10_000,
-            operations_bps: 0,
-        },
-        &h.recipients,
-    );
-}
-
-#[test]
-fn test_harvest_requires_admin_and_an_allocation() {
-    let h = harvest_setup();
-    let stranger = Address::generate(&h.env);
+    patch.max_fee_bps = Some(125);
     assert_eq!(
-        h.client()
-            .try_harvest_all_protocol_fees(&stranger, &soroban_sdk::vec![&h.env, h.token.clone()]),
+        c.sync_protocol_parameters(&s.admin, &patch).max_fee_bps,
+        125
+    );
+}
+
+#[test]
+fn test_sync_parameters_enforces_cooldown() {
+    let s = setup();
+    let c = s.client();
+    s.env.ledger().set_timestamp(10_000);
+
+    let mut patch = empty_patch();
+    patch.max_slippage_bps = Some(110);
+    c.sync_protocol_parameters(&s.admin, &patch);
+
+    patch.max_slippage_bps = Some(120);
+    s.env
+        .ledger()
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS - 1);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterCooldownActive))
+    );
+
+    // A different parameter is not affected by that cooldown.
+    let mut other = empty_patch();
+    other.min_escrow_hold_secs = Some(100_000);
+    c.sync_protocol_parameters(&s.admin, &other);
+
+    s.env
+        .ledger()
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS);
+    assert_eq!(
+        c.sync_protocol_parameters(&s.admin, &patch)
+            .max_slippage_bps,
+        120
+    );
+}
+
+#[test]
+fn test_sync_parameters_requires_admin_and_broadcasts() {
+    let s = setup();
+    let c = s.client();
+
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(110);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.pauser, &patch),
         Err(Ok(Error::Unauthorized))
     );
 
-    // A fresh admin contract with no allocation configured.
-    let env = &h.env;
-    let fresh_id = env.register(AdminContract, ());
-    let fresh = AdminContractClient::new(env, &fresh_id);
-    fresh.initialize(&h.admin, &h.admin, &h.payment, &h.escrow, &h.refund);
-    assert_eq!(
-        fresh.try_harvest_all_protocol_fees(&h.admin, &soroban_sdk::vec![env, h.token.clone()]),
-        Err(Ok(Error::TreasuryAllocationNotSet))
-    );
-}
-
-#[test]
-fn test_harvest_detects_fees_swept_elsewhere() {
-    let h = harvest_setup();
-    // Point the payment contract's sweep recipient somewhere else: the sweep
-    // succeeds, but the fees never reach the admin contract.
-    PaymentContractClient::new(&h.env, &h.payment)
-        .set_sweep_recipient(&h.contract_id, &Address::generate(&h.env));
-    h.accrue(&h.token, 1_000, 0, 0);
-
-    assert_eq!(
-        h.client()
-            .try_harvest_all_protocol_fees(&h.admin, &soroban_sdk::vec![&h.env, h.token.clone()]),
-        Err(Ok(Error::FeeHarvestNotReceived))
-    );
-}
-
-// ── Instance-storage budget ──────────────────────────────────────────────────
-
-/// Instance storage must stay below this many serialized bytes (it is loaded
-/// on every invocation); see core/contracts/*/src/storage.rs.
-const MAX_INSTANCE_STORAGE_BYTES: u32 = 4_096;
-
-fn instance_storage_xdr_len(s: &Setup) -> u32 {
-    use soroban_sdk::xdr::ToXdr;
-    s.env.as_contract(&s.contract_id, || {
-        s.env.storage().instance().all().to_xdr(&s.env).len()
-    })
-}
-
-#[test]
-fn test_upgrade_proposals_keep_instance_storage_under_budget() {
-    let s = setup();
-    for i in 0..40u8 {
-        let hash = BytesN::<32>::from_array(&s.env, &[i + 1; 32]);
-        s.client().propose_upgrade(&s.admin, &s.contract_id, &hash);
-    }
-    let len = instance_storage_xdr_len(&s);
-    assert!(len < MAX_INSTANCE_STORAGE_BYTES, "instance storage is {len} bytes");
-
-    // Proposals are persistent and still readable.
-    assert_eq!(
-        s.client().get_upgrade_proposal(&39).new_wasm_hash,
-        BytesN::<32>::from_array(&s.env, &[40; 32])
-    );
-    s.env.as_contract(&s.contract_id, || {
-        assert!(s.env.storage().persistent().has(&DataKey::UpgradeProposal(0)));
-        assert!(!s.env.storage().instance().has(&DataKey::UpgradeProposal(0)));
-    });
-}
-
-#[test]
-fn test_migrate_schema_moves_legacy_upgrade_proposals() {
-    let s = setup();
-    // Pre-schema-3 layout: every proposal in instance storage.
-    s.env.as_contract(&s.contract_id, || {
-        for i in 0..40u64 {
-            let proposal = UpgradeProposal {
-                contract_address: s.contract_id.clone(),
-                new_wasm_hash: BytesN::from_array(&s.env, &[i as u8 + 1; 32]),
-                proposed_at: 0,
-                timelock_period: 0,
-                approvals: Vec::new(&s.env),
-                executed: false,
-            };
-            s.env
-                .storage()
-                .instance()
-                .set(&DataKey::UpgradeProposal(i), &proposal);
-        }
-        s.env
-            .storage()
-            .instance()
-            .set(&DataKey::UpgradeProposalCounter, &40u64);
-    });
-    assert!(instance_storage_xdr_len(&s) > MAX_INSTANCE_STORAGE_BYTES);
-    // Readable before migrating.
-    assert!(!s.client().get_upgrade_proposal(&7).executed);
-
-    s.client().migrate_schema(&s.admin, &3);
-
-    assert!(instance_storage_xdr_len(&s) < MAX_INSTANCE_STORAGE_BYTES);
-    assert_eq!(
-        s.client().get_upgrade_proposal(&7).new_wasm_hash,
-        BytesN::<32>::from_array(&s.env, &[8; 32])
-    );
-    assert_eq!(s.client().get_schema_version(), 3);
+    c.sync_protocol_parameters(&s.admin, &patch);
+    let synced = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract_id)
+        .count();
+    assert_eq!(synced, 3);
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 110);
 }

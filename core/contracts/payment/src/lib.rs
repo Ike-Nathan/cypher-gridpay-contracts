@@ -61,15 +61,7 @@ pub enum ConfigKey {
     /// Legacy (schema < 3): the whole whitelist as one instance `Vec`.
     AllowedTokens,
     MaxForwardDepth,
-    /// Persistent shard `i` of the token whitelist (schema 3+).
-    TokenWhitelistShard(u32),
-    /// Instance: number of whitelisted tokens (schema 3+).
-    TokenWhitelistCount,
-    /// Persistent: progress of a batched schema migration.
-    MigrationCursor,
-    /// Instance: true while a batched migration is running; checked by every
-    /// guarded entry point, so it is a cheap scalar rather than the cursor.
-    MigrationInProgress,
+    RelayerStipendBps,
 }
 
 #[derive(Clone)]
@@ -91,6 +83,9 @@ pub enum PaymentKey {
     LargePaymentCounter,
     Discount(u64),
     TotalPendingSettlement(Address), // Track total pending settlement amount per token
+    PrivatePaymentCommitment(u64),
+    PaymentFee(u64),
+    UsedPrivatePaymentCommitment(BytesN<32>),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -125,6 +120,9 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    RelayerStipend(Address, Address),
+    StreamingPaymentChannel(u64),
+    StreamingPaymentChannelCounter,
 }
 
 #[derive(Clone)]
@@ -201,14 +199,9 @@ pub enum BasicError {
     // Issue #88: a data migration step failed, so the schema version must
     // not be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 127,
-    /// A merchant's aggregate volume for the day would exceed its verification
-    /// tier limit (#23).
-    DailyTierLimitExceeded = 128,
-    /// A batched schema migration is running; state-changing entry points are
-    /// blocked until `migrate_schema_step` completes it.
-    MigrationInProgress = 129,
-    /// `migrate_schema_step` was called with a batch size of 0.
-    InvalidMigrationBatch = 130,
+    // Issue #3: a string field contains raw PII (email, phone, or tax ID)
+    // that must not be stored on the immutable public ledger.
+    PiiDetected = 128,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -321,6 +314,16 @@ pub enum SubscriptionError {
     MerchantPaused = 317,
     /// Metered subscription units consumed exceed period usage cap. Resolution: reset billing period or increase unit cap.
     UsageCapExceeded = 318,
+    /// The required trial conversion notice has not been emitted.
+    TrialNoticeMissing = 319,
+    /// The current time is outside the trial conversion notice window.
+    InvalidTrialNoticeWindow = 320,
+    /// The proposed conversion amount exceeds customer-authorized consent.
+    TrialPriceConsentRequired = 321,
+    /// Usage can no longer be reported for the trial conversion grace period.
+    TrialUsageWindowClosed = 322,
+    /// A trial conversion notice has already been emitted.
+    TrialNoticeAlreadyEmitted = 323,
 }
 
 /// Errors relating to multi-sig administrative proposals and voting.
@@ -434,6 +437,9 @@ pub enum FeatureError {
     /// Balance sum mismatch. The settlement amounts do not sum to the deposit.
     BalanceSumMismatch = 541,
     InsufficientBalanceForSweep = 542,
+    /// Structuring / smurfing detected: cumulative payment volume within the rolling window
+    /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
+    StructuringDetected = 543,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -479,7 +485,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 542 {
+            if code >= 500 && code <= 543 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
             if code >= 400 && code <= 406 {
@@ -491,7 +497,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 130 {
+            if code >= 100 && code <= 128 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -640,6 +646,14 @@ pub struct SubscriptionTrialData {
     pub period_seconds: u64,
     pub ends_at: u64,
     pub converted: bool,
+    pub locked_conversion_amount: i128,
+    pub notice_emitted_at: Option<u64>,
+    pub min_notice_lead_secs: u64,
+    pub post_trial_cancel_grace_secs: u64,
+    pub conversion_charge_amount: Option<i128>,
+    pub conversion_charged_at: Option<u64>,
+    pub post_conversion_usage_units: u64,
+    pub conversion_charge_reversed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1058,6 +1072,21 @@ pub struct PaymentChannel {
     pub customer_pk: BytesN<32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StreamingPaymentChannel {
+    pub channel_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub deposited: i128,
+    pub claimed: i128,
+    pub flow_rate_per_sec: i128,
+    pub start_ts: u64,
+    pub stop_ts: u64,
+    pub open: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct MeteredSubscription {
@@ -1186,6 +1215,31 @@ pub struct TrialStarted {
 pub struct TrialConverted {
     pub subscription_id: u64,
     pub converted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionNoticeEmitted {
+    pub subscription_id: u64,
+    pub conversion_amount: i128,
+    pub notice_emitted_at: u64,
+    pub trial_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionChargeReversed {
+    pub subscription_id: u64,
+    pub amount: i128,
+    pub reversed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionUsageReported {
+    pub subscription_id: u64,
+    pub units: u64,
+    pub accumulated_units: u64,
 }
 
 #[contractevent]
@@ -1337,6 +1391,12 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EphemeralInvoiceRoute {
+    pub ephemeral_invoice_commitment: BytesN<32>,
 }
 
 /// Issue #70: primitive-only cross-contract verification result consumed by the
@@ -1890,6 +1950,21 @@ pub struct PaymentAnalytics {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct NetPosition {
+    pub party_a: Address,
+    pub party_b: Address,
+    /// Net amount: positive = party_a owes party_b, negative = party_b owes party_a.
+    pub net_amount: i128,
+    /// Token used for settlement.
+    pub token: Address,
+    /// Timestamp of last position update.
+    pub last_updated: u64,
+    /// Timestamp of the current netting window start.
+    pub window_start: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct MerchantAnalytics {
     pub total_payments: u64,
     pub total_volume: i128,
@@ -2052,6 +2127,9 @@ const MAX_NOTES_SIZE: u32 = 1024;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
 const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
+const MAX_TRIAL_NOTICE_LEAD_SECS: u64 = 30 * SECONDS_PER_DAY;
+const DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS: u64 = SECONDS_PER_DAY;
+const POST_TRIAL_CANCEL_GRACE_SECS: u64 = SECONDS_PER_DAY;
 
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
@@ -3042,6 +3120,94 @@ impl PaymentContract {
         )
     }
 
+    /// Creates a payment without publishing the merchant vault at invoice creation.
+    /// The commitment is SHA-256 of the vault address XDR followed by a 32-byte secret XDR.
+    pub fn create_private_payment(
+        env: Env,
+        customer: Address,
+        ephemeral_invoice_commitment: BytesN<32>,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_private_payment")?;
+        customer.require_auth();
+        let commitment_key = DataKey::Payment(PaymentKey::UsedPrivatePaymentCommitment(
+            ephemeral_invoice_commitment.clone(),
+        ));
+        if env.storage().instance().has(&commitment_key) {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer,
+            env.current_contract_address(),
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata,
+        )?;
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::PrivatePaymentCommitment(payment_id)),
+            &EphemeralInvoiceRoute {
+                ephemeral_invoice_commitment,
+            },
+        );
+        env.storage().instance().set(&commitment_key, &true);
+        Ok(payment_id)
+    }
+
+    /// Reveals and settles a private payment for its committed merchant vault.
+    pub fn complete_private_payment(
+        env: Env,
+        vault: Address,
+        secret: BytesN<32>,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "complete_private_payment")?;
+        vault.require_auth();
+        Self::require_merchant_not_paused(&env, &vault)?;
+
+        let route: EphemeralInvoiceRoute = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        let mut reveal = vault.to_xdr(&env);
+        reveal.append(&secret.to_xdr(&env));
+        if env.crypto().sha256(&reveal) != route.ephemeral_invoice_commitment {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+
+        let payment_key = DataKey::Payment(PaymentKey::Data(payment_id));
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&payment_key)
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        payment.merchant = vault.clone();
+        env.storage().instance().set(&payment_key, &payment);
+        env.storage()
+            .instance()
+            .remove(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )));
+
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        if threshold > 0 && payment.amount > threshold {
+            return PaymentContract::propose_large_payment(env, vault, payment_id);
+        }
+
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &vault, payment_id)?;
+        Ok(())
+    }
+
     /// Schedules a future payment by escrowing tokens until the scheduled time.
     ///
     /// # Arguments
@@ -3366,6 +3532,73 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Detect structuring / smurfing: accumulate the payer's payment volume within
+    /// a rolling window and flag when the total would have triggered `LargePaymentProposal`
+    /// if it had been sent as a single payment.
+    ///
+    /// Window size defaults to 3600 seconds (1 hour); configurable via the same
+    /// `large_payment_threshold` that governs single-payment timelocks.
+    fn check_velocity_structuring(
+        env: &Env,
+        customer: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        // If no threshold is configured, structuring detection is disabled.
+        if threshold <= 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        // Rolling window: 1 hour (3600 seconds).
+        const VELOCITY_WINDOW_SECONDS: u64 = 3600;
+
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::VelocityWindowStart(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let window_volume: i128 = if now.saturating_sub(window_start) < VELOCITY_WINDOW_SECONDS {
+            // Still within the rolling window — accumulate.
+            env.storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::VelocityWindowVolume(
+                    customer.clone(),
+                )))
+                .unwrap_or(0)
+        } else {
+            // Window has expired — start fresh.
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+            0
+        };
+
+        let new_volume = window_volume.saturating_add(amount);
+
+        if new_volume > threshold {
+            return Err(Error::Feature(FeatureError::StructuringDetected));
+        }
+
+        // Persist updated window state.
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::VelocityWindowVolume(customer.clone())),
+            &new_volume,
+        );
+        if window_start == 0 || now.saturating_sub(window_start) >= VELOCITY_WINDOW_SECONDS {
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+        }
+
+        Ok(())
+    }
+
     fn do_create_payment(
         env: &Env,
         customer: Address,
@@ -3409,6 +3642,9 @@ impl PaymentContract {
 
         // Check customer spend limit (#217)
         PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
+
+        // Issue #2: detect structuring / smurfing (split payments below threshold).
+        PaymentContract::check_velocity_structuring(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -4471,6 +4707,16 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
         // Check if payment requires multi-sig approval
         let payment = PaymentContract::get_payment(&env, payment_id);
         let threshold = PaymentContract::get_large_payment_threshold(env.clone());
@@ -4520,10 +4766,22 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &admin, payment_id)?;
+        Ok(())
     }
 
     fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
         // Check if payment exists
         if !env
             .storage()
@@ -4607,7 +4865,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::PendingSettlement(payment_id)),
                     &settlement,
                 );
-                
+
                 // Track total pending settlement amount per token for sweep validation
                 let total_pending: i128 = env
                     .storage()
@@ -4620,7 +4878,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::TotalPendingSettlement(payment.token.clone())),
                     &(total_pending + net_amount),
                 );
-                
+
                 let idx: u64 = env
                     .storage()
                     .instance()
@@ -6444,6 +6702,24 @@ impl PaymentContract {
                 period_seconds: trial_period_seconds,
                 ends_at: trial_ends_at,
                 converted: false,
+                locked_conversion_amount: amount,
+                notice_emitted_at: None,
+                min_notice_lead_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    (trial_period_seconds / 2)
+                        .max(1)
+                        .min(DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS)
+                },
+                post_trial_cancel_grace_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    POST_TRIAL_CANCEL_GRACE_SECS
+                },
+                conversion_charge_amount: None,
+                conversion_charged_at: None,
+                post_conversion_usage_units: 0,
+                conversion_charge_reversed: false,
             },
             pause_data: SubscriptionPauseData {
                 last_paused_at: 0,
@@ -6569,6 +6845,7 @@ impl PaymentContract {
                 SubscriptionError::MaxTrialDurationExceeded,
             ))?;
         sub.trial_data.period_seconds = new_total;
+        sub.trial_data.notice_emitted_at = None;
 
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -6576,6 +6853,174 @@ impl PaymentContract {
         );
 
         Ok(())
+    }
+
+    /// Emit the required on-chain notice before a trial converts to a paid subscription.
+    /// Only the subscription merchant may publish the notice.
+    pub fn emit_trial_conversion_notice(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        sub.merchant.require_auth();
+
+        if sub.trial_data.ends_at == 0 || sub.trial_data.converted {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+        if sub.trial_data.notice_emitted_at.is_some() {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialNoticeAlreadyEmitted,
+            ));
+        }
+
+        let now = env.ledger().timestamp();
+        let earliest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(MAX_TRIAL_NOTICE_LEAD_SECS);
+        let latest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(sub.trial_data.min_notice_lead_secs);
+        if now <= sub.created_at || now < earliest_notice_at || now > latest_notice_at {
+            return Err(Error::Subscription(
+                SubscriptionError::InvalidTrialNoticeWindow,
+            ));
+        }
+
+        sub.trial_data.notice_emitted_at = Some(now);
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (TrialConversionNoticeEmitted {
+            subscription_id,
+            conversion_amount: sub.trial_data.locked_conversion_amount,
+            notice_emitted_at: now,
+            trial_ends_at: sub.trial_data.ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Record customer consent for a new trial conversion amount.
+    /// Any previous conversion notice is invalidated and must be emitted again.
+    pub fn authorize_trial_conversion_amount(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.trial_data.ends_at == 0
+            || sub.trial_data.converted
+            || env.ledger().timestamp() >= sub.trial_data.ends_at
+        {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+
+        sub.amount = amount;
+        sub.trial_data.locked_conversion_amount = amount;
+        sub.trial_data.notice_emitted_at = None;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        Ok(())
+    }
+
+    /// Report usage during the post-conversion grace period.
+    /// A customer cancellation is refundable only while no usage has been reported.
+    pub fn report_trial_conversion_usage(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        units: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if units == 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let now = env.ledger().timestamp();
+        let charged_at = sub
+            .trial_data
+            .conversion_charged_at
+            .ok_or(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ))?;
+        if !sub.trial_data.converted
+            || sub.status != SubscriptionStatus::Active
+            || now > charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+        {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ));
+        }
+        sub.trial_data.post_conversion_usage_units = sub
+            .trial_data
+            .post_conversion_usage_units
+            .checked_add(units)
+            .ok_or(Error::Basic(BasicError::BillingOverflow))?;
+        let accumulated_units = sub.trial_data.post_conversion_usage_units;
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        (TrialConversionUsageReported {
+            subscription_id,
+            units,
+            accumulated_units,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    fn validate_trial_conversion(sub: &Subscription) -> Result<bool, Error> {
+        let is_trial_conversion = sub.trial_data.ends_at > 0 && !sub.trial_data.converted;
+        if is_trial_conversion {
+            if sub.trial_data.notice_emitted_at.is_none() {
+                return Err(Error::Subscription(SubscriptionError::TrialNoticeMissing));
+            }
+            if sub.amount > sub.trial_data.locked_conversion_amount {
+                return Err(Error::Subscription(
+                    SubscriptionError::TrialPriceConsentRequired,
+                ));
+            }
+        }
+        Ok(is_trial_conversion)
     }
 
     /// Execute the next recurring payment for a subscription.
@@ -6604,6 +7049,7 @@ impl PaymentContract {
 
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
+            let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
             let mut dunning: DunningState = env
                 .storage()
                 .instance()
@@ -6650,6 +7096,18 @@ impl PaymentContract {
                 .is_ok();
 
             if transfer_ok {
+                if is_trial_conversion {
+                    sub.trial_data.converted = true;
+                    sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                    sub.trial_data.conversion_charged_at = Some(now);
+                    sub.trial_data.post_conversion_usage_units = 0;
+                    sub.trial_data.conversion_charge_reversed = false;
+                    (TrialConverted {
+                        subscription_id,
+                        converted_at: now,
+                    })
+                    .publish(&env);
+                }
                 sub.payment_count += 1;
                 sub.retry_count = 0;
                 sub.next_payment_at = sub.next_payment_at + sub.interval;
@@ -6765,6 +7223,8 @@ impl PaymentContract {
             return Ok(());
         }
 
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
+
         // Check customer spend limit (#282)
         let charge_amount =
             PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
@@ -6789,8 +7249,12 @@ impl PaymentContract {
 
         if transfer_ok {
             // Mark converted on first post-trial charge
-            if sub.trial_data.ends_at > 0 && !sub.trial_data.converted {
+            if is_trial_conversion {
                 sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
                 (TrialConverted {
                     subscription_id,
                     converted_at: now,
@@ -7147,6 +7611,40 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
 
+        let now = env.ledger().timestamp();
+        if caller == sub.customer
+            && sub.trial_data.converted
+            && sub.payment_count == 1
+            && !sub.trial_data.conversion_charge_reversed
+            && sub.trial_data.post_conversion_usage_units == 0
+            && sub
+                .trial_data
+                .conversion_charged_at
+                .map_or(false, |charged_at| {
+                    now <= charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+                })
+        {
+            let amount = sub
+                .trial_data
+                .conversion_charge_amount
+                .ok_or(Error::Payment(PaymentError::TransferFailed))?;
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            if token_client
+                .try_transfer_from(&contract_address, &sub.merchant, &sub.customer, &amount)
+                .is_err()
+            {
+                return Err(Error::Payment(PaymentError::TransferFailed));
+            }
+            sub.trial_data.conversion_charge_reversed = true;
+            (TrialConversionChargeReversed {
+                subscription_id,
+                amount,
+                reversed_at: now,
+            })
+            .publish(&env);
+        }
+
         sub.status = SubscriptionStatus::Cancelled;
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -7156,7 +7654,6 @@ impl PaymentContract {
         Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
 
         // Emit TrialCancelled if cancelled during trial
-        let now = env.ledger().timestamp();
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             (TrialCancelled {
                 subscription_id,
@@ -7504,6 +8001,7 @@ impl PaymentContract {
             .ok_or(Error::Subscription(SubscriptionError::DunningNotFound))?;
 
         let now = env.ledger().timestamp();
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
 
         // Enforce backoff window
         if now < dunning.next_retry_at {
@@ -7526,6 +8024,18 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
+            if is_trial_conversion {
+                sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
+                (TrialConverted {
+                    subscription_id,
+                    converted_at: now,
+                })
+                .publish(&env);
+            }
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
@@ -8712,6 +9222,99 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0)
+    }
+
+    /// Sets the share of collected protocol fees reserved for completion relayers.
+    pub fn set_relayer_stipend_bps(
+        env: Env,
+        admin: Address,
+        relayer_stipend_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if relayer_stipend_bps > 10_000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::RelayerStipendBps),
+            &relayer_stipend_bps,
+        );
+        Ok(())
+    }
+
+    /// Returns a relayer's accrued stipend for a token.
+    pub fn get_relayer_stipend(env: Env, relayer: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::RelayerStipend(
+                relayer, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    /// Claims a relayer's accrued stipend in the token it was earned in.
+    pub fn claim_relayer_stipend(
+        env: Env,
+        relayer: Address,
+        token: Address,
+    ) -> Result<i128, Error> {
+        relayer.require_auth();
+        let key = DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), token.clone()));
+        let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return Err(Error::Feature(FeatureError::NothingToSweep));
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &relayer,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    fn accrue_relayer_stipend(env: &Env, relayer: &Address, payment_id: u64) -> Result<(), Error> {
+        let bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::RelayerStipendBps))
+            .unwrap_or(0);
+        if bps == 0 {
+            return Ok(());
+        }
+        let payment = PaymentContract::get_payment(env, payment_id);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PaymentFee(payment_id)))
+            .unwrap_or(0);
+        let stipend = fee.saturating_mul(bps as i128) / 10_000;
+        if stipend <= 0 {
+            return Ok(());
+        }
+        let balance_key =
+            DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), payment.token));
+        let accrued: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&balance_key, &accrued.saturating_add(stipend));
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::AccumulatedFees),
+            &accumulated.saturating_sub(stipend),
+        );
+        Ok(())
     }
 
     /// Admin withdraws accumulated fees to the treasury address.
@@ -12573,6 +13176,180 @@ impl PaymentContract {
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
     }
 
+    /// Opens a time-streaming channel funded by the customer.
+    pub fn open_streaming_channel(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        deposit: i128,
+        flow_rate_per_sec: i128,
+        start_ts: u64,
+        stop_ts: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "open_streaming_channel")?;
+        customer.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let now = env.ledger().timestamp();
+        if deposit <= 0 || flow_rate_per_sec <= 0 || start_ts < now || stop_ts <= start_ts {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if Self::is_zero_address(&env, &merchant) {
+            return Err(Error::Feature(FeatureError::InvalidCounterparty));
+        }
+        token::Client::new(&env, &token).transfer(
+            &customer,
+            &env.current_contract_address(),
+            &deposit,
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(
+                FeatureKey::StreamingPaymentChannelCounter,
+            ))
+            .unwrap_or(0);
+        let channel_id = counter + 1;
+        let channel = StreamingPaymentChannel {
+            channel_id,
+            customer,
+            merchant,
+            token,
+            deposited: deposit,
+            claimed: 0,
+            flow_rate_per_sec,
+            start_ts,
+            stop_ts,
+            open: true,
+        };
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannelCounter),
+            &channel_id,
+        );
+        Ok(channel_id)
+    }
+
+    /// Returns the unclaimed balance accrued by a streaming channel at the current ledger time.
+    pub fn get_streaming_claimable(env: Env, channel_id: u64) -> Result<i128, Error> {
+        let channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        Ok(Self::streaming_earned(&env, &channel).saturating_sub(channel.claimed))
+    }
+
+    /// Retrieves a streaming channel by its ID.
+    pub fn get_streaming_channel(
+        env: Env,
+        channel_id: u64,
+    ) -> Result<StreamingPaymentChannel, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))
+    }
+
+    /// Claims the currently accrued streaming balance for the merchant.
+    pub fn claim_streaming_channel(
+        env: Env,
+        merchant: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "claim_streaming_channel")?;
+        merchant.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if merchant != channel.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let amount = earned.saturating_sub(channel.claimed);
+        if amount <= 0 {
+            return Err(Error::Payment(PaymentError::NothingToSettle));
+        }
+        channel.claimed = earned;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        token::Client::new(&env, &channel.token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    /// Stops a stream and returns its unearned deposit to the customer.
+    pub fn close_streaming_channel(
+        env: Env,
+        customer: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "close_streaming_channel")?;
+        customer.require_auth();
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if customer != channel.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let newly_earned = earned.saturating_sub(channel.claimed);
+        let refund = channel.deposited.saturating_sub(earned);
+        channel.claimed = earned;
+        channel.open = false;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+        if newly_earned > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &newly_earned);
+        }
+        if refund > 0 {
+            token_client.transfer(&contract_address, &customer, &refund);
+        }
+        Ok(refund)
+    }
+
+    /// Returns the cumulative amount vested by the channel's linear time schedule.
+    fn streaming_earned(env: &Env, channel: &StreamingPaymentChannel) -> i128 {
+        let now = env.ledger().timestamp().min(channel.stop_ts);
+        let elapsed = now.saturating_sub(channel.start_ts) as i128;
+        channel
+            .flow_rate_per_sec
+            .saturating_mul(elapsed)
+            .min(channel.deposited)
+    }
+
     fn extract_public_key(env: &Env, address: &Address) -> BytesN<32> {
         let xdr = address.to_xdr(env);
         // ScVal XDR layout: [0,0,0,18](ScvAddress) [0,0,0,0](Account) [0,0,0,0](Ed25519) [32 bytes PK]
@@ -13128,7 +13905,7 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
-        
+
         // Security check: Ensure sweep won't encroach on merchant pending settlements
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
@@ -13612,6 +14389,18 @@ impl PaymentContract {
         archival::verify_archived_payment_blob(&env, payment_id, full_payment)
     }
 
+    /// Proves that `leaf_hash` (SHA-256 of an archived payment's XDR) is the
+    /// `index`-th leaf of the archived-record Merkle accumulator (#243).
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
+
     /// Configures risk-tier finality scaling (#196). Admin only.
     pub fn configure_finality_risk(
         env: Env,
@@ -13704,7 +14493,7 @@ impl PaymentContract {
             &settlement.merchant,
             &settlement.amount,
         );
-        
+
         // Decrement total pending settlement amount for this token
         let total_pending: i128 = env
             .storage()
@@ -13717,7 +14506,7 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::TotalPendingSettlement(settlement.token.clone())),
             &(total_pending.saturating_sub(settlement.amount)),
         );
-        
+
         env.storage().instance().set(
             &DataKey::State(StateDataKey::SettlementFinalized(payment_id)),
             &true,
@@ -14205,6 +14994,68 @@ impl PaymentContract {
         }
     }
 
+    /// Scan a string field for patterns that look like PII (emails, phone numbers,
+    /// tax IDs / SSNs) and reject them to enforce GDPR/CCPA data-minimization on
+    /// the immutable public ledger.
+    ///
+    /// Detection rules (byte-level, no regex engine available in no_std Soroban):
+    /// - Email: contains '@' preceded and followed by at least one non-'@' byte.
+    /// - Phone: 10+ consecutive digit bytes (possibly separated by spaces, dashes,
+    ///   or dots), e.g. `+14155552671` or `415-555-2671`.
+    /// - SSN/Tax ID: pattern `DDD-DD-DDDD` or `DD.DDD.DDD-DD` (9+ digit cluster).
+    fn check_pii_free(env: &Env, text: &String) -> Result<(), Error> {
+        // Convert to raw bytes for scanning.
+        let bytes = text.to_xdr(env);
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // --- Email detection: look for '@' with at least one char before and after ---
+        let mut at_pos: Option<u32> = None;
+        let mut i: u32 = 0;
+        while i < len {
+            if bytes.get(i).unwrap_or(0) == 64u8 { // '@'
+                at_pos = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(pos) = at_pos {
+            if pos > 0 && pos + 1 < len {
+                return Err(Error::Basic(BasicError::PiiDetected));
+            }
+        }
+
+        // --- Phone / Tax-ID detection: count consecutive digit-or-separator runs ---
+        // A run of >=9 digits (with optional spaces, dashes, dots, parens, '+') is flagged.
+        let mut digit_run: u32 = 0;
+        let mut k: u32 = 0;
+        while k < len {
+            let b = bytes.get(k).unwrap_or(0);
+            if b >= 48u8 && b <= 57u8 { // '0'..'9'
+                digit_run += 1;
+                if digit_run >= 9 {
+                    return Err(Error::Basic(BasicError::PiiDetected));
+                }
+            } else if b == 32u8  // space
+                || b == 45u8     // '-'
+                || b == 46u8     // '.'
+                || b == 40u8     // '('
+                || b == 41u8     // ')'
+                || b == 43u8     // '+'
+            {
+                // Separator — keep the digit run going if we already have digits.
+                // (Allows separators within phone numbers)
+            } else {
+                digit_run = 0;
+            }
+            k += 1;
+        }
+
+        Ok(())
+    }
+
     fn validate_bps(bps: u32) -> Result<(), Error> {
         if bps < 1 || bps > 10000 {
             return Err(Error::Basic(BasicError::InvalidBps));
@@ -14232,6 +15083,15 @@ mod test_metadata;
 mod test_payment_channel;
 #[cfg(test)]
 mod test_replay_prevention;
+
+#[cfg(test)]
+mod test_private_payment;
+
+#[cfg(test)]
+mod test_relayer_stipend;
+
+#[cfg(test)]
+mod test_streaming_channel;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
