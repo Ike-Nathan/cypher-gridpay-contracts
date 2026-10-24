@@ -627,6 +627,14 @@ pub struct EscrowHierarchyNode {
     pub parent_id: Option<u64>,
     pub children: Vec<u64>,
     pub depth: u32,
+    /// Portion of the parent escrow's total that is held as a contingency reserve.
+    /// This can be drawn by child escrows via `draw_parent_contingency`.
+    /// Starts at 0; can only be set by the parent-escrow payer (customer).
+    pub contingency_reserve: i128,
+    /// Maximum overdraft any single child may draw from the parent contingency
+    /// reserve, expressed in basis points of the child's original `amount`.
+    /// 0 means no overdraft is permitted.
+    pub max_child_overdraft_bps: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13814,6 +13822,8 @@ impl EscrowContract {
                 parent_id: None,
                 children: Vec::new(&env),
                 depth: 0, // Root depth is 0
+                contingency_reserve: 0,
+                max_child_overdraft_bps: 0,
             });
 
         if parent_node.depth + 1 > 3 {
@@ -13849,6 +13859,8 @@ impl EscrowContract {
             parent_id: Some(parent_id),
             children: Vec::new(&env),
             depth: child_depth,
+            contingency_reserve: 0,
+            max_child_overdraft_bps: 0,
         };
         env.storage().instance().set(
             &DataKey::Escrow(EscrowKey::Hierarchy(child_id)),
@@ -13898,6 +13910,8 @@ impl EscrowContract {
                     parent_id: None,
                     children: Vec::new(&env),
                     depth: 0,
+                    contingency_reserve: 0,
+                    max_child_overdraft_bps: 0,
                 });
 
             result.push_back(node.clone());
@@ -14236,7 +14250,8 @@ mod escrow_status_guard_test;
 mod health_check_test;
 //
 // #[cfg(test)]
-// mod test_sub_account;
+#[cfg(test)]
+mod test_sub_account;
 
 #[cfg(test)]
 mod storage_ttl_test;
