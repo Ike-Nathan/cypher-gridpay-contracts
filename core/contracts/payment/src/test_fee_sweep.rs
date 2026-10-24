@@ -246,3 +246,64 @@ fn test_set_sweep_recipient_is_overridable() {
     assert_eq!(history.len(), 1);
     assert_eq!(history.get(0).unwrap().recipient, second_recipient);
 }
+
+#[test]
+fn test_sweep_fees_rejects_excessive_amount() {
+    let (env, client, admin, _) = setup();
+    let recipient = Address::generate(&env);
+    client.set_sweep_recipient(&admin, &recipient);
+
+    create_completed_payment_with_fee(&env, &client, &admin, 10_000);
+    let sweepable = client.get_sweepable_balance();
+    assert!(sweepable > 0);
+
+    // Attempting to sweep more than accumulated fees must fail
+    let excessive_amount = sweepable + 100;
+    let result = client.try_sweep_fees(&admin, &excessive_amount);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::InsufficientFees)))
+    );
+}
+
+#[test]
+fn test_sweep_fees_partial_sweep_succeeds() {
+    let (env, client, admin, _) = setup();
+    let recipient = Address::generate(&env);
+    client.set_sweep_recipient(&admin, &recipient);
+
+    create_completed_payment_with_fee(&env, &client, &admin, 10_000);
+    let sweepable = client.get_sweepable_balance();
+    assert!(sweepable >= 10);
+
+    let partial_amount = sweepable / 2;
+    let swept = client.sweep_fees(&admin, &partial_amount);
+    assert_eq!(swept, partial_amount);
+
+    let remaining = client.get_sweepable_balance();
+    assert_eq!(remaining, sweepable - partial_amount);
+}
+
+#[test]
+fn test_sweep_fees_multisig_threshold_required() {
+    let (env, client, admin, _) = setup();
+    let recipient = Address::generate(&env);
+    client.set_sweep_recipient(&admin, &recipient);
+
+    let admin2 = Address::generate(&env);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2);
+
+    // Set large payment threshold
+    client.set_large_payment_threshold(&admin, &50);
+
+    create_completed_payment_with_fee(&env, &client, &admin, 100_000);
+    let sweepable = client.get_sweepable_balance();
+    assert!(sweepable > 50);
+
+    let result = client.try_sweep_fees(&admin, &sweepable);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Proposal(crate::ProposalError::RequiresMultiSig)))
+    );
+}

@@ -1,100 +1,93 @@
+//! Cross-workspace end-to-end integration tests.
+//!
+//! This crate wires the payment, escrow, dispute, and emergency-pause
+//! contracts into a single test environment and exercises realistic flows:
+//! Payment -> Escrow -> Dispute -> Refund, plus emergency pause coverage.
+
 #![cfg(test)]
-#![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::{Address as _, Ledger},
-    Address, Bytes, BytesN, Env, String, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct ContractRegistry {
-    pub current_escrow_contract: Address,
-    pub predecessor_escrow_contract: Option<Address>,
-    pub rotation_epoch: u64,
+/// Shared test environment registering all four contracts.
+struct E2eEnv {
+    env: Env,
+    payment: Address,
+    escrow: Address,
+    dispute: Address,
+    emergency_pause: Address,
+    admin: Address,
+    payer: Address,
+    payee: Address,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct InFlightEscrow {
-    pub escrow_id: u64,
-    pub contract_host: Address,
-    pub settled: bool,
-    pub amount: i128,
-}
+impl E2eEnv {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
 
-#[contract]
-pub struct MockContractRotationOrchestrator;
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
 
-#[contractimpl]
-impl MockContractRotationOrchestrator {
-    pub fn init_registry(initial_escrow: Address) -> ContractRegistry {
-        ContractRegistry {
-            current_escrow_contract: initial_escrow,
-            predecessor_escrow_contract: None,
-            rotation_epoch: 1,
+        let payment = env.register_contract(None, payment::PaymentContract);
+        let escrow = env.register_contract(None, escrow::EscrowContract);
+        let dispute = env.register_contract(None, dispute::DisputeContract);
+        let emergency_pause =
+            env.register_contract(None, emergency_pause::EmergencyPauseContract);
+
+        Self {
+            env,
+            payment,
+            escrow,
+            dispute,
+            emergency_pause,
+            admin,
+            payer,
+            payee,
         }
     }
-
-    pub fn rotate_escrow_contract(
-        mut registry: ContractRegistry,
-        new_escrow: Address,
-    ) -> ContractRegistry {
-        registry.predecessor_escrow_contract = Some(registry.current_escrow_contract);
-        registry.current_escrow_contract = new_escrow;
-        registry.rotation_epoch += 1;
-        registry
-    }
-
-    pub fn settle_predecessor_escrow(mut escrow: InFlightEscrow) -> InFlightEscrow {
-        assert!(!escrow.settled);
-        escrow.settled = true;
-        escrow
-    }
 }
 
 #[test]
-fn test_live_contract_rotation_via_admin_while_inflight_escrows_settle_on_predecessor() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn full_payment_escrow_dispute_refund_flow() {
+    let t = E2eEnv::new();
 
-    let v1_escrow = Address::generate(&env);
-    let v2_escrow = Address::generate(&env);
+    // 1. Payment: deposit funds from payer to payee.
+    let amount: i128 = 1_000;
+    let payment_client = payment::PaymentContractClient::new(&t.env, &t.payment);
+    payment_client.deposit(&t.payer, &t.payee, &amount);
 
-    // Initial deployment running v1
-    let mut registry = MockContractRotationOrchestrator::init_registry(v1_escrow.clone());
-    assert_eq!(registry.current_escrow_contract, v1_escrow);
-    assert_eq!(registry.predecessor_escrow_contract, None);
+    // 2. Escrow: lock the deposited funds under an escrow agreement.
+    let escrow_client = escrow::EscrowContractClient::new(&t.env, &t.escrow);
+    let escrow_id = escrow_client.create_escrow(&t.payer, &t.payee, &amount);
+    escrow_client.fund_escrow(&escrow_id, &t.payer);
 
-    // In-flight escrow spawned on v1
-    let in_flight = InFlightEscrow {
-        escrow_id: 8801,
-        contract_host: v1_escrow.clone(),
-        settled: false,
-        amount: 25000,
-    };
+    // 3. Dispute: raise a dispute against the escrow.
+    let dispute_client = dispute::DisputeContractClient::new(&t.env, &t.dispute);
+    let dispute_id = dispute_client.create_dispute(&t.payer, &escrow_id);
+    dispute_client.resolve_dispute(&dispute_id, &t.admin, &true);
 
-    // Live contract rotation to v2 executed by admin
-    registry = MockContractRotationOrchestrator::rotate_escrow_contract(registry, v2_escrow.clone());
-    assert_eq!(registry.current_escrow_contract, v2_escrow);
-    assert_eq!(registry.predecessor_escrow_contract, Some(v1_escrow.clone()));
-    assert_eq!(registry.rotation_epoch, 2);
+    // 4. Refund: execute the refund back to the payer.
+    escrow_client.refund(&escrow_id, &t.payer);
 
-    // In-flight escrow successfully settles on predecessor contract v1 without disruption
-    let settled = MockContractRotationOrchestrator::settle_predecessor_escrow(in_flight);
-    assert!(settled.settled);
-    assert_eq!(settled.contract_host, v1_escrow);
+    let escrow_state = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(escrow_state.amount, amount);
+    assert!(escrow_state.refunded);
 }
 
 #[test]
-fn test_cryptographic_receipt_and_circuit_breaker_guards() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn emergency_pause_blocks_escrow_flow() {
+    let t = E2eEnv::new();
 
-    let customer = Address::generate(&env);
-    let merchant = Address::generate(&env);
+    let pause_client =
+        emergency_pause::EmergencyPauseContractClient::new(&t.env, &t.emergency_pause);
+    pause_client.pause(&t.admin);
+    assert!(pause_client.is_paused());
 
-    let rolling_spend_limit = 50000_i128;
-    let attempted_spend = 15000_i128;
-    assert!(attempted_spend <= rolling_spend_limit);
+    let escrow_client = escrow::EscrowContractClient::new(&t.env, &t.escrow);
+    let result = escrow_client.try_create_escrow(&t.payer, &t.payee, &500);
+    assert!(result.is_err());
+
+    pause_client.unpause(&t.admin);
+    assert!(!pause_client.is_paused());
 }

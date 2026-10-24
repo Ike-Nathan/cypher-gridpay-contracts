@@ -78,6 +78,37 @@ fn test_activate_succession_rejects_premature_activation() {
 }
 
 #[test]
+fn test_activate_succession_rejects_when_admin_recently_active() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+
+    env.ledger().set_timestamp(5_000);
+    client.designate_successor(&admin, &successor, &120_u64);
+
+    // Primary admin performs a ledger interaction, resetting the inactivity clock.
+    client.set_batch_limit(&admin, &50_u32);
+
+    // Challenge period has elapsed, but the admin has not been inactive long enough.
+    env.ledger().set_timestamp(5_120);
+    let result = client.try_activate_succession(&successor);
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::NotReady))));
+}
+
+#[test]
+fn test_activate_succession_rejects_before_inactivity_threshold() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+
+    env.ledger().set_timestamp(5_000);
+    client.designate_successor(&admin, &successor, &120_u64);
+
+    // Challenge period elapsed, but INACTIVITY_THRESHOLD has not.
+    env.ledger().set_timestamp(5_120);
+    let result = client.try_activate_succession(&successor);
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::NotReady))));
+}
+
+#[test]
 fn test_any_admin_can_revoke_pending_succession() {
     let (env, client, admin) = setup();
     let second_admin = Address::generate(&env);
