@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{storage::Instance as _, Address as _, Ledger};
+use soroban_sdk::testutils::{storage::Instance as _, Address as _, Events, Ledger};
 
 struct Setup {
     env: Env,
@@ -388,242 +388,254 @@ fn test_admin_calls_extend_instance_ttl() {
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
 }
 
-// ── Scoped, time-bounded role grants ─────────────────────────────────────────
+// ── Canary upgrade verification (Issue #235) ────────────────────────────────
 
-const DAY: u64 = 86_400;
+mod canary {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 
-fn hash(env: &Env, b: u8) -> BytesN<32> {
-    BytesN::from_array(env, &[b; 32])
+    #[contracttype]
+    enum Key {
+        Version,
+        Paused,
+        Faulty,
+        Hash,
+    }
+
+    /// Stand-in upgrade target exposing the entry points `execute_upgrade`
+    /// drives. A faulty target ignores `migrate_schema`.
+    #[contract]
+    pub struct MockTarget;
+
+    #[contractimpl]
+    impl MockTarget {
+        pub fn configure(env: Env, version: u32, paused: bool, faulty: bool) {
+            env.storage().instance().set(&Key::Version, &version);
+            env.storage().instance().set(&Key::Paused, &paused);
+            env.storage().instance().set(&Key::Faulty, &faulty);
+        }
+
+        pub fn get_schema_version(env: Env) -> u32 {
+            env.storage().instance().get(&Key::Version).unwrap_or(1)
+        }
+
+        pub fn get_pause_state(env: Env) -> payments::PauseState {
+            payments::PauseState {
+                globally_paused: env.storage().instance().get(&Key::Paused).unwrap_or(false),
+                paused_functions: Vec::new(&env),
+                paused_at: 0,
+                paused_by: env.current_contract_address(),
+                pause_reason: String::from_str(&env, ""),
+            }
+        }
+
+        pub fn upgrade(env: Env, _caller: Address, new_wasm_hash: BytesN<32>) -> BytesN<32> {
+            env.storage().instance().set(&Key::Hash, &new_wasm_hash);
+            new_wasm_hash
+        }
+
+        pub fn migrate_schema(env: Env, _caller: Address, target_version: u32) {
+            let faulty: bool = env.storage().instance().get(&Key::Faulty).unwrap_or(false);
+            if !faulty {
+                env.storage().instance().set(&Key::Version, &target_version);
+            }
+        }
+
+        pub fn installed_hash(env: Env) -> Option<BytesN<32>> {
+            env.storage().instance().get(&Key::Hash)
+        }
+    }
 }
 
-fn at(s: &Setup, ts: u64) {
-    s.env.ledger().set_timestamp(ts);
+fn setup_canary(s: &Setup, version: u32, paused: bool, faulty: bool) -> Address {
+    let id = s.env.register(canary::MockTarget, ());
+    canary::MockTargetClient::new(&s.env, &id).configure(&version, &paused, &faulty);
+    id
+}
+
+fn wasm_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7u8; 32])
 }
 
 #[test]
-fn test_scoped_upgrade_proposer_can_only_target_its_contracts() {
+fn test_upgrade_with_migration_verifies_post_schema_version() {
     let s = setup();
-    at(&s, 1_000);
-    let operator = Address::generate(&s.env);
-    s.client().grant_scoped_role(
-        &s.admin,
-        &operator,
-        &OperatorRole::UpgradeProposer,
-        &soroban_sdk::vec![&s.env, s.payment.clone()],
-        &(1_000 + 7 * DAY),
-    );
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, false);
 
-    // In scope: allowed.
-    s.client().propose_upgrade(&operator, &s.payment, &hash(&s.env, 1));
-    // Out of scope: rejected.
-    assert_eq!(
-        s.client().try_propose_upgrade(&operator, &s.escrow, &hash(&s.env, 2)),
-        Err(Ok(Error::RoleTargetNotAllowed))
-    );
-    // No grant at all: rejected.
-    assert_eq!(
-        s.client()
-            .try_propose_upgrade(&Address::generate(&s.env), &s.payment, &hash(&s.env, 3)),
-        Err(Ok(Error::RoleGrantNotFound))
-    );
-    // The stored admin needs no grant.
-    s.client().propose_upgrade(&s.admin, &s.escrow, &hash(&s.env, 4));
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    c.execute_upgrade(&s.admin, &id);
+
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.get_schema_version(), 2);
+    assert_eq!(mock.installed_hash(), Some(wasm_hash(&s.env)));
+    assert!(c.get_upgrade_proposal(&id).executed);
 }
 
 #[test]
-fn test_unrestricted_grant_covers_every_target() {
+fn test_upgrade_rolls_back_on_post_schema_mismatch() {
     let s = setup();
-    at(&s, 1_000);
-    let operator = Address::generate(&s.env);
-    s.client().grant_scoped_role(
-        &s.admin,
-        &operator,
-        &OperatorRole::UpgradeProposer,
-        &Vec::new(&s.env),
-        &(1_000 + DAY),
-    );
-    for target in [&s.payment, &s.escrow, &s.refund] {
-        s.client().propose_upgrade(&operator, target, &hash(&s.env, 9));
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, true);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::PostUpgradeVerificationFailed)));
+
+    // Upgrade, migration and the executed flag are all rolled back.
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.installed_hash(), None);
+    assert_eq!(mock.get_schema_version(), 1);
+    assert!(!c.get_upgrade_proposal(&id).executed);
+}
+
+#[test]
+fn test_migrating_upgrade_requires_paused_target() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::TargetNotPaused)));
+}
+
+#[test]
+fn test_expired_upgrade_proposal_cannot_execute() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &3_600, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    s.env.ledger().set_timestamp(1_000);
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &1, &None);
+    c.approve_upgrade(&s.admin, &id);
+
+    let expires_at = c.get_upgrade_proposal(&id).expires_at;
+    assert_eq!(expires_at, 1_000 + 3_600 + UPGRADE_PROPOSAL_VALIDITY);
+
+    s.env.ledger().set_timestamp(expires_at + 1);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::UpgradeProposalExpired)));
+
+    // Still executable right up to the expiry.
+    s.env.ledger().set_timestamp(expires_at);
+    c.execute_upgrade(&s.admin, &id);
+}
+
+// ── Protocol parameter guardrails (Issue #240) ──────────────────────────────
+
+fn empty_patch() -> ProtocolParameterPatch {
+    ProtocolParameterPatch {
+        max_fee_bps: None,
+        min_finality_delay_secs: None,
+        max_slippage_bps: None,
+        min_escrow_hold_secs: None,
     }
 }
 
 #[test]
-fn test_expired_grant_is_rejected() {
+fn test_sync_parameters_rejects_out_of_bounds() {
     let s = setup();
-    at(&s, 1_000);
-    let operator = Address::generate(&s.env);
-    let expires_at = 1_000 + DAY;
-    s.client().grant_scoped_role(
-        &s.admin,
-        &operator,
-        &OperatorRole::UpgradeProposer,
-        &Vec::new(&s.env),
-        &expires_at,
+    let c = s.client();
+
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(9_900);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
     );
 
-    at(&s, expires_at); // last valid second
-    s.client().propose_upgrade(&operator, &s.payment, &hash(&s.env, 1));
-    at(&s, expires_at + 1);
+    let mut patch = empty_patch();
+    patch.min_finality_delay_secs = Some(0);
     assert_eq!(
-        s.client().try_propose_upgrade(&operator, &s.payment, &hash(&s.env, 2)),
-        Err(Ok(Error::RoleGrantExpired))
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
+    );
+
+    // Nothing was applied.
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 100);
+}
+
+#[test]
+fn test_sync_parameters_rejects_large_step() {
+    let s = setup();
+    let c = s.client();
+
+    // Default fee is 100 bps; a 25% step allows at most 125.
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(126);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterStepTooLarge))
+    );
+
+    patch.max_fee_bps = Some(125);
+    assert_eq!(
+        c.sync_protocol_parameters(&s.admin, &patch).max_fee_bps,
+        125
     );
 }
 
 #[test]
-fn test_operational_grants_must_expire_within_the_maximum() {
+fn test_sync_parameters_enforces_cooldown() {
     let s = setup();
-    at(&s, 1_000);
-    let operator = Address::generate(&s.env);
-    let grant = |expires_at: u64| {
-        s.client().try_grant_scoped_role(
-            &s.admin,
-            &operator,
-            &OperatorRole::FeeHarvester,
-            &Vec::new(&s.env),
-            &expires_at,
-        )
-    };
-    let max = DEFAULT_MAX_ROLE_GRANT_DURATION_SECS;
-    assert_eq!(grant(0), Err(Ok(Error::InvalidRoleExpiry)), "no indefinite operator grants");
-    assert_eq!(grant(1_000), Err(Ok(Error::InvalidRoleExpiry)), "already expired");
-    assert_eq!(grant(1_000 + max + 1), Err(Ok(Error::InvalidRoleExpiry)), "too long");
-    assert_eq!(grant(1_000 + max), Ok(Ok(())));
+    let c = s.client();
+    s.env.ledger().set_timestamp(10_000);
 
-    // The maximum is configurable.
-    s.client().set_role_policy(&s.admin, &DAY, &2);
-    assert_eq!(grant(1_000 + 2 * DAY), Err(Ok(Error::InvalidRoleExpiry)));
+    let mut patch = empty_patch();
+    patch.max_slippage_bps = Some(110);
+    c.sync_protocol_parameters(&s.admin, &patch);
 
-    // SuperAdmin grants may be indefinite.
-    s.client().grant_scoped_role(
-        &s.admin,
-        &Address::generate(&s.env),
-        &OperatorRole::SuperAdmin,
-        &Vec::new(&s.env),
-        &0,
+    patch.max_slippage_bps = Some(120);
+    s.env
+        .ledger()
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS - 1);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterCooldownActive))
+    );
+
+    // A different parameter is not affected by that cooldown.
+    let mut other = empty_patch();
+    other.min_escrow_hold_secs = Some(100_000);
+    c.sync_protocol_parameters(&s.admin, &other);
+
+    s.env
+        .ledger()
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS);
+    assert_eq!(
+        c.sync_protocol_parameters(&s.admin, &patch)
+            .max_slippage_bps,
+        120
     );
 }
 
 #[test]
-fn test_only_super_admins_grant_and_never_to_themselves() {
+fn test_sync_parameters_requires_admin_and_broadcasts() {
     let s = setup();
-    at(&s, 1_000);
-    let super_op = Address::generate(&s.env);
-    let operator = Address::generate(&s.env);
-    s.client().grant_scoped_role(
-        &s.admin,
-        &super_op,
-        &OperatorRole::SuperAdmin,
-        &Vec::new(&s.env),
-        &(1_000 + 10 * DAY),
-    );
+    let c = s.client();
 
-    // A SuperAdmin grantee can grant others...
-    s.client().grant_scoped_role(
-        &super_op,
-        &operator,
-        &OperatorRole::ComplianceOfficer,
-        &Vec::new(&s.env),
-        &(1_000 + DAY),
-    );
-    // ...but not renew its own grant.
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(110);
     assert_eq!(
-        s.client().try_grant_scoped_role(
-            &super_op,
-            &super_op,
-            &OperatorRole::SuperAdmin,
-            &Vec::new(&s.env),
-            &(1_000 + 100 * DAY),
-        ),
-        Err(Ok(Error::SelfGrantForbidden))
-    );
-    // An operational role holder can't grant at all.
-    assert_eq!(
-        s.client().try_grant_scoped_role(
-            &operator,
-            &Address::generate(&s.env),
-            &OperatorRole::ComplianceOfficer,
-            &Vec::new(&s.env),
-            &(1_000 + DAY),
-        ),
+        c.try_sync_protocol_parameters(&s.pauser, &patch),
         Err(Ok(Error::Unauthorized))
     );
-    // Once the SuperAdmin grant expires, its holder can't grant either.
-    at(&s, 1_000 + 10 * DAY + 1);
-    assert_eq!(
-        s.client().try_grant_scoped_role(
-            &super_op,
-            &Address::generate(&s.env),
-            &OperatorRole::ComplianceOfficer,
-            &Vec::new(&s.env),
-            &(1_000 + 11 * DAY),
-        ),
-        Err(Ok(Error::RoleGrantExpired))
-    );
-}
 
-#[test]
-fn test_self_renewal_needs_a_super_admin_quorum() {
-    let s = setup();
-    at(&s, 1_000);
-    let a = Address::generate(&s.env);
-    let b = Address::generate(&s.env);
-    for who in [&a, &b] {
-        s.client().grant_scoped_role(
-            &s.admin,
-            who,
-            &OperatorRole::SuperAdmin,
-            &Vec::new(&s.env),
-            &(1_000 + 10 * DAY),
-        );
-    }
-    let renew = |approvers: Vec<Address>| {
-        s.client().try_renew_role_with_quorum(
-            &approvers,
-            &a,
-            &OperatorRole::SuperAdmin,
-            &Vec::new(&s.env),
-            &(1_000 + 100 * DAY),
-        )
-    };
-    // The grantee's own approval doesn't count, nor do duplicates or outsiders.
-    assert_eq!(
-        renew(soroban_sdk::vec![&s.env, a.clone(), b.clone()]),
-        Err(Ok(Error::InsufficientRoleQuorum))
-    );
-    assert_eq!(
-        renew(soroban_sdk::vec![&s.env, b.clone(), b.clone(), Address::generate(&s.env)]),
-        Err(Ok(Error::InsufficientRoleQuorum))
-    );
-    // Two other SuperAdmins: renewed.
-    assert_eq!(renew(soroban_sdk::vec![&s.env, b.clone(), s.admin.clone()]), Ok(Ok(())));
-    assert_eq!(
-        s.client().get_role_grant(&a, &OperatorRole::SuperAdmin).unwrap().expires_at,
-        1_000 + 100 * DAY
-    );
-}
-
-#[test]
-fn test_revoked_grant_stops_working() {
-    let s = setup();
-    at(&s, 1_000);
-    let operator = Address::generate(&s.env);
-    s.client().grant_scoped_role(
-        &s.admin,
-        &operator,
-        &OperatorRole::UpgradeProposer,
-        &Vec::new(&s.env),
-        &(1_000 + DAY),
-    );
-    s.client()
-        .revoke_scoped_role(&s.admin, &operator, &OperatorRole::UpgradeProposer);
-    assert_eq!(
-        s.client().try_propose_upgrade(&operator, &s.payment, &hash(&s.env, 1)),
-        Err(Ok(Error::RoleGrantNotFound))
-    );
-    assert_eq!(
-        s.client()
-            .try_revoke_scoped_role(&s.admin, &operator, &OperatorRole::UpgradeProposer),
-        Err(Ok(Error::RoleGrantNotFound))
-    );
+    c.sync_protocol_parameters(&s.admin, &patch);
+    let synced = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract_id)
+        .count();
+    assert_eq!(synced, 3);
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 110);
 }

@@ -161,6 +161,9 @@ cat > "${MANIFEST_FILE}" <<EOF
 }
 EOF
 
+# Validate manifest JSON before reporting success
+jq . "${MANIFEST_FILE}" >/dev/null || { log_error "Failed to write valid deployment manifest JSON"; exit 1; }
+
 log_info "Deployment manifest written to: ${MANIFEST_FILE}"
 log_info "Deployment complete!"
 echo ""

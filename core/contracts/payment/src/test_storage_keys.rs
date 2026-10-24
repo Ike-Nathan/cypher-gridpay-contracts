@@ -785,3 +785,111 @@ fn test_namespaced_keys_hold_independent_values() {
     assert_eq!(pay_7, 555);
     assert_eq!(sub_7, 666);
 }
+
+/// Instance-storage budget: the token whitelist lives in sharded persistent
+/// entries, so instance storage stays under `MAX_INSTANCE_STORAGE_BYTES`
+/// however long the whitelist gets.
+mod instance_budget {
+    use crate::storage::{
+        assert_instance_storage_within_budget, instance_storage_xdr_len, MAX_INSTANCE_STORAGE_BYTES,
+        SHARD_CAPACITY,
+    };
+    use crate::{ConfigKey, DataKey, PaymentContract, PaymentContractClient};
+    use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+
+    const MAX_WHITELIST: u32 = 100;
+
+    fn setup(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(PaymentContract, ());
+        let client = PaymentContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        (client, contract_id, admin)
+    }
+
+    fn tokens(env: &Env, n: u32) -> Vec<Address> {
+        let mut v = Vec::new(env);
+        for _ in 0..n {
+            v.push_back(Address::generate(env));
+        }
+        v
+    }
+
+    #[test]
+    fn full_whitelist_keeps_instance_storage_under_budget() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        let list = tokens(&env, MAX_WHITELIST);
+        for token in list.iter() {
+            client.add_allowed_token(&admin, &token);
+        }
+
+        assert_instance_storage_within_budget(&env, &contract_id);
+        assert_eq!(client.get_allowed_tokens(), list);
+        env.as_contract(&contract_id, || {
+            let shards = MAX_WHITELIST.div_ceil(SHARD_CAPACITY);
+            for shard in 0..shards {
+                assert!(env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::Config(ConfigKey::TokenWhitelistShard(shard))));
+                assert!(!env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::Config(ConfigKey::TokenWhitelistShard(shard))));
+            }
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&DataKey::Config(ConfigKey::AllowedTokens)));
+        });
+    }
+
+    #[test]
+    fn removing_tokens_drops_unused_shards() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        let list = tokens(&env, 40); // two shards
+        for token in list.iter() {
+            client.add_allowed_token(&admin, &token);
+        }
+        for token in list.slice(30..40).iter() {
+            client.remove_allowed_token(&admin, &token);
+        }
+        assert_eq!(client.get_allowed_tokens(), list.slice(0..30));
+        env.as_contract(&contract_id, || {
+            let persistent = env.storage().persistent();
+            assert!(persistent.has(&DataKey::Config(ConfigKey::TokenWhitelistShard(0))));
+            assert!(!persistent.has(&DataKey::Config(ConfigKey::TokenWhitelistShard(1))));
+        });
+    }
+
+    #[test]
+    fn migrate_schema_moves_legacy_instance_whitelist() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        // A contract from before schema 3: the whole list in one instance Vec.
+        let list = tokens(&env, MAX_WHITELIST);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::AllowedTokens), &list);
+        });
+        // That layout is what blows the budget.
+        assert!(instance_storage_xdr_len(&env, &contract_id) > MAX_INSTANCE_STORAGE_BYTES);
+        // Reads still work before migrating.
+        assert_eq!(client.get_allowed_tokens(), list);
+
+        client.migrate_schema(&admin, &3);
+
+        assert_eq!(client.get_allowed_tokens(), list);
+        assert_instance_storage_within_budget(&env, &contract_id);
+        env.as_contract(&contract_id, || {
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&DataKey::Config(ConfigKey::AllowedTokens)));
+        });
+    }
+}

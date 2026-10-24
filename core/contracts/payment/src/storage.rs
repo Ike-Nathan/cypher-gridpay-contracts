@@ -5,7 +5,10 @@
 //! restores them. Every active read or write goes through these helpers so the
 //! touched entry's TTL is extended automatically.
 
-use soroban_sdk::{Env, IntoVal, TryFromVal, Val};
+use soroban_sdk::{
+    contracttype, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, Val,
+    Vec,
+};
 
 /// Approximate number of ledgers closed per day (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
@@ -74,104 +77,109 @@ where
     extend_persistent(env, key);
 }
 
-/// Shortest ledger close time assumed when converting a business deadline (in
-/// seconds) into ledgers. Ledgers close every ~5 s; assuming 4 s means faster
-/// ledgers can never make an entry expire before its deadline.
-pub const MIN_SECONDS_PER_LEDGER: u64 = 4;
-/// Ledgers added on top of every deadline-derived TTL.
-pub const DEADLINE_SAFETY_LEDGERS: u32 = DAY_IN_LEDGERS;
+/// Depth of the archived-record Merkle accumulator (Issue #243): up to 2^20
+/// leaves, with a frontier of 20 * 32 = 640 bytes.
+pub const MERKLE_TREE_DEPTH: u32 = 20;
 
-/// How long an entry is kept alive, by what it holds.
+const MERKLE_FRONTIER_KEY: Symbol = symbol_short!("arch_imt");
+
+/// Incremental Merkle tree over the SHA-256 digests of finalized/archived
+/// records (Issue #243). Only the rightmost filled node of each level is kept,
+/// so off-chain copies of archived records can be proven against `root`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct IncrementalMerkleFrontier {
+    pub frontier: Vec<BytesN<32>>,
+    pub leaf_count: u64,
+    pub root: BytesN<32>,
+}
+
+fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    let mut data = Bytes::from_array(env, &left.to_array());
+    data.extend_from_array(&right.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Returns the stored frontier, or the empty tree (all-zero leaves).
+pub fn get_merkle_frontier(env: &Env) -> IncrementalMerkleFrontier {
+    if let Some(imt) = get_persistent(env, &MERKLE_FRONTIER_KEY) {
+        return imt;
+    }
+    let mut frontier = Vec::new(env);
+    let mut zero = BytesN::from_array(env, &[0u8; 32]);
+    for _ in 0..MERKLE_TREE_DEPTH {
+        frontier.push_back(zero.clone());
+        zero = hash_pair(env, &zero, &zero);
+    }
+    IncrementalMerkleFrontier {
+        frontier,
+        leaf_count: 0,
+        root: zero,
+    }
+}
+
+/// SHA-256 digest of a record's XDR encoding, used as its Merkle leaf.
+pub fn archived_record_leaf<T>(env: &Env, record: &T) -> BytesN<32>
+where
+    T: IntoVal<Env, Val> + Clone,
+{
+    env.crypto().sha256(&record.clone().to_xdr(env)).to_bytes()
+}
+
+/// Appends a leaf to the accumulator and returns its index.
 ///
-/// * `CriticalActiveLock` - funds or authority are locked by it (an escrowed
-///   or disputed record, an arbitration, a reserve, a multisig config). Long
-///   bump, high threshold, and never shorter than its business deadline
-///   (see [`extend_persistent_until`] / [`extend_instance_until`]).
-/// * `StandardActive` - live but not locking funds.
-/// * `TerminalAuditRecord` - completed, refunded or resolved: kept only for
-///   the minimum audit retention, so finished small records stop costing rent.
-/// * `EphemeralWindow` - short-lived windows (rate limits, caches).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageTier {
-    CriticalActiveLock,
-    StandardActive,
-    TerminalAuditRecord,
-    EphemeralWindow,
-}
-
-impl StorageTier {
-    /// Ledgers an entry of this tier is extended to.
-    pub const fn bump_amount(self) -> u32 {
-        match self {
-            StorageTier::CriticalActiveLock => 120 * DAY_IN_LEDGERS,
-            StorageTier::StandardActive => 30 * DAY_IN_LEDGERS,
-            StorageTier::TerminalAuditRecord => 14 * DAY_IN_LEDGERS,
-            StorageTier::EphemeralWindow => DAY_IN_LEDGERS,
-        }
+/// # Panics
+/// Panics once all 2^`MERKLE_TREE_DEPTH` leaves are used.
+pub fn append_archived_leaf(env: &Env, leaf: BytesN<32>) -> u64 {
+    let mut imt = get_merkle_frontier(env);
+    let index = imt.leaf_count;
+    if index >= 1u64 << MERKLE_TREE_DEPTH {
+        panic!("archived record accumulator is full");
     }
 
-    /// An entry of this tier is extended once its TTL drops below this.
-    pub const fn threshold(self) -> u32 {
-        match self {
-            StorageTier::CriticalActiveLock => 90 * DAY_IN_LEDGERS,
-            StorageTier::StandardActive => 29 * DAY_IN_LEDGERS,
-            StorageTier::TerminalAuditRecord => 7 * DAY_IN_LEDGERS,
-            StorageTier::EphemeralWindow => DAY_IN_LEDGERS / 2,
+    let mut node = leaf;
+    let mut zero = BytesN::from_array(env, &[0u8; 32]);
+    let mut position = index;
+    for level in 0..MERKLE_TREE_DEPTH {
+        if position & 1 == 0 {
+            imt.frontier.set(level, node.clone());
+            node = hash_pair(env, &node, &zero);
+        } else {
+            node = hash_pair(env, &imt.frontier.get_unchecked(level), &node);
         }
+        zero = hash_pair(env, &zero, &zero);
+        position >>= 1;
     }
+
+    imt.root = node;
+    imt.leaf_count += 1;
+    set_persistent(env, &MERKLE_FRONTIER_KEY, &imt);
+    index
 }
 
-/// Ledgers until `timestamp` (0 if it has passed), at the conservative
-/// [`MIN_SECONDS_PER_LEDGER`].
-pub fn ledgers_until(env: &Env, timestamp: u64) -> u32 {
-    let secs = timestamp.saturating_sub(env.ledger().timestamp());
-    secs.div_ceil(MIN_SECONDS_PER_LEDGER).min(u32::MAX as u64) as u32
-}
-
-/// TTL (in ledgers) an entry needs to outlive `deadline + grace_secs`, never
-/// below `tier`'s bump, capped at the network maximum. A deadline beyond the
-/// maximum gets the maximum; a keeper must bump it again later
-/// (`batch_bump_critical`).
-pub fn required_ttl(env: &Env, tier: StorageTier, deadline: u64, grace_secs: u64) -> u32 {
-    let needed = ledgers_until(env, deadline.saturating_add(grace_secs))
-        .saturating_add(DEADLINE_SAFETY_LEDGERS);
-    needed.max(tier.bump_amount()).min(env.storage().max_ttl())
-}
-
-/// Extends a persistent entry by its tier's policy. The entry must exist.
-pub fn extend_persistent_tiered<K>(env: &Env, key: &K, tier: StorageTier)
-where
-    K: IntoVal<Env, Val>,
-{
-    let max = env.storage().max_ttl();
-    env.storage().persistent().extend_ttl(
-        key,
-        tier.threshold().min(max),
-        tier.bump_amount().min(max),
-    );
-}
-
-/// Extends a persistent entry so it outlives `deadline + grace_secs` (and at
-/// least its tier's bump). The entry must exist. Returns the TTL target.
-pub fn extend_persistent_until<K>(
+/// Checks that `leaf_hash` sits at `index` under the current root, given its
+/// `MERKLE_TREE_DEPTH` sibling hashes ordered from the leaf level upwards.
+/// Indices at or beyond `leaf_count` are rejected.
+pub fn verify_archived_record_inclusion(
     env: &Env,
-    key: &K,
-    tier: StorageTier,
-    deadline: u64,
-    grace_secs: u64,
-) -> u32
-where
-    K: IntoVal<Env, Val>,
-{
-    let target = required_ttl(env, tier, deadline, grace_secs);
-    env.storage().persistent().extend_ttl(key, target, target);
-    target
-}
+    leaf_hash: BytesN<32>,
+    index: u64,
+    proof: Vec<BytesN<32>>,
+) -> bool {
+    let imt = get_merkle_frontier(env);
+    if index >= imt.leaf_count || proof.len() != MERKLE_TREE_DEPTH {
+        return false;
+    }
 
-/// Extends the contract instance (and every record kept in instance storage)
-/// so it outlives `deadline + grace_secs` at `tier`. Returns the TTL target.
-pub fn extend_instance_until(env: &Env, tier: StorageTier, deadline: u64, grace_secs: u64) -> u32 {
-    let target = required_ttl(env, tier, deadline, grace_secs);
-    env.storage().instance().extend_ttl(target, target);
-    target
+    let mut node = leaf_hash;
+    let mut position = index;
+    for sibling in proof.iter() {
+        node = if position & 1 == 0 {
+            hash_pair(env, &node, &sibling)
+        } else {
+            hash_pair(env, &sibling, &node)
+        };
+        position >>= 1;
+    }
+    node == imt.root
 }

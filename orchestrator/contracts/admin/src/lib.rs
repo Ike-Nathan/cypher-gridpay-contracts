@@ -3,8 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 #[contracterror]
@@ -23,21 +23,14 @@ pub enum Error {
     InsufficientApprovals = 11,
     UpgradeAlreadyExecuted = 12,
     InvalidWasmHash = 13,
-    /// The upgrade targets a contract this one cannot upgrade (only itself).
-    InvalidUpgradeTarget = 14,
-    /// The caller holds no grant for the role.
-    RoleGrantNotFound = 15,
-    /// The caller's grant for the role has expired (`now > expires_at`).
-    RoleGrantExpired = 16,
-    /// The grant does not cover the contract the action targets.
-    RoleTargetNotAllowed = 17,
-    /// A non-SuperAdmin grant must expire, in the future, within
-    /// `max_role_grant_duration_secs`.
-    InvalidRoleExpiry = 18,
-    /// An operator cannot grant or renew a role for themselves.
-    SelfGrantForbidden = 19,
-    /// A quorum renewal lacked enough distinct, active SuperAdmin approvers.
-    InsufficientRoleQuorum = 20,
+    // Issue #235: canary upgrade verification
+    UpgradeProposalExpired = 14,
+    TargetNotPaused = 15,
+    PostUpgradeVerificationFailed = 16,
+    // Issue #240: protocol parameter guardrails
+    ParameterOutOfBounds = 17,
+    ParameterStepTooLarge = 18,
+    ParameterCooldownActive = 19,
 }
 
 /// Identifies which downstream contract address is being rotated.
@@ -120,48 +113,168 @@ pub enum DataKey {
     UpgradeProposalCounter,
     UpgradeTimelock,
     UpgradeRequiredApprovals,
-    /// Persistent: the grant of `role` to an address.
-    RoleGrant(Address, OperatorRole),
-    /// Instance: longest lifetime of a non-SuperAdmin grant, in seconds.
-    MaxRoleGrantDuration,
-    /// Instance: SuperAdmin approvals a quorum renewal needs.
-    RoleRenewalQuorum,
+    // Issue #240: global protocol parameter registry
+    ProtocolParameters,
+    ParameterLastUpdated(ProtocolParameter),
 }
 
-/// Operational roles, granted per address with an expiry and target scope.
-/// The stored admin is always a SuperAdmin.
+/// How long an upgrade proposal stays executable once its timelock has
+/// elapsed (Issue #235). Stale approved proposals cannot be executed weeks
+/// later.
+pub const UPGRADE_PROPOSAL_VALIDITY: u64 = 7 * 24 * 60 * 60;
+
+/// A WASM upgrade of a target contract awaiting approval and execution.
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperatorRole {
-    SuperAdmin,
-    EmergencyPauser,
-    UpgradeProposer,
-    FeeHarvester,
-    ComplianceOfficer,
+pub struct UpgradeProposal {
+    pub contract_address: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub timelock_period: u64,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    /// Issue #235: schema version the target must report after the upgrade
+    /// (and optional migration) for the upgrade to be committed.
+    pub expected_post_schema_version: u32,
+    /// Issue #235: WASM hash the target must acknowledge having installed.
+    pub expected_wasm_hash: BytesN<32>,
+    /// Issue #235: when set, `migrate_schema(target_version)` is invoked on the
+    /// target in the same transaction as the upgrade.
+    pub run_migration_target: Option<u32>,
+    /// Issue #235: last timestamp at which the proposal may be executed.
+    pub expires_at: u64,
 }
 
-/// A time-bounded, target-scoped grant of `role` to `grantee`.
-///
-/// `allowed_targets` lists the contracts the grant may act on; empty means
-/// every managed contract. `expires_at` is a ledger timestamp; `0` (never
-/// expires) is only allowed for SuperAdmin.
+/// Emitted when an upgrade passes post-upgrade verification (Issue #235).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeVerified {
+    pub proposal_id: u64,
+    pub contract_address: Address,
+    pub pre_schema_version: u32,
+    pub post_schema_version: u32,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Immutable constitutional bounds on global economic parameters
+/// (Issue #240). No admin quorum can move a parameter outside these limits.
+pub struct GlobalParameterGuardrails;
+
+impl GlobalParameterGuardrails {
+    /// Hard ceiling on the protocol fee (5%).
+    pub const ABSOLUTE_MAX_FEE_BPS: u32 = 500;
+    /// Hard ceiling on the maximum allowed slippage (10%).
+    pub const ABSOLUTE_MAX_SLIPPAGE_BPS: u32 = 1_000;
+    /// Hard floor on the minimum finality delay.
+    pub const ABSOLUTE_MIN_FINALITY_DELAY_SECS: u64 = 60;
+    /// Hard floor on the minimum escrow hold time.
+    pub const ABSOLUTE_MIN_ESCROW_HOLD_SECS: u64 = 3_600;
+    /// Maximum change of a parameter per adjustment, relative to its current
+    /// value (25%).
+    pub const MAX_PARAMETER_STEP_CHANGE_BPS: u32 = 2_500;
+    /// Minimum time between two adjustments of the same parameter.
+    pub const MIN_PARAMETER_COOLDOWN_SECS: u64 = 86_400;
+}
+
+/// Identifies a global economic parameter for per-parameter cooldowns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ProtocolParameter {
+    MaxFeeBps,
+    MinFinalityDelaySecs,
+    MaxSlippageBps,
+    MinEscrowHoldSecs,
+}
+
+/// Global economic parameters shared by Payment, Escrow and Refund.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProtocolParameters {
+    pub max_fee_bps: u32,
+    pub min_finality_delay_secs: u64,
+    pub max_slippage_bps: u32,
+    pub min_escrow_hold_secs: u64,
+}
+
+/// A partial update of [`ProtocolParameters`]; `None` leaves a value as is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProtocolParameterPatch {
+    pub max_fee_bps: Option<u32>,
+    pub min_finality_delay_secs: Option<u64>,
+    pub max_slippage_bps: Option<u32>,
+    pub min_escrow_hold_secs: Option<u64>,
+}
+
+/// Broadcast of the synced registry to one downstream contract (Issue #240).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolParametersSynced {
+    pub target: ContractTarget,
+    pub contract_address: Address,
+    pub parameters: ProtocolParameters,
+    pub synced_at: u64,
+}
+
+/// Split of every harvested protocol fee, in basis points. The four parts
+/// must sum to exactly 10_000.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoleGrant {
-    pub grantee: Address,
-    pub role: OperatorRole,
-    pub allowed_targets: Vec<Address>,
-    pub expires_at: u64,
-    pub granted_by: Address,
+pub struct TreasuryAllocationConfig {
+    pub insurance_pool_bps: u32,
+    pub arbitrator_incentive_bps: u32,
+    pub protocol_treasury_bps: u32,
+    pub operations_bps: u32,
 }
 
-/// Default longest lifetime of a non-SuperAdmin grant: 30 days. Operators
-/// have to be re-attested at least this often.
-pub const DEFAULT_MAX_ROLE_GRANT_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
-/// Default number of SuperAdmin approvals for a quorum renewal.
-pub const DEFAULT_ROLE_RENEWAL_QUORUM: u32 = 2;
-/// TTL bump for persistent role grants (~30 days of ledgers).
-const ROLE_GRANT_TTL: u32 = 30 * 17_280;
+/// Where each part of the treasury allocation is paid.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryRecipients {
+    pub insurance_pool: Address,
+    pub arbitrator_pool: Address,
+    pub protocol_treasury: Address,
+    pub operations: Address,
+}
+
+/// What `harvest_all_protocol_fees` collected and paid out for one token.
+/// `total == from_payment + from_escrow + from_refund ==
+/// insurance_pool + arbitrator_incentive + protocol_treasury + operations`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeHarvestReport {
+    pub token: Address,
+    pub from_payment: i128,
+    pub from_escrow: i128,
+    pub from_refund: i128,
+    pub total: i128,
+    pub insurance_pool: i128,
+    pub arbitrator_incentive: i128,
+    pub protocol_treasury: i128,
+    pub operations: i128,
+}
+
+/// Emitted once per token that `harvest_all_protocol_fees` collected.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeesHarvested {
+    pub token: Address,
+    pub total: i128,
+    pub insurance_pool: i128,
+    pub arbitrator_incentive: i128,
+    pub protocol_treasury: i128,
+    pub operations: i128,
+}
+
+const BPS_DENOMINATOR: u32 = 10_000;
+
+/// `amount * bps / 10_000`, rounded down, without overflowing for any
+/// non-negative `amount`.
+fn bps_share(amount: i128, bps: u32) -> i128 {
+    let bps = bps as i128;
+    let denom = BPS_DENOMINATOR as i128;
+    (amount / denom) * bps + (amount % denom) * bps / denom
+}
 
 /// A proposed WASM upgrade awaiting approvals and its timelock.
 #[contracttype]
@@ -174,6 +287,11 @@ pub struct UpgradeProposal {
     pub approvals: Vec<Address>,
     pub executed: bool,
 }
+
+/// TTL for persistent upgrade proposals (~30 days at ~5s per ledger), bumped
+/// whenever a proposal is read or written.
+const PROPOSAL_TTL_BUMP: u32 = 30 * 17_280;
+const PROPOSAL_TTL_THRESHOLD: u32 = PROPOSAL_TTL_BUMP - 17_280;
 
 /// Schema version written by `initialize`.
 const INITIAL_SCHEMA_VERSION: u32 = 1;
@@ -297,9 +415,57 @@ impl AdminContract {
             if next_version == 2 {
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: upgrade proposals move from instance to persistent storage.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
+    }
+
+    /// Upgrade proposals accumulate (one per proposal, never deleted), so
+    /// they live in persistent storage instead of the instance entry every
+    /// call loads. Proposals stored before schema 3 are still read from
+    /// instance storage.
+    fn load_upgrade_proposal(env: &Env, proposal_id: u64) -> Option<UpgradeProposal> {
+        let key = DataKey::UpgradeProposal(proposal_id);
+        let found: Option<UpgradeProposal> = env.storage().persistent().get(&key);
+        if found.is_some() {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+        }
+        found.or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_upgrade_proposal(env: &Env, proposal_id: u64, proposal: &UpgradeProposal) {
+        let key = DataKey::UpgradeProposal(proposal_id);
+        env.storage().persistent().set(&key, proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROPOSAL_TTL_THRESHOLD, PROPOSAL_TTL_BUMP);
+        env.storage().instance().remove(&key);
+    }
+
+    /// v2 -> v3: moves every upgrade proposal out of instance storage.
+    fn migrate_v2_to_v3(env: &Env) {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposalCounter)
+            .unwrap_or(0);
+        for proposal_id in 0..counter {
+            let legacy: Option<UpgradeProposal> = env
+                .storage()
+                .instance()
+                .get(&DataKey::UpgradeProposal(proposal_id));
+            if let Some(proposal) = legacy {
+                Self::store_upgrade_proposal(env, proposal_id, &proposal);
+            }
+        }
     }
 
     /// v1 -> v2 data migration: re-validates the stored orchestrator
@@ -747,6 +913,13 @@ impl AdminContract {
     }
 
     /// Applies a pending rotation once its timelock has elapsed.
+    ///
+    /// Issue #237: the new address must differ from the current one and pass
+    /// a readiness probe (`get_schema_version` and `is_initialized`). The old
+    /// address is kept in the deprecated-contract allowlist so in-flight
+    /// escrows/refunds can still complete legacy settlement callbacks, and
+    /// the new address is broadcast to both sibling contracts. If any sibling
+    /// rejects the update the whole rotation is rolled back.
     fn execute_rotation(
         env: &Env,
         target: ContractTarget,
@@ -770,11 +943,26 @@ impl AdminContract {
             .instance()
             .get(&stored_key)
             .ok_or(Error::NotInitialized)?;
+        if rotation.new_address == old_address {
+            return Err(Error::RotationToCurrentAddress);
+        }
+        Self::probe_rotation_target(env, &rotation.new_address)?;
 
         env.storage()
             .instance()
             .set(&stored_key, &rotation.new_address);
         env.storage().instance().remove(&pending_key);
+
+        let deprecated_key = DataKey::DeprecatedContracts(target.clone());
+        let mut deprecated: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&deprecated_key)
+            .unwrap_or(Vec::new(env));
+        deprecated.push_back(old_address.clone());
+        env.storage().instance().set(&deprecated_key, &deprecated);
+
+        Self::broadcast_peer_address(env, &target, &rotation.new_address)?;
 
         (ContractTargetUpdated {
             target,
@@ -785,6 +973,67 @@ impl AdminContract {
         .publish(env);
 
         Ok(())
+    }
+
+    /// Rejects a rotation target that is not a deployed, initialized contract.
+    fn probe_rotation_target(env: &Env, new_address: &Address) -> Result<(), Error> {
+        let schema = env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            new_address,
+            &Symbol::new(env, "get_schema_version"),
+            Vec::new(env),
+        );
+        let initialized = env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            new_address,
+            &Symbol::new(env, "is_initialized"),
+            Vec::new(env),
+        );
+        match (schema, initialized) {
+            (Ok(Ok(version)), Ok(Ok(true))) if version > 0 => Ok(()),
+            _ => Err(Error::RotationTargetNotReady),
+        }
+    }
+
+    /// Pushes a rotated address to the two sibling contracts, e.g. an escrow
+    /// rotation calls `set_escrow_contract` on Payment and Refund.
+    fn broadcast_peer_address(
+        env: &Env,
+        target: &ContractTarget,
+        new_address: &Address,
+    ) -> Result<(), Error> {
+        let (payment, escrow, refund) = Self::get_contract_addresses(env)?;
+        let (setter, peers) = match target {
+            ContractTarget::Payment => ("set_payment_contract", [escrow, refund]),
+            ContractTarget::Escrow => ("set_escrow_contract", [payment, refund]),
+            ContractTarget::Refund => ("set_refund_contract", [payment, escrow]),
+        };
+        let args: Vec<Val> = (env.current_contract_address(), new_address.clone()).into_val(env);
+        for peer in peers {
+            let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
+                &peer,
+                &Symbol::new(env, setter),
+                args.clone(),
+            );
+            if !matches!(result, Ok(Ok(_))) {
+                return Err(Error::PeerSyncFailed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the addresses a contract target was rotated away from, oldest
+    /// first (Issue #237). Siblings use this allowlist to accept legacy
+    /// settlement callbacks from contracts that are still draining.
+    pub fn get_deprecated_contracts(env: Env, target: ContractTarget) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DeprecatedContracts(target))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns whether `address` is a deprecated `target` contract that may
+    /// still complete legacy settlement callbacks (Issue #237).
+    pub fn is_deprecated_contract(env: Env, target: ContractTarget, address: Address) -> bool {
+        Self::get_deprecated_contracts(env, target).contains(&address)
     }
 
     /// Sets or updates the emergency pauser address.
@@ -865,6 +1114,10 @@ impl AdminContract {
     /// - `admin`: the admin address that must be authorized.
     /// - `contract_address`: the address of the contract to upgrade.
     /// - `new_wasm_hash`: the hash of the new WASM bytecode.
+    /// - `expected_post_schema_version`: the schema version the target must
+    ///   report once the upgrade (and optional migration) has run.
+    /// - `run_migration_target`: when set, `migrate_schema` is invoked on the
+    ///   target with this version in the same transaction as the upgrade.
     ///
     /// # Returns
     /// Returns the proposal ID on success.
@@ -878,6 +1131,8 @@ impl AdminContract {
         admin: Address,
         contract_address: Address,
         new_wasm_hash: BytesN<32>,
+        expected_post_schema_version: u32,
+        run_migration_target: Option<u32>,
     ) -> Result<u64, Error> {
         admin.require_auth();
         // The stored admin, or an active UpgradeProposer scoped to this target.
@@ -906,18 +1161,23 @@ impl AdminContract {
             .get(&DataKey::UpgradeProposalCounter)
             .unwrap_or(0);
 
+        let proposed_at = env.ledger().timestamp();
         let proposal = UpgradeProposal {
             contract_address: contract_address.clone(),
             new_wasm_hash: new_wasm_hash.clone(),
-            proposed_at: env.ledger().timestamp(),
+            proposed_at,
             timelock_period,
             approvals: Vec::new(&env),
             executed: false,
+            expected_post_schema_version,
+            expected_wasm_hash: new_wasm_hash,
+            run_migration_target,
+            expires_at: proposed_at
+                .saturating_add(timelock_period)
+                .saturating_add(UPGRADE_PROPOSAL_VALIDITY),
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal(counter), &proposal);
+        Self::store_upgrade_proposal(&env, counter, &proposal);
         env.storage()
             .instance()
             .set(&DataKey::UpgradeProposalCounter, &(counter + 1));
@@ -935,7 +1195,8 @@ impl AdminContract {
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
     /// `Error::Unauthorized` if the provided admin address does not match the stored admin,
     /// `Error::UpgradeProposalNotFound` if the proposal does not exist,
-    /// or `Error::UpgradeAlreadyExecuted` if the proposal has already been executed.
+    /// `Error::UpgradeAlreadyExecuted` if the proposal has already been executed,
+    /// or `Error::UpgradeProposalExpired` if the proposal is past `expires_at`.
     pub fn approve_upgrade(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
@@ -948,14 +1209,14 @@ impl AdminContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut proposal: UpgradeProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        let mut proposal: UpgradeProposal = Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::UpgradeAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::UpgradeProposalExpired);
         }
 
         // Check if admin already approved
@@ -966,14 +1227,20 @@ impl AdminContract {
         }
 
         proposal.approvals.push_back(admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal(proposal_id), &proposal);
+        Self::store_upgrade_proposal(&env, proposal_id, &proposal);
 
         Ok(())
     }
 
     /// Executes an approved upgrade proposal after the timelock has expired.
+    ///
+    /// Issue #235: the upgrade, the optional schema migration and the
+    /// post-upgrade verification run in one transaction. The target's
+    /// pre-upgrade schema version is captured, its `upgrade` entry point is
+    /// invoked (it must acknowledge `expected_wasm_hash`), `migrate_schema` is
+    /// run when `run_migration_target` is set, and the target must then report
+    /// `expected_post_schema_version`. Any failed check returns an error, which
+    /// reverts the upgrade and migration atomically.
     ///
     /// # Parameters
     /// - `admin`: the admin address that must be authorized.
@@ -985,7 +1252,11 @@ impl AdminContract {
     /// `Error::UpgradeProposalNotFound` if the proposal does not exist,
     /// `Error::UpgradeTimelockNotExpired` if the timelock period has not passed,
     /// `Error::InsufficientApprovals` if the required number of approvals has not been met,
-    /// or `Error::UpgradeAlreadyExecuted` if the proposal has already been executed.
+    /// `Error::UpgradeAlreadyExecuted` if the proposal has already been executed,
+    /// `Error::UpgradeProposalExpired` if the proposal is past `expires_at`,
+    /// `Error::TargetNotPaused` if a schema-migrating upgrade targets a live
+    /// contract, or `Error::PostUpgradeVerificationFailed` if the target does
+    /// not report the expected WASM hash or schema version afterwards.
     pub fn execute_upgrade(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
@@ -998,10 +1269,7 @@ impl AdminContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut proposal: UpgradeProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        let mut proposal: UpgradeProposal = Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)?;
 
         if proposal.executed {
@@ -1013,6 +1281,9 @@ impl AdminContract {
         let unlock_time = proposal.proposed_at + proposal.timelock_period;
         if current_time < unlock_time {
             return Err(Error::UpgradeTimelockNotExpired);
+        }
+        if current_time > proposal.expires_at {
+            return Err(Error::UpgradeProposalExpired);
         }
 
         // Check approvals
@@ -1034,13 +1305,216 @@ impl AdminContract {
 
         // Mark as executed
         proposal.executed = true;
+        Self::store_upgrade_proposal(&env, proposal_id, &proposal);
+
+        let target = proposal.contract_address.clone();
+        let this = env.current_contract_address();
+
+        // Pre-upgrade checkpoint.
+        let pre_schema_version = Self::target_schema_version(&env, &target);
+        if proposal.run_migration_target.is_some()
+            && !Self::target_pause_state(&env, &target).globally_paused
+        {
+            return Err(Error::TargetNotPaused);
+        }
+
+        // Upgrade: only the target itself can swap its WASM, so it exposes an
+        // `upgrade` entry point that reports the hash it installed.
+        let installed_hash: BytesN<32> = env.invoke_contract(
+            &target,
+            &Symbol::new(&env, "upgrade"),
+            (this.clone(), proposal.new_wasm_hash.clone()).into_val(&env),
+        );
+        if installed_hash != proposal.expected_wasm_hash {
+            return Err(Error::PostUpgradeVerificationFailed);
+        }
+
+        if let Some(target_version) = proposal.run_migration_target {
+            env.invoke_contract::<Val>(
+                &target,
+                &Symbol::new(&env, "migrate_schema"),
+                (this, target_version).into_val(&env),
+            );
+        }
+
+        // Post-upgrade invariants: expected schema, no downgrade, and the
+        // target still answers its health query.
+        let post_schema_version = Self::target_schema_version(&env, &target);
+        if post_schema_version != proposal.expected_post_schema_version
+            || post_schema_version < pre_schema_version
+        {
+            return Err(Error::PostUpgradeVerificationFailed);
+        }
+        Self::target_pause_state(&env, &target);
+
+        (UpgradeVerified {
+            proposal_id,
+            contract_address: target,
+            pre_schema_version,
+            post_schema_version,
+            wasm_hash: proposal.new_wasm_hash,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reads a target contract's storage schema version.
+    fn target_schema_version(env: &Env, target: &Address) -> u32 {
+        env.invoke_contract(target, &Symbol::new(env, "get_schema_version"), Vec::new(env))
+    }
+
+    /// Reads a target contract's pause state; the call doubles as a health
+    /// probe because it panics if the target cannot answer.
+    fn target_pause_state(env: &Env, target: &Address) -> payments::PauseState {
+        env.invoke_contract(target, &Symbol::new(env, "get_pause_state"), Vec::new(env))
+    }
+
+    /// Returns the global protocol parameter registry (Issue #240).
+    ///
+    /// Payment, Escrow and Refund read their economic bounds from here; before
+    /// the first sync the conservative defaults are returned.
+    pub fn get_protocol_parameters(env: Env) -> ProtocolParameters {
         env.storage()
             .instance()
-            .set(&DataKey::UpgradeProposal(proposal_id), &proposal);
+            .get(&DataKey::ProtocolParameters)
+            .unwrap_or(ProtocolParameters {
+                max_fee_bps: 100,
+                min_finality_delay_secs: 3_600,
+                max_slippage_bps: 100,
+                min_escrow_hold_secs: 86_400,
+            })
+    }
 
-        env.deployer()
-            .update_current_contract_wasm(proposal.new_wasm_hash);
+    /// Validates and applies a patch to the global protocol parameter registry
+    /// and broadcasts the result to Payment, Escrow and Refund (Issue #240).
+    ///
+    /// Every patched value must lie within the [`GlobalParameterGuardrails`]
+    /// hard bounds, differ from its current value by at most
+    /// `MAX_PARAMETER_STEP_CHANGE_BPS`, and respect
+    /// `MIN_PARAMETER_COOLDOWN_SECS` since that parameter last changed. The
+    /// hard bounds are constitutional: no admin signature can bypass them. The
+    /// patch is all-or-nothing.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` before `initialize`, `Error::Unauthorized`
+    /// if the caller is not the stored admin, `Error::ParameterOutOfBounds`,
+    /// `Error::ParameterStepTooLarge` or `Error::ParameterCooldownActive` when
+    /// a patched value violates a guardrail.
+    pub fn sync_protocol_parameters(
+        env: Env,
+        admin: Address,
+        patch: ProtocolParameterPatch,
+    ) -> Result<ProtocolParameters, Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (payment_contract, escrow_contract, refund_contract) =
+            Self::get_contract_addresses(&env)?;
 
+        type G = GlobalParameterGuardrails;
+        let mut params = Self::get_protocol_parameters(env.clone());
+
+        if let Some(v) = patch.max_fee_bps {
+            if v > G::ABSOLUTE_MAX_FEE_BPS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MaxFeeBps,
+                params.max_fee_bps as u64,
+                v as u64,
+            )?;
+            params.max_fee_bps = v;
+        }
+        if let Some(v) = patch.min_finality_delay_secs {
+            if v < G::ABSOLUTE_MIN_FINALITY_DELAY_SECS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MinFinalityDelaySecs,
+                params.min_finality_delay_secs,
+                v,
+            )?;
+            params.min_finality_delay_secs = v;
+        }
+        if let Some(v) = patch.max_slippage_bps {
+            if v > G::ABSOLUTE_MAX_SLIPPAGE_BPS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MaxSlippageBps,
+                params.max_slippage_bps as u64,
+                v as u64,
+            )?;
+            params.max_slippage_bps = v;
+        }
+        if let Some(v) = patch.min_escrow_hold_secs {
+            if v < G::ABSOLUTE_MIN_ESCROW_HOLD_SECS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MinEscrowHoldSecs,
+                params.min_escrow_hold_secs,
+                v,
+            )?;
+            params.min_escrow_hold_secs = v;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolParameters, &params);
+
+        let now = env.ledger().timestamp();
+        for (target, contract_address) in [
+            (ContractTarget::Payment, payment_contract),
+            (ContractTarget::Escrow, escrow_contract),
+            (ContractTarget::Refund, refund_contract),
+        ] {
+            (ProtocolParametersSynced {
+                target,
+                contract_address,
+                parameters: params.clone(),
+                synced_at: now,
+            })
+            .publish(&env);
+        }
+
+        Ok(params)
+    }
+
+    /// Enforces the per-parameter step-change limit and cooldown, then records
+    /// the adjustment time. Unchanged values are accepted without touching the
+    /// cooldown.
+    fn check_parameter_change(
+        env: &Env,
+        parameter: ProtocolParameter,
+        current: u64,
+        new: u64,
+    ) -> Result<(), Error> {
+        if new == current {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::ParameterLastUpdated(parameter);
+        if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+            if now < last.saturating_add(GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS) {
+                return Err(Error::ParameterCooldownActive);
+            }
+        }
+
+        let delta = current.abs_diff(new) as u128;
+        let max_delta = current as u128
+            * GlobalParameterGuardrails::MAX_PARAMETER_STEP_CHANGE_BPS as u128
+            / 10_000;
+        if delta > max_delta {
+            return Err(Error::ParameterStepTooLarge);
+        }
+
+        env.storage().instance().set(&key, &now);
         Ok(())
     }
 
@@ -1087,224 +1561,185 @@ impl AdminContract {
         Ok(())
     }
 
-    /// Grants `role` to `grantee`, scoped to `allowed_targets` (empty = every
-    /// managed contract) until `expires_at`. Replaces any existing grant of
-    /// that role to `grantee`.
-    ///
-    /// Only a SuperAdmin may grant. A non-SuperAdmin role must expire in the
-    /// future and within `max_role_grant_duration_secs`, so operator keys are
-    /// re-attested regularly; a SuperAdmin grant may use `expires_at = 0`
-    /// (never). Nobody can grant (or renew) a role for themselves: see
-    /// [`renew_role_with_quorum`](Self::renew_role_with_quorum).
+    /// Sets how harvested protocol fees are split, and where each part goes.
     ///
     /// # Errors
-    /// `NotInitialized`, `Unauthorized` (granter not a SuperAdmin),
-    /// `SelfGrantForbidden`, `InvalidRoleExpiry`.
-    pub fn grant_scoped_role(
-        env: Env,
-        granter: Address,
-        grantee: Address,
-        role: OperatorRole,
-        allowed_targets: Vec<Address>,
-        expires_at: u64,
-    ) -> Result<(), Error> {
-        granter.require_auth();
-        Self::require_super_admin(&env, &granter)?;
-        if granter == grantee {
-            return Err(Error::SelfGrantForbidden);
-        }
-        Self::store_role_grant(&env, &granter, grantee, role, allowed_targets, expires_at)
-    }
-
-    /// Renews (or re-scopes) `grantee`'s grant of `role` with the approval of
-    /// at least `role_renewal_quorum` distinct, active SuperAdmins other than
-    /// the grantee. This is the only way a SuperAdmin's own grant can be
-    /// extended, so no operator can keep themselves in a role alone.
-    ///
-    /// # Errors
-    /// `InsufficientRoleQuorum` when fewer qualifying approvers sign, plus
-    /// the expiry rules of [`grant_scoped_role`](Self::grant_scoped_role).
-    pub fn renew_role_with_quorum(
-        env: Env,
-        approvers: Vec<Address>,
-        grantee: Address,
-        role: OperatorRole,
-        allowed_targets: Vec<Address>,
-        expires_at: u64,
-    ) -> Result<(), Error> {
-        let quorum: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RoleRenewalQuorum)
-            .unwrap_or(DEFAULT_ROLE_RENEWAL_QUORUM);
-        let mut counted: Vec<Address> = Vec::new(&env);
-        for approver in approvers.iter() {
-            // The grantee and repeated approvers never count, so they are
-            // skipped before asking for (duplicate) authorization.
-            if approver == grantee || counted.contains(&approver) {
-                continue;
-            }
-            approver.require_auth();
-            if Self::require_super_admin(&env, &approver).is_ok() {
-                counted.push_back(approver);
-            }
-        }
-        if counted.len() < quorum {
-            return Err(Error::InsufficientRoleQuorum);
-        }
-        let granted_by = counted.get(0).unwrap();
-        Self::store_role_grant(&env, &granted_by, grantee, role, allowed_targets, expires_at)
-    }
-
-    /// Revokes `grantee`'s grant of `role`. SuperAdmin only.
-    ///
-    /// # Errors
-    /// `NotInitialized`, `Unauthorized`, `RoleGrantNotFound`.
-    pub fn revoke_scoped_role(
-        env: Env,
-        revoker: Address,
-        grantee: Address,
-        role: OperatorRole,
-    ) -> Result<(), Error> {
-        revoker.require_auth();
-        Self::require_super_admin(&env, &revoker)?;
-        let key = DataKey::RoleGrant(grantee, role);
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::RoleGrantNotFound);
-        }
-        env.storage().persistent().remove(&key);
-        Ok(())
-    }
-
-    /// The grant of `role` to `grantee`, if any (expired grants included).
-    pub fn get_role_grant(env: Env, grantee: Address, role: OperatorRole) -> Option<RoleGrant> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::RoleGrant(grantee, role))
-    }
-
-    /// Sets the longest lifetime of a non-SuperAdmin grant and the quorum for
-    /// renewals. Stored admin only.
-    pub fn set_role_policy(
+    /// `NotInitialized` / `Unauthorized` for anyone but the stored admin;
+    /// `InvalidTreasuryAllocation` unless the four parts sum to exactly 10_000.
+    pub fn set_treasury_allocation(
         env: Env,
         admin: Address,
-        max_role_grant_duration_secs: u64,
-        renewal_quorum: u32,
+        config: TreasuryAllocationConfig,
+        recipients: TreasuryRecipients,
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        if max_role_grant_duration_secs == 0 || renewal_quorum == 0 {
-            return Err(Error::InvalidRoleExpiry);
+        let sum = config.insurance_pool_bps as u64
+            + config.arbitrator_incentive_bps as u64
+            + config.protocol_treasury_bps as u64
+            + config.operations_bps as u64;
+        if sum != BPS_DENOMINATOR as u64 {
+            return Err(Error::InvalidTreasuryAllocation);
         }
         env.storage()
             .instance()
-            .set(&DataKey::MaxRoleGrantDuration, &max_role_grant_duration_secs);
+            .set(&DataKey::TreasuryAllocation, &config);
         env.storage()
             .instance()
-            .set(&DataKey::RoleRenewalQuorum, &renewal_quorum);
+            .set(&DataKey::TreasuryRecipients, &recipients);
         Ok(())
     }
 
-    /// Fails unless `caller` may act as `role` on `target` now.
+    /// The configured treasury split and recipients, if set.
+    pub fn get_treasury_allocation(
+        env: Env,
+    ) -> Option<(TreasuryAllocationConfig, TreasuryRecipients)> {
+        let config: TreasuryAllocationConfig =
+            env.storage().instance().get(&DataKey::TreasuryAllocation)?;
+        let recipients: TreasuryRecipients =
+            env.storage().instance().get(&DataKey::TreasuryRecipients)?;
+        Some((config, recipients))
+    }
+
+    /// Collects the protocol fees accrued in the payment, escrow and refund
+    /// contracts for each of `tokens`, routes them through this contract,
+    /// and pays them out according to the treasury allocation.
     ///
-    /// The stored admin and active SuperAdmins pass for every role. Anyone
-    /// else needs an unexpired grant of `role` whose `allowed_targets` is
-    /// empty or contains `target`; `target = None` (an action on every
-    /// managed contract) needs an unrestricted grant.
+    /// Per token:
+    /// * Payment: `sweep_fees` for the whole accumulated balance, when
+    ///   `token` is the payment contract's fee token. The payment contract's
+    ///   sweep recipient must be this contract.
+    /// * Escrow: `withdraw_escrow_fees` for its accumulated fees in `token`.
+    /// * Refund: `sweep_protocol_fees` for its accumulated protocol fees.
+    ///
+    /// A contract with nothing accrued for a token is skipped; the other
+    /// contracts are still harvested. This contract must be an admin of all
+    /// three. The harvested total is split by the configured basis points,
+    /// rounding down, and the rounding remainder goes to the protocol
+    /// treasury, so the four payouts always add up to exactly what was
+    /// harvested. A token with nothing to harvest anywhere gets no report.
     ///
     /// # Errors
-    /// `NotInitialized`, `RoleGrantNotFound`, `RoleGrantExpired`,
-    /// `RoleTargetNotAllowed`.
-    fn require_active_role(
-        env: &Env,
-        caller: &Address,
-        role: OperatorRole,
-        target: Option<Address>,
-    ) -> Result<(), Error> {
-        if Self::require_super_admin(env, caller).is_ok() {
-            return Ok(());
-        }
-        let grant = Self::active_grant(env, caller, role)?;
-        if grant.allowed_targets.is_empty() {
-            return Ok(());
-        }
-        match target {
-            Some(target) if grant.allowed_targets.contains(&target) => Ok(()),
-            _ => Err(Error::RoleTargetNotAllowed),
-        }
-    }
-
-    /// The stored admin, or an address with an active SuperAdmin grant.
-    fn require_super_admin(env: &Env, caller: &Address) -> Result<(), Error> {
-        let stored_admin: Address = env
+    /// * `NotInitialized` / `Unauthorized` for anyone but the stored admin.
+    /// * `TreasuryAllocationNotSet` before `set_treasury_allocation`.
+    /// * `FeeHarvestFailed` if a child refuses a sweep.
+    /// * `FeeHarvestNotReceived` if swept fees did not reach this contract.
+    pub fn harvest_all_protocol_fees(
+        env: Env,
+        caller: Address,
+        tokens: Vec<Address>,
+    ) -> Result<Vec<FeeHarvestReport>, Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        let config: TreasuryAllocationConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if *caller == stored_admin {
-            return Ok(());
-        }
-        match Self::active_grant(env, caller, OperatorRole::SuperAdmin) {
-            Ok(_) => Ok(()),
-            Err(Error::RoleGrantNotFound) => Err(Error::Unauthorized),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// `caller`'s grant of `role`, if it exists and has not expired.
-    fn active_grant(env: &Env, caller: &Address, role: OperatorRole) -> Result<RoleGrant, Error> {
-        let key = DataKey::RoleGrant(caller.clone(), role);
-        let grant: RoleGrant = env
+            .get(&DataKey::TreasuryAllocation)
+            .ok_or(Error::TreasuryAllocationNotSet)?;
+        let recipients: TreasuryRecipients = env
             .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::RoleGrantNotFound)?;
-        if grant.expires_at != 0 && env.ledger().timestamp() > grant.expires_at {
-            return Err(Error::RoleGrantExpired);
-        }
-        Ok(grant)
-    }
+            .instance()
+            .get(&DataKey::TreasuryRecipients)
+            .ok_or(Error::TreasuryAllocationNotSet)?;
+        let (payment_contract, escrow_contract, refund_contract) =
+            Self::get_contract_addresses(&env)?;
 
-    fn store_role_grant(
-        env: &Env,
-        granted_by: &Address,
-        grantee: Address,
-        role: OperatorRole,
-        allowed_targets: Vec<Address>,
-        expires_at: u64,
-    ) -> Result<(), Error> {
-        let now = env.ledger().timestamp();
-        if role != OperatorRole::SuperAdmin {
-            let max: u64 = env
-                .storage()
-                .instance()
-                .get(&DataKey::MaxRoleGrantDuration)
-                .unwrap_or(DEFAULT_MAX_ROLE_GRANT_DURATION_SECS);
-            if expires_at <= now || expires_at - now > max {
-                return Err(Error::InvalidRoleExpiry);
-            }
-        } else if expires_at != 0 && expires_at <= now {
-            return Err(Error::InvalidRoleExpiry);
-        }
-        let key = DataKey::RoleGrant(grantee.clone(), role);
-        let grant = RoleGrant {
-            grantee,
-            role,
-            allowed_targets,
-            expires_at,
-            granted_by: granted_by.clone(),
+        let this = env.current_contract_address();
+        let payment = PaymentContractClient::new(&env, &payment_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract);
+        let refund = RefundContractClient::new(&env, &refund_contract);
+        // The payment contract accrues fees in a single fee token.
+        let payment_fee_token = match payment.try_get_fee_config() {
+            Ok(Ok(fee_config)) => Some(fee_config.fee_token),
+            _ => None,
         };
-        env.storage().persistent().set(&key, &grant);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, ROLE_GRANT_TTL, ROLE_GRANT_TTL);
-        Ok(())
+
+        let mut reports = Vec::new(&env);
+        for token_address in tokens.iter() {
+            let token_client = token::Client::new(&env, &token_address);
+
+            let from_payment = if payment_fee_token.as_ref() == Some(&token_address) {
+                let accrued = payment.get_accumulated_fees();
+                if accrued > 0 {
+                    let before = token_client.balance(&this);
+                    payment
+                        .try_sweep_fees(&this, &accrued)
+                        .map_err(|_| Error::FeeHarvestFailed)?
+                        .map_err(|_| Error::FeeHarvestFailed)?;
+                    if token_client.balance(&this) - before != accrued {
+                        return Err(Error::FeeHarvestNotReceived);
+                    }
+                }
+                accrued.max(0)
+            } else {
+                0
+            };
+
+            let escrow_accrued = escrow.get_accumulated_escrow_fees(&token_address);
+            let from_escrow = if escrow_accrued > 0 {
+                escrow
+                    .try_withdraw_escrow_fees(&this, &token_address, &this, &escrow_accrued)
+                    .map_err(|_| Error::FeeHarvestFailed)?
+                    .map_err(|_| Error::FeeHarvestFailed)?
+            } else {
+                0
+            };
+
+            let from_refund = refund
+                .try_sweep_protocol_fees(&this, &token_address, &this)
+                .map_err(|_| Error::FeeHarvestFailed)?
+                .map_err(|_| Error::FeeHarvestFailed)?;
+
+            let total = from_payment + from_escrow + from_refund;
+            if total <= 0 {
+                continue;
+            }
+
+            let insurance_pool = bps_share(total, config.insurance_pool_bps);
+            let arbitrator_incentive = bps_share(total, config.arbitrator_incentive_bps);
+            let operations = bps_share(total, config.operations_bps);
+            // The remainder, including every rounding unit, goes to the
+            // treasury so the payouts add up to exactly `total`.
+            let protocol_treasury = total - insurance_pool - arbitrator_incentive - operations;
+
+            for (to, amount) in [
+                (&recipients.insurance_pool, insurance_pool),
+                (&recipients.arbitrator_pool, arbitrator_incentive),
+                (&recipients.protocol_treasury, protocol_treasury),
+                (&recipients.operations, operations),
+            ] {
+                if amount > 0 {
+                    token_client.transfer(&this, to, &amount);
+                }
+            }
+
+            ProtocolFeesHarvested {
+                token: token_address.clone(),
+                total,
+                insurance_pool,
+                arbitrator_incentive,
+                protocol_treasury,
+                operations,
+            }
+            .publish(&env);
+
+            reports.push_back(FeeHarvestReport {
+                token: token_address,
+                from_payment,
+                from_escrow,
+                from_refund,
+                total,
+                insurance_pool,
+                arbitrator_incentive,
+                protocol_treasury,
+                operations,
+            });
+        }
+        Ok(reports)
     }
 
     pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Result<UpgradeProposal, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::UpgradeProposal(proposal_id))
+        Self::load_upgrade_proposal(&env, proposal_id)
             .ok_or(Error::UpgradeProposalNotFound)
     }
 }
@@ -1644,7 +2079,7 @@ mod test {
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
 
         // Propose upgrade
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         assert_eq!(proposal_id, 0);
 
         // Verify proposal exists
@@ -1695,7 +2130,7 @@ mod test {
         client.configure_upgrade(&admin, &3600, &1);
 
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         client.approve_upgrade(&admin, &proposal_id);
 
         // Try to execute before timelock expires - should fail
@@ -1733,7 +2168,7 @@ mod test {
         client.configure_upgrade(&admin, &0, &2);
 
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         client.approve_upgrade(&admin, &proposal_id);
 
         // Try to execute with only 1 approval - should fail

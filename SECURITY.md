@@ -84,5 +84,42 @@ We welcome independent security researchers and auditors to review our smart con
 2. **Handle Rejections Gracefully:** Listen to typed contract error codes (`ContractError`) rather than generic RPC failures.
 3. **Subscribe to On-Chain Events:** Monitor Soroban emitted topics to verify transaction finality before releasing off-chain goods.
 
+### 6.1 Signed messages and domain separation
+
+Every off-chain signature the contracts verify with `ed25519_verify` is over
+a digest bound to a canonical domain: the network, the contract instance and
+the entry point. A signature therefore cannot be replayed on another network
+(Testnet to Mainnet), against a redeployed contract, or at another entry
+point. The contract always uses its own address and the current network when
+recomputing the digest, so a signature made for any other domain fails
+verification.
+
+```text
+domain_hash = sha256(
+      "CYPHER_GRIDPAY_DOMAIN_V1"   24 bytes, ASCII (protocol + domain version)
+   || network_id                  32 bytes: sha256(network passphrase)
+   || contract_address            40 bytes: XDR ScVal of the contract address
+   || action_tag                  ASCII entry-point tag, e.g. "channel_settle"
+)
+
+struct_hash = action-specific (below)
+
+digest = sha256( 0x19 || 0x01 || domain_hash || struct_hash )   66-byte pre-image
+```
+
+The signer signs the 32-byte `digest` with ed25519.
+
+| Action tag | Entry point | `struct_hash` |
+|---|---|---|
+| `channel_settle` | `settle_channel(channel_id, merchant_amount, nonce, signature)` | `sha256(xdr(u64 channel_id) \|\| xdr(i128 merchant_amount) \|\| xdr(u64 nonce))` |
+
+`xdr(...)` is the XDR encoding of the value as a Soroban `ScVal` (what
+`to_xdr` produces on-chain): 12 bytes for a `u64`, 20 bytes for an `i128`.
+
+The payment contract exposes `get_domain_separator()` and
+`channel_settle_digest(channel_id, merchant_amount, nonce)` so integrators can
+check their encoding against the chain. A new signed action must get its own
+tag, and changing the layout means a new `DOMAIN_V*` tag.
+
 ---
 *Last Updated: September 2026*

@@ -2,6 +2,7 @@
 
 use crate::{
     CustomerRefundSummary, RefundContract, RefundContractClient, RefundReasonCode, RefundStatus,
+    ABUSE_QUARANTINE_PERIOD_SECS, CLEAN_PAYMENT_DECAY_BPS,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -529,4 +530,220 @@ fn test_customer_refund_history_multiple_customers() {
     let history2 = client.get_customer_refund_history(&customer2, &10, &0);
     assert_eq!(history2.len(), 1);
     assert_eq!(history2.get(0).unwrap().amount, 2000);
+}
+
+// ── Issue #230: serial-refunder scoring and quarantine ──────────────────────
+
+const VIP_TIER: u32 = 9;
+
+fn disable_fraud_checks(client: &RefundContractClient, admin: &Address) {
+    client.set_fraud_config(
+        admin,
+        &crate::FraudConfig {
+            enabled: false,
+            max_refund_rate_bps: 10000,
+            min_transactions_for_check: 100,
+        },
+    );
+}
+
+fn vip_merchant(env: &Env, client: &RefundContractClient) -> Address {
+    let merchant = Address::generate(env);
+    client.set_customer_tier_policy(&merchant, &VIP_TIER, &10000u32);
+    client.set_vip_tier_policy(&merchant, &VIP_TIER, &true);
+    merchant
+}
+
+fn request(
+    env: &Env,
+    client: &RefundContractClient,
+    merchant: &Address,
+    customer: &Address,
+    payment_id: u64,
+    reason_code: RefundReasonCode,
+) -> u64 {
+    client.request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &500,
+        &1000,
+        &Address::generate(env),
+        &String::from_str(env, "claim"),
+        &reason_code,
+        &env.ledger().timestamp(),
+    )
+}
+
+/// Files three denied claims at three different merchants.
+fn make_serial_refunder(
+    env: &Env,
+    client: &RefundContractClient,
+    admin: &Address,
+    customer: &Address,
+) {
+    for payment_id in 1..=3u64 {
+        let merchant = Address::generate(env);
+        let refund_id = request(
+            env,
+            client,
+            &merchant,
+            customer,
+            payment_id,
+            RefundReasonCode::NonDelivery,
+        );
+        client.reject_refund(admin, &refund_id, &String::from_str(env, "no evidence"));
+    }
+}
+
+#[test]
+fn test_serial_refunder_is_quarantined_from_fast_track() {
+    let (env, client, admin, _merchant, customer) = setup_test_env();
+    disable_fraud_checks(&client, &admin);
+    client.set_abuse_quarantine_threshold(&admin, &5_000);
+    client.set_customer_tier(&admin, &customer, &VIP_TIER);
+    env.ledger().set_timestamp(1_000);
+
+    make_serial_refunder(&env, &client, &admin, &customer);
+
+    let profile = client.get_customer_refund_profile(&customer);
+    assert_eq!(profile.total_refunds_requested, 3);
+    assert_eq!(profile.denied_refunds_count, 3);
+    assert_eq!(profile.distinct_merchants_refunded, 3);
+    // (3 denied * 3) * 10_000 / max(10, 0 payments)
+    assert_eq!(profile.abuse_risk_bps, 9_000);
+    assert_eq!(
+        profile.auto_refund_disqualified_until,
+        1_000 + ABUSE_QUARANTINE_PERIOD_SECS
+    );
+
+    // The VIP fast-track no longer applies, but the claim is still accepted
+    // for manual review.
+    let merchant = vip_merchant(&env, &client);
+    let refund_id = request(
+        &env,
+        &client,
+        &merchant,
+        &customer,
+        4,
+        RefundReasonCode::ProductDefect,
+    );
+    assert_eq!(
+        client.get_refund(&refund_id).status,
+        RefundStatus::Requested
+    );
+    assert_eq!(
+        client
+            .get_customer_refund_profile(&customer)
+            .distinct_merchants_refunded,
+        4
+    );
+
+    // Manual review can still approve it.
+    client.approve_refund(&admin, &refund_id);
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+}
+
+#[test]
+fn test_high_volume_buyer_keeps_fast_track() {
+    let (env, client, admin, _merchant, customer) = setup_test_env();
+    disable_fraud_checks(&client, &admin);
+    client.set_abuse_quarantine_threshold(&admin, &5_000);
+    client.set_customer_tier(&admin, &customer, &VIP_TIER);
+
+    for _ in 0..50 {
+        client.record_customer_payment(&admin, &customer);
+    }
+    let merchant = vip_merchant(&env, &client);
+    let refund_id = request(
+        &env,
+        &client,
+        &merchant,
+        &customer,
+        1,
+        RefundReasonCode::ProductDefect,
+    );
+
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+    let profile = client.get_customer_refund_profile(&customer);
+    assert_eq!(profile.approved_refunds_count, 1);
+    // 1 approved * 10_000 / 50 payments
+    assert_eq!(profile.abuse_risk_bps, 200);
+}
+
+#[test]
+fn test_clean_payments_decay_score_and_lift_quarantine() {
+    let (env, client, admin, _merchant, customer) = setup_test_env();
+    disable_fraud_checks(&client, &admin);
+    client.set_abuse_quarantine_threshold(&admin, &5_000);
+    client.set_customer_tier(&admin, &customer, &VIP_TIER);
+    env.ledger().set_timestamp(1_000);
+
+    make_serial_refunder(&env, &client, &admin, &customer);
+    assert_eq!(
+        client.get_customer_refund_profile(&customer).abuse_risk_bps,
+        9_000
+    );
+
+    // Each consecutive refund-free payment lowers the score.
+    client.record_customer_payment(&admin, &customer);
+    let profile = client.get_customer_refund_profile(&customer);
+    assert_eq!(profile.consecutive_clean_payments, 1);
+    assert_eq!(profile.abuse_risk_bps, 9_000 - CLEAN_PAYMENT_DECAY_BPS);
+
+    for _ in 0..9 {
+        client.record_customer_payment(&admin, &customer);
+    }
+    // 9 * 10_000 / 10 payments - 10 * 500
+    assert_eq!(
+        client.get_customer_refund_profile(&customer).abuse_risk_bps,
+        4_000
+    );
+
+    // Below threshold, but the quarantine period still has to run out.
+    let merchant = vip_merchant(&env, &client);
+    let refund_id = request(
+        &env,
+        &client,
+        &merchant,
+        &customer,
+        4,
+        RefundReasonCode::Other,
+    );
+    assert_eq!(
+        client.get_refund(&refund_id).status,
+        RefundStatus::Requested
+    );
+
+    // Filing a refund resets the clean streak.
+    assert_eq!(
+        client
+            .get_customer_refund_profile(&customer)
+            .consecutive_clean_payments,
+        0
+    );
+
+    for _ in 0..10 {
+        client.record_customer_payment(&admin, &customer);
+    }
+    env.ledger()
+        .set_timestamp(1_000 + ABUSE_QUARANTINE_PERIOD_SECS + 1);
+    let refund_id = request(
+        &env,
+        &client,
+        &merchant,
+        &customer,
+        5,
+        RefundReasonCode::Other,
+    );
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+}
+
+#[test]
+fn test_record_customer_payment_requires_admin_or_payment_contract() {
+    let (env, client, _admin, _merchant, customer) = setup_test_env();
+    let stranger = Address::generate(&env);
+    assert!(client
+        .try_record_customer_payment(&stranger, &customer)
+        .is_err());
 }
