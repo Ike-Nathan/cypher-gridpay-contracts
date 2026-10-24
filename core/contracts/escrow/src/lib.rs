@@ -31,6 +31,7 @@ pub enum ConfigKey {
     WatchdogConfig,
     BatchLimit,
     PauseStateKey,
+    /// Persistent (instance before): one pause-history ring-buffer slot.
     PauseHistoryEntry(u64),
     PauseHistoryCount,
     ActivePauseIndex(String),
@@ -46,7 +47,12 @@ pub enum ConfigKey {
     EvidenceDeadlineConfig,
     ThresholdVersion,
     ProposalApprovalVersion(String),
+    /// Minimum escrow deposit amount (#45).
     MinEscrowAmount,
+    /// Persistent: progress of a batched schema migration.
+    MigrationCursor,
+    /// Instance: true while a batched migration is running.
+    MigrationInProgress,
     KeeperBountyConfig,
     DormantSettlement(u64),
 }
@@ -185,6 +191,10 @@ pub enum BasicError {
     InvalidAddress = 113,
     /// Storage schema is already at or above the requested version. Resolution: specify newer version for migration.
     SchemaAlreadyAtTarget = 114,
+    /// A batched schema migration is running; state-changing entry points are blocked until `migrate_schema_step` completes it.
+    MigrationInProgress = 115,
+    /// `migrate_schema_step` was called with a batch size of 0.
+    InvalidMigrationBatch = 116,
 }
 
 /// Errors relating to escrow creation, status transitions, vesting, and expiration.
@@ -203,7 +213,7 @@ pub enum EscrowError {
     /// Inactivity or dispute resolution timeout has not been reached. Resolution: wait until timeout deadline passes.
     TimeoutNotReached = 204,
     /// Escrow release is in a mandatory cooling/hold period. Resolution: wait until hold period expires.
-    ReleaseOnHoldPeriod = 205,
+    HoldPeriodActive = 205,
     /// Vesting schedule parameters (cliff, duration, intervals) are invalid. Resolution: provide non-zero duration and valid cliff.
     InvalidVestingSchedule = 206,
     /// Vesting cliff timestamp has not arrived yet. Resolution: wait until vesting cliff period has elapsed.
@@ -254,6 +264,10 @@ pub enum EscrowError {
     ClawbackDelayTooShort = 229,
     EvidenceLimitExceeded = 230,
     InvalidTemplateParameters = 231,
+    /// The release timelock has not elapsed yet. Resolution: wait until the timelock expires.
+    TimelockNotElapsed = 232,
+    /// Escrow deposit is below the configured minimum (`ConfigKey::MinEscrowAmount`). Resolution: deposit at least the minimum.
+    DepositBelowMinimum = 233,
 }
 
 /// Errors relating to disputes, arbitration, evidence, observers, and token swaps.
@@ -300,6 +314,14 @@ pub enum ActionError {
     VotingPhaseClosed = 318,
     /// Vote choice must be 0 (customer) or 1 (merchant). Resolution: use one of the supported choices.
     InvalidVoteChoice = 319,
+    /// The oracle price is older than the configured staleness threshold. Resolution: refresh the oracle price.
+    StaleOraclePrice = 320,
+    /// Keeper bounties are not enabled. Resolution: configure `KeeperBountyConfig` first.
+    KeeperBountyDisabled = 321,
+    /// The escrow is not in its dormant notice period. Resolution: flag it as stale first.
+    NotInDormantNoticePeriod = 322,
+    /// The dormant grace period has not elapsed. Resolution: wait until it ends.
+    DormantGraceNotElapsed = 323,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -350,13 +372,13 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 300 && code <= 319 {
+            if code >= 300 && code <= 323 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 231 {
+            if code >= 200 && code <= 233 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 114 {
+            if code >= 100 && code <= 116 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
             if code == 999 {
@@ -723,14 +745,14 @@ pub enum TestError {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollateralReleasedProportional {
     pub escrow_id: u64,
     pub seller: Address,
     pub amount_released: i128,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollateralDeposited {
     pub escrow_id: u64,
     pub party: Address,
@@ -2131,6 +2153,21 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
 
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
+/// Most escrows `migrate_schema_step` migrates per call.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
+/// Progress of a batched schema migration (`migrate_schema_step`). Escrows
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
 /// Default seasoning window applied to a beneficiary after a transfer (24 h).
 /// During this window the escrow remains subject to ClawbackCode::FraudulentOrigin.
@@ -2365,8 +2402,6 @@ impl EscrowContract {
             &DataKey::Participant(ParticipantKey::AccumulatedFees(token.clone())),
             &(accumulated - amount),
         );
-        Self::transfer_if_token_contract(&env, &token, &to, amount)?;
-
         Self::transfer_if_token_contract(&env, &token, &to, amount)?;
 
         EscrowFeesWithdrawn {
@@ -4854,8 +4889,11 @@ impl EscrowContract {
         // Issue #243: commit the finalized escrow to the Merkle accumulator.
         storage::append_archived_leaf(&env, storage::archived_record_leaf(&env, &escrow));
 
-        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, escrow.amount, escrow.fee_bps, 10000);
-        let merchant_amount = escrow.amount - fee_amount;
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
+        let fee_amount = fixed_math::mul_div_ceil_or_panic(&env, distributable, escrow.fee_bps, 10000);
+        let merchant_amount = distributable - fee_amount;
         let fee_config = Self::get_escrow_fee_config(env.clone());
 
         if fee_amount > 0 && fee_config.fee_recipient == env.current_contract_address() {
@@ -5011,7 +5049,10 @@ impl EscrowContract {
             EscrowStatus::Disputed => {
                 return Err(Error::Escrow(EscrowError::InvalidStatus));
             }
-            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled | EscrowStatus::ExpiredRefunded => {
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
                 return Err(Error::Escrow(EscrowError::AlreadyProcessed))
             }
         }
@@ -5022,6 +5063,9 @@ impl EscrowContract {
         // Issue #243: commit the finalized escrow to the Merkle accumulator.
         storage::append_archived_leaf(&env, storage::archived_record_leaf(&env, &escrow));
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // CEI: Resolved status is persisted above before refunding the customer.
         EscrowContract::transfer_if_token_contract(
             &env,
@@ -6159,6 +6203,10 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         Self::dequeue_escalation(&env, escrow_id);
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
+
         match &favor {
             AutoResolveFavor::Customer => {
                 EscrowContract::transfer_if_token_contract(
@@ -6390,8 +6438,11 @@ impl EscrowContract {
         // CEI: all state (status, collateral record, reputation, analytics) is
         // persisted above. External token transfers happen last.
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // Transfer main escrow funds to the dispute winner
-        Self::transfer_if_token_contract(&env, &escrow.token, &winner, escrow.amount)?;
+        Self::transfer_if_token_contract(&env, &escrow.token, &winner, distributable)?;
 
         // Distribute collateral to the dispute winner
         if let Some(collateral) = collateral {
@@ -8205,7 +8256,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0,
+            hold_period_until: current_timestamp,
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -9423,6 +9474,11 @@ impl EscrowContract {
                 let current_time: u64 = env.ledger().timestamp();
                 let mut escrow = EscrowContract::get_escrow(env, escrow_id);
 
+                if escrow.status == EscrowStatus::DormantNoticePeriod {
+                    // Admin activity cancels the keeper timer, as party activity does.
+                    EscrowContract::cancel_dormant_notice(env, escrow_id);
+                    escrow = EscrowContract::get_escrow(env, escrow_id);
+                }
                 match escrow.status {
                     EscrowStatus::Locked => {
                         if !early_release {
@@ -9444,8 +9500,11 @@ impl EscrowContract {
                     EscrowStatus::Resolved => {
                         return Err(Error::Escrow(EscrowError::AlreadyProcessed))
                     }
-                    EscrowStatus::Cancelled => {
+                    EscrowStatus::Cancelled | EscrowStatus::ExpiredRefunded => {
                         return Err(Error::Escrow(EscrowError::AlreadyProcessed))
+                    }
+                    EscrowStatus::DormantNoticePeriod => {
+                        return Err(Error::Escrow(EscrowError::InvalidStatus))
                     }
                 }
 
@@ -9455,8 +9514,11 @@ impl EscrowContract {
                 // Issue #243: commit the finalized escrow to the Merkle accumulator.
                 storage::append_archived_leaf(env, storage::archived_record_leaf(env, &escrow));
 
-                let fee_amount = fixed_math::mul_div_ceil_or_panic(env, escrow.amount, escrow.fee_bps, 10000);
-                let merchant_amount = escrow.amount - fee_amount;
+                // Sub-account milestone ledgers are isolated from the parent: a
+                // parent-level liquidation may only touch the parent's own remainder.
+                let distributable = EscrowContract::parent_liquidatable_amount(env, &escrow);
+                let fee_amount = fixed_math::mul_div_ceil_or_panic(env, distributable, escrow.fee_bps, 10000);
+                let merchant_amount = distributable - fee_amount;
                 let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
 
                 if fee_amount > 0 && fee_config.fee_recipient == env.current_contract_address() {
@@ -9602,12 +9664,15 @@ impl EscrowContract {
                     a.total_resolutions += 1;
                 });
 
+                // Sub-account milestone ledgers are isolated from the parent: a
+                // parent-level liquidation may only touch the parent's own remainder.
+                let distributable = EscrowContract::parent_liquidatable_amount(env, &escrow);
                 // CEI: status, reputation and analytics are persisted above.
                 EscrowContract::transfer_if_token_contract(
                     env,
                     &escrow.token,
                     &winner,
-                    escrow.amount,
+                    distributable,
                 )?;
 
                 EscrowResolved {
@@ -10116,10 +10181,7 @@ impl EscrowContract {
         // Circular buffer: reuse the slot of the oldest entry once the
         // retention limit is reached, so history storage stays bounded.
         let slot = Self::pause_history_slot(history_count);
-        env.storage().instance().set(
-            &DataKey::Config(ConfigKey::PauseHistoryEntry(slot)),
-            &entry,
-        );
+        Self::store_pause_history(&env, slot, &entry);
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::PauseHistoryCount),
             &(history_count + 1),
@@ -10179,21 +10241,14 @@ impl EscrowContract {
         {
             let active_slot = Self::pause_history_slot(active_idx);
             if let Some(mut entry) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, PauseHistory>(&DataKey::Config(ConfigKey::PauseHistoryEntry(
-                        active_slot,
-                    )))
+                Self::load_pause_history(&env, active_slot)
             {
                 // The slot is recycled once the entry falls out of the
                 // rolling window; never mutate a different function's entry.
                 if entry.function_name == global_key {
                     entry.unpaused_by = Some(admin.clone());
                     entry.unpaused_at = Some(now);
-                    env.storage().instance().set(
-                        &DataKey::Config(ConfigKey::PauseHistoryEntry(active_slot)),
-                        &entry,
-                    );
+                    Self::store_pause_history(&env, active_slot, &entry);
                 }
             }
             env.storage()
@@ -10288,10 +10343,7 @@ impl EscrowContract {
         // Circular buffer: reuse the slot of the oldest entry once the
         // retention limit is reached, so history storage stays bounded.
         let slot = Self::pause_history_slot(history_count);
-        env.storage().instance().set(
-            &DataKey::Config(ConfigKey::PauseHistoryEntry(slot)),
-            &entry,
-        );
+        Self::store_pause_history(&env, slot, &entry);
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::PauseHistoryCount),
             &(history_count + 1),
@@ -10357,21 +10409,14 @@ impl EscrowContract {
         {
             let active_slot = Self::pause_history_slot(active_idx);
             if let Some(mut entry) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, PauseHistory>(&DataKey::Config(ConfigKey::PauseHistoryEntry(
-                        active_slot,
-                    )))
+                Self::load_pause_history(&env, active_slot)
             {
                 // The slot is recycled once the entry falls out of the
                 // rolling window; never mutate a different function's entry.
                 if entry.function_name == function_name {
                     entry.unpaused_by = Some(admin.clone());
                     entry.unpaused_at = Some(now);
-                    env.storage().instance().set(
-                        &DataKey::Config(ConfigKey::PauseHistoryEntry(active_slot)),
-                        &entry,
-                    );
+                    Self::store_pause_history(&env, active_slot, &entry);
                 }
             }
             env.storage()
@@ -10411,9 +10456,7 @@ impl EscrowContract {
         let end = core::cmp::min(start.saturating_add(limit as u64), window_end);
         let mut i = start;
         while i < end {
-            if let Some(entry) = env.storage().instance().get::<DataKey, PauseHistory>(
-                &DataKey::Config(ConfigKey::PauseHistoryEntry(Self::pause_history_slot(i))),
-            ) {
+            if let Some(entry) = Self::load_pause_history(&env, Self::pause_history_slot(i)) {
                 result.push_back(entry);
             }
             i += 1;
@@ -10437,9 +10480,7 @@ impl EscrowContract {
         let (window_start, window_end) = Self::pause_history_window(&env);
         let mut i = window_start;
         while i < window_end {
-            if let Some(entry) = env.storage().instance().get::<DataKey, PauseHistory>(
-                &DataKey::Config(ConfigKey::PauseHistoryEntry(Self::pause_history_slot(i))),
-            ) {
+            if let Some(entry) = Self::load_pause_history(&env, Self::pause_history_slot(i)) {
                 if entry.function_name == function_name {
                     result.push_back(entry);
                 }
@@ -10447,6 +10488,23 @@ impl EscrowContract {
             i += 1;
         }
         result
+    }
+
+    /// Reads one pause-history slot. Entries carry free-text reasons, so the
+    /// ring buffer lives in persistent storage rather than the instance entry
+    /// loaded on every call; slots written before that are still read from
+    /// instance storage until they are overwritten.
+    fn load_pause_history(env: &Env, slot: u64) -> Option<PauseHistory> {
+        let key = DataKey::Config(ConfigKey::PauseHistoryEntry(slot));
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    /// Writes one pause-history slot to persistent storage and drops any
+    /// legacy instance copy of it.
+    fn store_pause_history(env: &Env, slot: u64, entry: &PauseHistory) {
+        let key = DataKey::Config(ConfigKey::PauseHistoryEntry(slot));
+        storage::set_persistent(env, &key, entry);
+        env.storage().instance().remove(&key);
     }
 
     /// Returns the storage slot used for an absolute pause-history index.
@@ -10775,6 +10833,121 @@ impl EscrowContract {
     ///
     /// # Panics
     /// Panics if required state is missing.
+    /// Migrates the schema to [`MIGRATION_TARGET_SCHEMA_VERSION`] a batch of
+    /// escrows at a time, so contracts with many escrows stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over escrow ids
+    /// `1..=escrow counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` escrows
+    /// (capped at [`MAX_MIGRATION_BATCH`]), using the same per-escrow rewrite
+    /// as `migrate_escrow_batch`. After the last one the schema version is
+    /// written and the guard is lifted. Escrows already marked migrated are
+    /// skipped, so retrying a batch is safe; read-only queries keep working.
+    ///
+    /// # Errors
+    /// `NotAnAdmin`, `SchemaAlreadyAtTarget`, `InvalidMigrationBatch` for a
+    /// batch size of 0.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if batch_size == 0 {
+            return Err(Error::Basic(BasicError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= MIGRATION_TARGET_SCHEMA_VERSION {
+                    return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Escrow(EscrowKey::Counter))
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(ConfigKey::MigrationInProgress), &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: MIGRATION_TARGET_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for escrow_id in cursor.next_record_id..end {
+            Self::migrate_escrow_record(&env, escrow_id);
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::SchemaVersion), &cursor.to_version);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Config(ConfigKey::MigrationInProgress));
+        }
+        storage::set_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor), &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor))
+    }
+
+    /// Rewrites one escrow in the current format and marks it migrated.
+    /// Skips escrows already marked or missing; idempotent.
+    fn migrate_escrow_record(env: &Env, escrow_id: u64) {
+        let marker = DataKey::Dispute(DisputeKey::EscrowMigrated(escrow_id));
+        if env.storage().instance().get::<DataKey, bool>(&marker).unwrap_or(false) {
+            return;
+        }
+        if let Some(escrow) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+            env.storage().instance().set(&marker, &true);
+        }
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Config(ConfigKey::MigrationInProgress))
+            .unwrap_or(false)
+        {
+            return Err(Error::Basic(BasicError::MigrationInProgress));
+        }
+        Ok(())
+    }
+
     pub fn get_migration_status(env: Env) -> MigrationStatus {
         env.storage()
             .instance()
@@ -10789,6 +10962,7 @@ impl EscrowContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()
@@ -11652,7 +11826,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0,
+            hold_period_until: current_timestamp,
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -12857,7 +13031,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0, // Default for batch
+            hold_period_until: current_timestamp, // no hold period for batch-created escrows
             fee_bps: 0,         // Default fee
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
@@ -13080,10 +13254,16 @@ impl EscrowContract {
         let mut escrow = Self::get_escrow(&env, escrow_id);
 
         match escrow.status {
-            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => {
                 return Err(Error::Escrow(EscrowError::EscrowAlreadyExpired));
             }
-            EscrowStatus::Disputed => return Err(Error::Escrow(EscrowError::InvalidStatus)),
+            // Dormant escrows are reclaimed through the keeper flow instead.
+            EscrowStatus::Disputed | EscrowStatus::DormantNoticePeriod => {
+                return Err(Error::Escrow(EscrowError::InvalidStatus))
+            }
             EscrowStatus::Locked => {}
         }
 
@@ -13098,6 +13278,9 @@ impl EscrowContract {
         // Issue #243: commit the finalized escrow to the Merkle accumulator.
         storage::append_archived_leaf(&env, storage::archived_record_leaf(&env, &escrow));
 
+        // Sub-account milestone ledgers are isolated from the parent: a
+        // parent-level liquidation may only touch the parent's own remainder.
+        let distributable = EscrowContract::parent_liquidatable_amount(&env, &escrow);
         // CEI: Cancelled status is persisted above before the refund transfer.
         EscrowContract::transfer_if_token_contract(
             &env,
@@ -14737,7 +14920,10 @@ impl EscrowContract {
             amount,
             token,
             parent_escrow.release_timestamp,
-            parent_escrow.min_hold_period,
+            // The child inherits whatever is left of the parent's hold period.
+            parent_escrow
+                .hold_period_until
+                .saturating_sub(env.ledger().timestamp()),
             parent_escrow.expiry_timestamp,
             parent_escrow.auto_refund_on_expiry,
             None,
@@ -14820,19 +15006,8 @@ impl EscrowContract {
         result
     }
 
-    /// Executes can parent release.
-    ///
-    /// # Arguments
-    /// * `env` - Soroban environment.
-    /// * `parent_id` - Identifier for the requested object.
-    ///
-    /// # Returns
-    /// True or false.
-    ///
-    /// # Panics
-    /// Panics if the contract state is invalid.
-        /// Issue #289: Proportional performance collateral release as milestones settle.
-    pub fn release_proportional_excess_collateral(
+    /// Issue #289: Proportional performance collateral release as milestones settle.
+    pub fn release_proportional_collateral(
         env: Env,
         escrow_id: u64,
         seller: Address,
@@ -14843,14 +15018,14 @@ impl EscrowContract {
             .storage()
             .instance()
             .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
-            .ok_or(Error::Escrow(EscrowError::EscrowNotFound))?;
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
 
-        if escrow.seller != seller {
+        if escrow.merchant != seller {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
         if escrow.status == EscrowStatus::Disputed {
-            return Err(Error::Action(ActionError::EscrowDisputed));
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
 
         let amount_released = 0_i128;
@@ -14864,6 +15039,17 @@ impl EscrowContract {
         Ok(amount_released)
     }
 
+    /// Executes can parent release.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `parent_id` - Identifier for the requested object.
+    ///
+    /// # Returns
+    /// True or false.
+    ///
+    /// # Panics
+    /// Panics if the contract state is invalid.
     pub fn can_parent_release(env: Env, parent_id: u64) -> bool {
         if !env
             .storage()
@@ -15152,3 +15338,6 @@ mod test_sub_account;
 
 #[cfg(test)]
 mod storage_ttl_test;
+
+#[cfg(test)]
+mod test_storage_keys;

@@ -218,3 +218,123 @@ fn test_migrate_schema_rejects_non_admin_before_running_migrations() {
     assert_eq!(result, Err(Ok(Error::Core(CoreError::Unauthorized))));
     assert_eq!(client.get_schema_version(), 1);
 }
+
+// ── Batched migration (migrate_schema_step) ──────────────────────────────────
+
+/// 100 refunds (distinct customers, so no rate limit applies) whose status
+/// index entries were never built (schema 1).
+fn legacy_refunds(env: &Env) -> (RefundContractClient<'_>, Address, Address, Address) {
+    let (client, contract_id, admin, merchant, _, token) = setup(env);
+    for id in 1..=100_u64 {
+        let customer = Address::generate(env);
+        request_refund(env, &client, &merchant, &customer, &token, id, 1_000);
+    }
+    env.as_contract(&contract_id, || {
+        for id in 1..=100_u64 {
+            env.storage().instance().remove(&DataKey::RefundStatusIndex(id));
+        }
+    });
+    (client, contract_id, admin, merchant)
+}
+
+fn indexed(env: &Env, contract_id: &Address, id: u64) -> bool {
+    env.as_contract(contract_id, || {
+        env.storage().instance().has(&DataKey::RefundStatusIndex(id))
+    })
+}
+
+#[test]
+fn test_migrate_schema_step_migrates_100_records_in_5_batches() {
+    let env = Env::default();
+    let (client, contract_id, admin, merchant) = legacy_refunds(&env);
+    let token = Address::generate(&env);
+
+    for step in 1..=5_u64 {
+        let cursor = client.migrate_schema_step(&admin, &20);
+        assert_eq!(cursor.records_migrated, step * 20);
+        assert_eq!(cursor.next_record_id, step * 20 + 1);
+        assert_eq!(cursor.completed, step == 5);
+        // Exactly the migrated prefix has been rebuilt.
+        assert!(indexed(&env, &contract_id, step * 20));
+        if step < 5 {
+            assert!(!indexed(&env, &contract_id, step * 20 + 1));
+            assert_eq!(client.get_schema_version(), 1);
+            // User writes are blocked; reads keep working.
+            let blocked = client.try_request_refund(
+                &merchant,
+                &500,
+                &Address::generate(&env),
+                &10,
+                &10,
+                &token,
+                &String::from_str(&env, "late"),
+                &RefundReasonCode::ProductDefect,
+                &env.ledger().timestamp(),
+            );
+            assert_eq!(blocked, Err(Ok(Error::Ext(ExtError::MigrationInProgress))));
+            assert_eq!(client.get_refund(&1).id, 1);
+        }
+    }
+
+    assert_eq!(client.get_schema_version(), LATEST_SCHEMA_VERSION);
+    for id in 1..=100_u64 {
+        assert!(indexed(&env, &contract_id, id));
+    }
+    // Writes work again, and there is nothing left to migrate.
+    request_refund(&env, &client, &merchant, &Address::generate(&env), &token, 500, 10);
+    assert_eq!(
+        client.try_migrate_schema_step(&admin, &20),
+        Err(Ok(Error::Ext(ExtError::SchemaAlreadyAtTarget)))
+    );
+}
+
+#[test]
+fn test_migrate_schema_step_caps_the_batch_and_retries_idempotently() {
+    let env = Env::default();
+    let (client, contract_id, admin, _) = legacy_refunds(&env);
+    let cursor = client.migrate_schema_step(&admin, &500);
+    assert_eq!(cursor.records_migrated, MAX_MIGRATION_BATCH as u64);
+    assert_eq!(
+        client.try_migrate_schema_step(&admin, &0),
+        Err(Ok(Error::Ext(ExtError::InvalidMigrationBatch)))
+    );
+
+    // Replay the first batch: the status index must not gain duplicates.
+    let status_count = |env: &Env| -> u64 {
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::RefundStatusCount(RefundStatus::Requested))
+                .unwrap_or(0)
+        })
+    };
+    let before = status_count(&env);
+    env.as_contract(&contract_id, || {
+        let mut cursor: MigrationCursor =
+            env.storage().persistent().get(&SystemKey::MigrationCursor).unwrap();
+        cursor.next_record_id = 1;
+        env.storage().persistent().set(&SystemKey::MigrationCursor, &cursor);
+    });
+    client.migrate_schema_step(&admin, &25);
+    assert_eq!(status_count(&env), before, "no duplicate index entries");
+
+    while !client.get_migration_cursor().unwrap().completed {
+        client.migrate_schema_step(&admin, &25);
+    }
+    assert_eq!(client.get_schema_version(), LATEST_SCHEMA_VERSION);
+}
+
+#[test]
+fn test_migrate_schema_step_requires_admin_and_blocks_monolithic_migration() {
+    let env = Env::default();
+    let (client, _, admin, _) = legacy_refunds(&env);
+    assert_eq!(
+        client.try_migrate_schema_step(&Address::generate(&env), &10),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    client.migrate_schema_step(&admin, &10);
+    assert_eq!(
+        client.try_migrate_schema(&admin, &3),
+        Err(Ok(Error::Ext(ExtError::MigrationInProgress)))
+    );
+}

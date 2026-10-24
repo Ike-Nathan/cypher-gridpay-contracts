@@ -103,11 +103,10 @@ fn test_payment_channel_full_lifecycle() {
     // channel_id.to_xdr || merchant_amount.to_xdr || nonce.to_xdr
     let merchant_amount: i128 = 700;
     let nonce: u64 = 1;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&nonce.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &nonce),
+    );
 
     // Collect message bytes and sign
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
@@ -169,11 +168,10 @@ fn test_settle_channel_invalid_nonce() {
     // Build a signature with nonce = 0 (invalid — must be > channel.settled_nonce which starts at 0)
     let merchant_amount: i128 = 500;
     let bad_nonce: u64 = 0;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&bad_nonce.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &bad_nonce),
+    );
 
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let signature = signing_key.sign(&msg_vec);
@@ -227,11 +225,10 @@ fn test_settle_channel_rejects_negative_merchant_amount() {
 
     let merchant_amount: i128 = -500;
     let nonce: u64 = 1;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&nonce.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &nonce),
+    );
 
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let signature = signing_key.sign(&msg_vec);
@@ -294,11 +291,10 @@ fn test_stale_nonce_replay_rejected() {
     //   stale: nonce=1, merchant gets 100
     //   latest: nonce=5, merchant gets 800
     let sign_state = |nonce: u64, amount: i128| -> BytesN<64> {
-        let mut msg = Bytes::new(&env);
-        msg.append(&channel_id.to_xdr(&env));
-        msg.append(&amount.to_xdr(&env));
-        msg.append(&nonce.to_xdr(&env));
-        msg.append(&contract_id.to_xdr(&env));
+        // The domain-bound settle digest (channels.rs) is what gets signed.
+        let msg = Bytes::from(
+            PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &amount, &nonce),
+        );
         let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
         let sig = signing_key.sign(&msg_vec);
         BytesN::<64>::from_array(&env, &sig.to_bytes())
@@ -359,11 +355,10 @@ fn test_equal_nonce_replay_rejected() {
     );
 
     // nonce=0 equals settled_nonce initial value of 0 — must be rejected (not strictly greater)
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&500i128.to_xdr(&env));
-    msg.append(&0u64.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &500i128, &0u64),
+    );
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -491,11 +486,10 @@ fn counterparty_can_close_immediately_on_agreement() {
 
     let merchant_amount: i128 = 400;
     let nonce: u64 = 1;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&nonce.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &nonce),
+    );
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -546,11 +540,10 @@ fn close_transfers_correct_balances_to_each_party() {
 
     let merchant_amount: i128 = 300;
     let nonce: u64 = 1;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&nonce.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &nonce),
+    );
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -622,11 +615,10 @@ fn test_cross_contract_signature_replay_rejected() {
     // Sign message bound to contract_a
     let merchant_amount: i128 = 400;
     let nonce: u64 = 1;
-    let mut msg_a = Bytes::new(&env);
-    msg_a.append(&channel_id_a.to_xdr(&env));
-    msg_a.append(&merchant_amount.to_xdr(&env));
-    msg_a.append(&nonce.to_xdr(&env));
-    msg_a.append(&contract_a.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg_a = Bytes::from(
+        PaymentContractClient::new(&env, &contract_a).channel_settle_digest(&channel_id_a, &merchant_amount, &nonce),
+    );
     let msg_vec: alloc::vec::Vec<u8> = msg_a.iter().collect();
     let sig_a = signing_key.sign(&msg_vec);
     let sig_bn_a = BytesN::<64>::from_array(&env, &sig_a.to_bytes());
@@ -676,11 +668,10 @@ fn test_sequence_number_replay_rejected() {
     // Initial sequence_number (nonce) = 0. Attempting to submit nonce = 0 must fail.
     let merchant_amount: i128 = 200;
     let stale_sequence: u64 = 0;
-    let mut msg = Bytes::new(&env);
-    msg.append(&channel_id.to_xdr(&env));
-    msg.append(&merchant_amount.to_xdr(&env));
-    msg.append(&stale_sequence.to_xdr(&env));
-    msg.append(&contract_id.to_xdr(&env));
+    // The domain-bound settle digest (channels.rs) is what gets signed.
+    let msg = Bytes::from(
+        PaymentContractClient::new(&env, &contract_id).channel_settle_digest(&channel_id, &merchant_amount, &stale_sequence),
+    );
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());

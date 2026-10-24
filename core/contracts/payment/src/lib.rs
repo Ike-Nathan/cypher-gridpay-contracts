@@ -13,6 +13,13 @@ use soroban_sdk::{
 pub mod storage;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
+mod archival;
+pub mod channels;
+mod finality;
+mod reconciliation;
+pub use channels::DomainSeparator;
+pub use archival::{ArchivalConfig, CompactArchivedPayment};
+pub use finality::{FinalityFlag, FinalityRiskConfig};
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -51,6 +58,7 @@ pub enum ConfigKey {
     PauseStateKey,
     MinSplitAmount,
     SchemaVersion,
+    /// Legacy (schema < 3): the whole whitelist as one instance `Vec`.
     AllowedTokens,
     MaxForwardDepth,
     RelayerStipendBps,
@@ -594,7 +602,7 @@ pub struct PayoutSchedule {
     pub accumulated: i128,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum PaymentStatus {
     Pending,
@@ -2091,6 +2099,25 @@ pub struct PaymentInvoice {
     pub issued_at: u64,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Records
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most records `migrate_schema_step` migrates per call, keeping a step well
+/// inside Soroban's CPU-instruction and write-entry limits.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct PaymentContract;
 
@@ -2213,6 +2240,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
@@ -2225,6 +2253,321 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::SchemaVersion), &target_version);
+        Ok(())
+    }
+
+    /// Runs the data transformations registered for every schema version step
+    /// between `from_version` (exclusive) and `to_version` (inclusive).
+    ///
+    /// # Arguments
+    /// * `from_version` - The currently stored schema version.
+    /// * `to_version` - The requested schema version.
+    ///
+    /// # Returns
+    /// `Ok(())` when all steps completed, or `SchemaMigrationFailed` if any
+    /// entry could not be transformed (in which case the caller reverts).
+    fn run_data_migrations(env: &Env, from_version: u32, to_version: u32) -> Result<(), Error> {
+        let mut version = from_version;
+        while version < to_version {
+            let next_version = version + 1;
+            // v2: every stored payment must be reachable through the customer
+            // index, the merchant index and the paged merchant index. Versions
+            // without a registered data transformation are no-ops.
+            if next_version == 2 {
+                Self::migrate_v1_to_v2(env)?;
+            }
+            // v3: the token whitelist moves from one instance `Vec` to
+            // sharded persistent entries.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
+            version = next_version;
+        }
+        Ok(())
+    }
+
+    /// v1 -> v2 data migration: backfills the per-customer and per-merchant
+    /// payment indexes for payments stored before those indexes existed.
+    ///
+    /// # Returns
+    /// `Ok(())` when every payment in `1..=PaymentKey::Counter` could be read
+    /// and indexed, otherwise `SchemaMigrationFailed`.
+    /// v2 -> v3: moves the legacy instance whitelist into sharded persistent
+    /// storage. Idempotent; a contract that never had a whitelist is a no-op.
+    fn migrate_v2_to_v3(env: &Env) {
+        let legacy: Option<Vec<Address>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens));
+        if let Some(tokens) = legacy {
+            Self::store_allowed_tokens(env, &tokens);
+        }
+    }
+
+    fn migrate_v1_to_v2(env: &Env) -> Result<(), Error> {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Counter))
+            .unwrap_or(0);
+
+        for payment_id in 1..=counter {
+            Self::migrate_payment_v1_to_v2(env, payment_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// v1 -> v2 for one payment: index it for its customer and merchant.
+    /// Idempotent (the index helpers skip ids already present).
+    fn migrate_payment_v1_to_v2(env: &Env, payment_id: u64) -> Result<(), Error> {
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the indexed party must agree.
+        if payment.id != payment_id {
+            return Err(Error::Basic(BasicError::SchemaMigrationFailed));
+        }
+
+        Self::index_payment_for_customer(env, &payment.customer, payment_id);
+        Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
+        Ok(())
+    }
+
+    /// Appends `payment_id` to the customer's payment index when missing.
+    fn index_payment_for_customer(env: &Env, customer: &Address, payment_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        if Self::index_contains(
+            env,
+            count,
+            |index| DataKey::Customer(CustomerDataKey::Payments(customer.clone(), index)),
+            payment_id,
+        ) {
+            return;
+        }
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::Payments(customer.clone(), count)),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::PaymentCount(customer.clone())),
+            &(count + 1),
+        );
+    }
+
+    /// Appends `payment_id` to the merchant's flat and paged payment indexes
+    /// when missing.
+    fn index_payment_for_merchant(env: &Env, merchant: &Address, payment_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        if !Self::index_contains(
+            env,
+            count,
+            |index| DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), index)),
+            payment_id,
+        ) {
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), count)),
+                &payment_id,
+            );
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
+                &(count + 1),
+            );
+        }
+        Self::index_payment_in_merchant_page(env, merchant, payment_id);
+    }
+
+    /// Number of payment ids stored per paged merchant index page.
+    const MERCHANT_PAYMENT_PAGE_SIZE: u64 = 100;
+
+    /// Appends `payment_id` to the merchant's paged payment index, starting a
+    /// new page when the current one is full.
+    fn index_payment_in_merchant_page(env: &Env, merchant: &Address, payment_id: u64) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let last_page = if total == 0 {
+            0
+        } else {
+            (total - 1) / Self::MERCHANT_PAYMENT_PAGE_SIZE
+        };
+        let mut page: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                merchant.clone(),
+                last_page,
+            )))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..page.len() {
+            if page.get(i) == Some(payment_id) {
+                return;
+            }
+        }
+
+        if page.len() as u64 >= Self::MERCHANT_PAYMENT_PAGE_SIZE {
+            page = Vec::new(env);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    last_page + 1,
+                )),
+                &page,
+            );
+        }
+        page.push_back(payment_id);
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                merchant.clone(),
+                last_page,
+            )),
+            &page,
+        );
+    }
+
+    /// Returns `true` when `payment_id` is already stored in one of the `count`
+    /// slots addressed by `key_at`.
+    fn index_contains<F>(env: &Env, count: u64, key_at: F, payment_id: u64) -> bool
+    where
+        F: Fn(u64) -> DataKey,
+    {
+        if count == 0 {
+            return false;
+        }
+        // Healthy indexes are append-only, so the newest slot is checked first.
+        for index in (0..count).rev() {
+            if env.storage().instance().get::<DataKey, u64>(&key_at(index)) == Some(payment_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of records at
+    /// a time, so contracts with many records stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over payment
+    /// ids `1..=payment counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` records
+    /// (capped at [`MAX_MIGRATION_BATCH`]) and advances the cursor. When the
+    /// cursor passes the last record, the non-record steps run, the schema
+    /// version is written and the guard is lifted. Every per-record step is
+    /// idempotent, so retrying a batch is safe. Read-only queries keep working
+    /// throughout.
+    ///
+    /// # Errors
+    /// `NotAnAdmin`, `SchemaAlreadyAtTarget` (nothing to migrate),
+    /// `InvalidMigrationBatch` for a batch size of 0, `SchemaMigrationFailed`
+    /// for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if batch_size == 0 {
+            return Err(Error::Basic(BasicError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Payment(PaymentKey::Counter))
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(ConfigKey::MigrationInProgress), &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for payment_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                Self::migrate_payment_v1_to_v2(&env, payment_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            // Steps that are not per record.
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::SchemaVersion), &cursor.to_version);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Config(ConfigKey::MigrationInProgress));
+        }
+        storage::set_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor), &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor))
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Config(ConfigKey::MigrationInProgress))
+            .unwrap_or(false)
+        {
+            return Err(Error::Basic(BasicError::MigrationInProgress));
+        }
         Ok(())
     }
 
@@ -5872,16 +6215,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let mut tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let mut tokens = Self::load_allowed_tokens(&env);
         if !tokens.contains(&token) {
             tokens.push_back(token);
-            env.storage()
-                .instance()
-                .set(&DataKey::Config(ConfigKey::AllowedTokens), &tokens);
+            Self::store_allowed_tokens(&env, &tokens);
         }
 
         Ok(())
@@ -5907,20 +6244,14 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let tokens = Self::load_allowed_tokens(&env);
         let mut updated = Vec::new(&env);
         for entry in tokens.iter() {
             if entry != token {
                 updated.push_back(entry);
             }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::AllowedTokens), &updated);
+        Self::store_allowed_tokens(&env, &updated);
 
         Ok(())
     }
@@ -5936,10 +6267,39 @@ impl PaymentContract {
     /// # Returns
     /// A `Vec<Address>` of allowed token addresses. Returns an empty vector if none are configured.
     pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        Self::load_allowed_tokens(&env)
+    }
+
+    /// The token whitelist. It lives in persistent shards
+    /// (`TokenWhitelistShard`) with only its length in instance storage, so
+    /// a long whitelist does not inflate every invocation. A contract not yet
+    /// migrated to schema 3 still has it under the legacy instance key.
+    fn load_allowed_tokens(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+        )
+        .or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::Config(ConfigKey::AllowedTokens))
+        })
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Writes the token whitelist in sharded form and drops the legacy
+    /// instance copy.
+    fn store_allowed_tokens(env: &Env, tokens: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+            tokens,
+        );
         env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env))
+            .remove(&DataKey::Config(ConfigKey::AllowedTokens));
     }
 
     // Mirrors the refund contract's token-registry bypass (Issue #191): an
@@ -5947,11 +6307,7 @@ impl PaymentContract {
     // tokens are permitted until an admin opts in by calling
     // `add_allowed_token`.
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(env));
+        let tokens = Self::load_allowed_tokens(env);
         tokens.is_empty() || tokens.contains(token)
     }
 
@@ -8771,6 +9127,7 @@ impl PaymentContract {
             PaymentContract::risk_surcharge_bps(&env, &customer, amount, &currency);
         let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
         let fee = PaymentContract::compute_fee_amount(
+            &env,
             amount,
             effective_bps,
             &record.fee_tier,
@@ -9036,6 +9393,7 @@ impl PaymentContract {
             PaymentContract::risk_surcharge_bps(env, customer, amount, &currency);
         let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
         let fee = PaymentContract::compute_fee_amount(
+            env,
             amount,
             effective_bps,
             &record.fee_tier,
@@ -9102,6 +9460,7 @@ impl PaymentContract {
     /// Computes the fee amount applying the tier discount, adding the
     /// risk-based surcharge, then clamping to min/max.
     fn compute_fee_amount(
+        env: &Env,
         amount: i128,
         fee_bps: u32,
         tier: &FeeTier,
@@ -11661,6 +12020,7 @@ impl PaymentContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()
@@ -12629,6 +12989,26 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the channel is not found, closed, expired, nonce is stale,
     /// amount exceeds deposit, or signature verification fails.
+    /// The signing domain of this contract on the current network
+    /// (see `channels.rs`). Read-only.
+    pub fn get_domain_separator(env: Env) -> DomainSeparator {
+        DomainSeparator::current(&env)
+    }
+
+    /// The 32-byte digest a customer signs to authorize
+    /// `settle_channel(channel_id, merchant_amount, nonce)` on this contract
+    /// and network. Read-only; lets integrators check their own encoding.
+    pub fn channel_settle_digest(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+    ) -> BytesN<32> {
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::signing_digest(&env, channels::ACTION_CHANNEL_SETTLE, &struct_hash)
+    }
+
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -12663,16 +13043,20 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
-        // Issue #113: Verify signature over (channel_id, merchant_amount, nonce, contract_address)
-        // Including the contract address prevents cross-channel replay attacks.
-        let mut msg = Bytes::new(&env);
-        msg.append(&channel_id.to_xdr(&env));
-        msg.append(&merchant_amount.to_xdr(&env));
-        msg.append(&nonce.to_xdr(&env));
-        msg.append(&env.current_contract_address().to_xdr(&env));
-
-        env.crypto()
-            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+        // The customer signs the domain-separated digest of (channel_id,
+        // merchant_amount, nonce): bound to this network, this contract and
+        // the settle_channel action, so it can't be replayed on another
+        // network, another deployment or another entry point (see
+        // channels.rs and SECURITY.md for the byte layout).
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::verify_domain_signature(
+            &env,
+            &channel.customer_pk,
+            channels::ACTION_CHANNEL_SETTLE,
+            &struct_hash,
+            &signature,
+        );
 
         let customer_refund = channel.deposited - merchant_amount;
 
@@ -13456,6 +13840,16 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the caller is not an admin, the sweep recipient
     /// is not set, the fee config is missing, or there are no fees to sweep.
+    pub fn sweep_platform_fees(env: Env, admin: Address) -> Result<i128, Error> {
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+            .unwrap_or(0);
+        let amount = if accumulated > 0 { accumulated } else { 0 };
+        Self::sweep_fees(env, admin, amount)
+    }
+
     /// Sweeps up to `sweep_amount` of accumulated platform fees to the configured recipient.
     ///
     /// # Arguments
@@ -13493,25 +13887,17 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::NothingToSweep));
         }
 
-        // Issue #111: Mathematical assertion — sweep amount must never exceed accumulated fees.
-        let sweep_amount: i128 = accumulated;
-        assert!(
-            sweep_amount <= accumulated,
-            "sweep_amount ({}) exceeds accumulated_fees ({})",
-            sweep_amount,
-            accumulated
-        );
+        // Issue #111: the swept amount must be positive and never exceed the
+        // accumulated fees, so a sweep can't dip into merchant settlements.
+        if sweep_amount <= 0 || sweep_amount > accumulated {
+            return Err(Error::Feature(FeatureError::InsufficientFees));
+        }
 
-        // Issue #111: Require multisig approval for sweeps exceeding the threshold.
-        let sweep_threshold: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::LargePaymentThreshold))
-            .unwrap_or(0);
-        if sweep_threshold > 0 && sweep_amount > sweep_threshold {
-            if config.required_signatures > 1 {
-                return Err(Error::Basic(BasicError::InsufficientAdmins));
-            }
+        // Issue #111: sweeps above the large-payment threshold need multisig.
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        let multisig_threshold = if threshold > 0 { threshold } else { 1_000_000 };
+        if sweep_amount > multisig_threshold && config.required_signatures > 1 {
+            return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
         let fee_config: FeeConfig = env
@@ -13523,6 +13909,7 @@ impl PaymentContract {
         // Security check: Ensure sweep won't encroach on merchant pending settlements
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
+        let remaining = accumulated - sweep_amount;
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::AccumulatedFees), &remaining);
@@ -14694,6 +15081,8 @@ mod test_metadata;
 
 #[cfg(test)]
 mod test_payment_channel;
+#[cfg(test)]
+mod test_replay_prevention;
 
 #[cfg(test)]
 mod test_private_payment;
@@ -14749,6 +15138,12 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_storage_keys;
+
+#[cfg(test)]
+mod test_storage_ttl;
 
 #[cfg(test)]
 mod test_completion_fee_parity;

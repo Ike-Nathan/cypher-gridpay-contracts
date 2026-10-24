@@ -116,6 +116,7 @@ pub enum DataKey {
 pub enum ArbitrationKey {
     ArbitrationCase(u64),
     ArbitrationCounter,
+    /// Legacy (schema < 3): every arbitrator in one instance `Vec`.
     ArbitratorList,
     ArbitratorsVoted(u64),
     ArbitratorVote(u64, Address),
@@ -123,6 +124,7 @@ pub enum ArbitrationKey {
     AccumulatedTreasuryFees,
     ArbitrationStakeConfig,
     ArbitrationStake(u64),
+    /// Persistent (instance before schema 3): one per registered arbitrator.
     ArbitratorReputation(Address),
     ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
@@ -134,6 +136,14 @@ pub enum ArbitrationKey {
     // Uniqueness guard: maps refund_id -> case_id so the same refund
     // cannot be escalated into multiple parallel arbitration cases.
     CaseByRefund(u64),
+    /// Persistent shard `i` of the arbitrator registry (schema 3+).
+    ArbitratorShard(u32),
+    /// Instance: number of registered arbitrators (schema 3+).
+    ArbitratorCount,
+    /// Persistent shard `i` of the senior arbitrator list (schema 3+).
+    SeniorArbitratorShard(u32),
+    /// Instance: number of senior arbitrators (schema 3+).
+    SeniorArbitratorCount,
     // Time-decay settings for inactive arbitrators' reputation scores
     ReputationDecayConfig,
     // Participation stake deposited by an arbitrator (slashable by admin)
@@ -264,8 +274,11 @@ pub enum VoucherKey {
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum TokenKey {
+    /// Persistent (schema 3+; instance before): one entry per token.
     SupportedToken(Address),
+    /// Instance: number of registered tokens.
     TokenCount,
+    /// Persistent (schema 3+; instance before): the token at index `i`.
     TokenByIndex(u64),
 }
 
@@ -620,17 +633,19 @@ pub struct RefundDeniedEvent {
     pub rejection_reason: String,
 }
 
+/// Emitted when a denied/appealed refund is escalated to the orchestrator's
+/// supreme council (#294). (Event names are limited to 32 characters.)
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AppealEscalatedToSupremeCouncilEvent {
+pub struct SupremeEscalationEvent {
     pub refund_id: u64,
     pub appellant: Address,
     pub amount: i128,
     pub escalated_at: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppealFiledEvent {
     pub appeal_id: u64,
     pub refund_id: u64,
@@ -1970,6 +1985,24 @@ pub struct MigrationReport {
     pub dry_run: bool,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Refunds
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most refunds `migrate_schema_step` migrates per call.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct RefundContract;
 
@@ -2072,6 +2105,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
@@ -2122,6 +2156,111 @@ impl RefundContract {
         }
     }
 
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of refunds at a
+    /// time, so contracts with many refunds stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over refund ids
+    /// `1..=refund counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` refunds
+    /// (capped at [`MAX_MIGRATION_BATCH`]). After the last one, the non-record
+    /// steps run, the schema version is written and the guard is lifted. Every
+    /// step is idempotent, so retrying a batch is safe; read-only queries keep
+    /// working throughout.
+    ///
+    /// # Errors
+    /// `Unauthorized`, `SchemaAlreadyAtTarget`, `InvalidMigrationBatch` for a
+    /// batch size of 0, `SchemaMigrationFailed` for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if batch_size == 0 {
+            return Err(Error::Ext(ExtError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::RefundCounter)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::MigrationInProgress, &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for refund_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                // Legacy records first: the v2 step reads them as `Refund`.
+                Self::migrate_legacy_refund(&env, refund_id)?;
+                Self::migrate_refund_v1_to_v2(&env, refund_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&SystemKey::SchemaVersion, &cursor.to_version);
+            env.storage().instance().remove(&SystemKey::MigrationInProgress);
+        }
+        storage::set_persistent(&env, &SystemKey::MigrationCursor, &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &SystemKey::MigrationCursor)
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&SystemKey::MigrationInProgress)
+            .unwrap_or(false)
+        {
+            return Err(Error::Ext(ExtError::MigrationInProgress));
+        }
+        Ok(())
+    }
+
     /// Runs the data transformations registered for every schema version step
     /// between `from_version` (exclusive) and `to_version` (inclusive).
     ///
@@ -2147,6 +2286,11 @@ impl RefundContract {
                 Self::migrate_legacy_refunds(env)?;
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: arbitrator lists and supported-token entries move from
+            // instance to persistent storage.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
@@ -2166,43 +2310,50 @@ impl RefundContract {
             .unwrap_or(0);
 
         for refund_id in 1..=counter {
-            let refund: Refund = env
-                .storage()
-                .instance()
-                .get(&DataKey::Refund(refund_id))
-                .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
-
-            // Corrupted record: the id and the stored record must agree.
-            if refund.id != refund_id {
-                return Err(Error::Ext(ExtError::SchemaMigrationFailed));
-            }
-
-            // Status index membership (RefundsByStatus / RefundStatusIndex).
-            if !env
-                .storage()
-                .instance()
-                .has(&DataKey::RefundStatusIndex(refund_id))
-            {
-                Self::add_to_status_index(env, refund.status.clone(), refund_id);
-            }
-
-            // Rejection bookkeeping used by the appeal window checks.
-            if refund.status == RefundStatus::Rejected
-                && !env
-                    .storage()
-                    .instance()
-                    .has(&SystemKey::RefundRejectedAt(refund_id))
-            {
-                let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
-                env.storage()
-                    .instance()
-                    .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
-            }
-
-            // Per-customer history index.
-            Self::index_refund_for_customer(env, &refund.customer, refund_id);
+            Self::migrate_refund_v1_to_v2(env, refund_id)?;
         }
 
+        Ok(())
+    }
+
+    /// v1 -> v2 for one refund: status index, rejection timestamp, customer
+    /// history. Idempotent.
+    fn migrate_refund_v1_to_v2(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the stored record must agree.
+        if refund.id != refund_id {
+            return Err(Error::Ext(ExtError::SchemaMigrationFailed));
+        }
+
+        // Status index membership (RefundsByStatus / RefundStatusIndex).
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::RefundStatusIndex(refund_id))
+        {
+            Self::add_to_status_index(env, refund.status.clone(), refund_id);
+        }
+
+        // Rejection bookkeeping used by the appeal window checks.
+        if refund.status == RefundStatus::Rejected
+            && !env
+                .storage()
+                .instance()
+                .has(&SystemKey::RefundRejectedAt(refund_id))
+        {
+            let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
+            env.storage()
+                .instance()
+                .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
+        }
+
+        // Per-customer history index.
+        Self::index_refund_for_customer(env, &refund.customer, refund_id);
         Ok(())
     }
 
@@ -2433,10 +2584,7 @@ impl RefundContract {
             .get(&TokenKey::TokenCount)
             .unwrap_or(0);
         if token_count > 0 {
-            let supported: Option<SupportedRefundToken> = env
-                .storage()
-                .instance()
-                .get(&TokenKey::SupportedToken(token.clone()));
+            let supported: Option<SupportedRefundToken> = Self::load_supported_token(&env, &token);
             match supported {
                 Some(t) if t.active => {}
                 _ => return Err(Error::Ext(ExtError::UnsupportedRefundToken)),
@@ -3016,9 +3164,11 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
         refund.status = RefundStatus::EscalatedToSupremeCouncil;
-        Self::save_refund(&env, &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
 
-        (AppealEscalatedToSupremeCouncilEvent {
+        (SupremeEscalationEvent {
             refund_id,
             appellant,
             amount: refund.amount,
@@ -3694,18 +3844,12 @@ impl RefundContract {
         if admin != stored_admin {
             return Err(Error::Core(CoreError::Unauthorized));
         }
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_arbitrators(&env);
         if list.contains(&arbitrator) {
             return Err(Error::Core(CoreError::Unauthorized));
         }
         list.push_back(arbitrator.clone());
-        env.storage()
-            .instance()
-            .set(&ArbitrationKey::ArbitratorList, &list);
+        Self::store_arbitrators(&env, &list);
 
         // Initialize reputation for new arbitrator
         let reputation = ArbitratorReputation {
@@ -3717,10 +3861,7 @@ impl RefundContract {
             score: 100, // Starting score
             last_active: env.ledger().timestamp(),
         };
-        env.storage().instance().set(
-            &ArbitrationKey::ArbitratorReputation(arbitrator),
-            &reputation,
-        );
+        Self::store_reputation(&env, &arbitrator, &reputation);
 
         Ok(())
     }
@@ -3775,11 +3916,7 @@ impl RefundContract {
             }
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -3866,11 +4003,7 @@ impl RefundContract {
             .unwrap_or(0);
         let case_id = counter + 1;
 
-        let arbitrators = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::load_arbitrators(&env);
         if arbitrators.len() < 3 {
             return Err(Error::Core(CoreError::QuorumNotReached));
         }
@@ -4280,10 +4413,7 @@ impl RefundContract {
             };
 
             // Get current reputation
-            let mut reputation: ArbitratorReputation = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(voter.clone()))
+            let mut reputation: ArbitratorReputation = Self::load_reputation(&env, &voter)
                 .unwrap_or(ArbitratorReputation {
                     arbitrator: voter.clone(),
                     total_cases: 0,
@@ -4325,10 +4455,7 @@ impl RefundContract {
             reputation.last_active = current_time;
 
             // Store updated reputation
-            env.storage().instance().set(
-                &ArbitrationKey::ArbitratorReputation(voter.clone()),
-                &reputation,
-            );
+            Self::store_reputation(&env, &voter, &reputation);
 
             // Emit score update event
             ArbitratorScoreUpdated {
@@ -4835,9 +4962,7 @@ impl RefundContract {
         env: Env,
         arbitrator: Address,
     ) -> Option<ArbitratorReputation> {
-        env.storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorReputation(arbitrator))
+        Self::load_reputation(&env, &arbitrator)
             .map(|rep| Self::decayed_reputation(&env, rep))
     }
 
@@ -4932,11 +5057,7 @@ impl RefundContract {
         let mut results = Vec::new(&env);
 
         // Get all arbitrators from the arbitrator list
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.len() == 0 {
             return results;
@@ -4945,12 +5066,7 @@ impl RefundContract {
         // Collect all reputations
         let mut reputations = Vec::new(&env);
         for arbitrator in arbitrators.iter() {
-            if let Some(reputation) = env
-                .storage()
-                .instance()
-                .get::<ArbitrationKey, ArbitratorReputation>(&ArbitrationKey::ArbitratorReputation(
-                    arbitrator.clone(),
-                ))
+            if let Some(reputation) = Self::load_reputation(&env, &arbitrator)
             {
                 // Rank by decayed score so long-inactive arbitrators drop.
                 reputations.push_back(Self::decayed_reputation(&env, reputation));
@@ -5006,20 +5122,13 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::InvalidScoreThreshold));
         }
 
-        let mut arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let mut removed_count: u32 = 0;
         let mut new_arbitrators = Vec::new(&env);
 
         for arbitrator in arbitrators.iter() {
-            let reputation: Option<ArbitratorReputation> = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+            let reputation: Option<ArbitratorReputation> = Self::load_reputation(&env, &arbitrator);
 
             let should_remove = if let Some(rep) = reputation {
                 Self::decayed_reputation(&env, rep).score < min_score
@@ -5029,9 +5138,7 @@ impl RefundContract {
 
             if should_remove {
                 // Remove reputation data
-                env.storage()
-                    .instance()
-                    .remove(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+                Self::remove_reputation(&env, &arbitrator);
 
                 // Emit deregistration event
                 ArbitratorDeregistered {
@@ -5637,6 +5744,44 @@ impl RefundContract {
         Ok(accumulated)
     }
 
+    /// Sweep every accumulated protocol fee in `token` to `recipient`.
+    ///
+    /// Same as [`withdraw_protocol_fees`](Self::withdraw_protocol_fees),
+    /// except that nothing accumulated is not an error: it returns `0` and
+    /// transfers nothing, so a caller harvesting several contracts can skip an
+    /// empty one without reverting the rest.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn sweep_protocol_fees(
+        env: Env,
+        admin: Address,
+        token: Address,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        let key = ConfigKey::AccumulatedFees(token.clone());
+        let accumulated: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if accumulated <= 0 {
+            return Ok(0);
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &accumulated,
+        );
+        Ok(accumulated)
+    }
+
     fn mark_arbitration_award(env: &Env, refund_id: u64) {
         env.storage()
             .instance()
@@ -6001,11 +6146,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -6300,7 +6441,7 @@ impl RefundContract {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
-                        RefundStatus::PendingAppeal => {
+                        RefundStatus::PendingAppeal | RefundStatus::EscalatedToSupremeCouncil => {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
@@ -7884,7 +8025,9 @@ impl RefundContract {
             };
             let active = match refund.status {
                 RefundStatus::Requested => refund.expires_at.is_none_or(|exp| now < exp),
-                RefundStatus::Approved | RefundStatus::PendingAppeal => true,
+                RefundStatus::Approved
+                | RefundStatus::PendingAppeal
+                | RefundStatus::EscalatedToSupremeCouncil => true,
                 RefundStatus::Rejected
                 | RefundStatus::PermanentlyDenied
                 | RefundStatus::Processed => false,
@@ -8234,6 +8377,119 @@ impl RefundContract {
         Ok(())
     }
 
+    /// The arbitrator registry, kept in persistent shards with only its
+    /// length in instance storage; falls back to the legacy instance list on
+    /// a contract not yet migrated to schema 3.
+    fn load_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(env, &ArbitrationKey::ArbitratorCount, ArbitrationKey::ArbitratorShard)
+            .or_else(|| env.storage().instance().get(&ArbitrationKey::ArbitratorList))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// An arbitrator's reputation record: persistent, one per registered
+    /// arbitrator (legacy instance before schema 3).
+    fn load_reputation(env: &Env, arbitrator: &Address) -> Option<ArbitratorReputation> {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_reputation(env: &Env, arbitrator: &Address, reputation: &ArbitratorReputation) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::set_persistent(env, &key, reputation);
+        env.storage().instance().remove(&key);
+    }
+
+    fn remove_reputation(env: &Env, arbitrator: &Address) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        env.storage().persistent().remove(&key);
+        env.storage().instance().remove(&key);
+    }
+
+    fn store_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::ArbitratorCount,
+            ArbitrationKey::ArbitratorShard,
+            list,
+        );
+        env.storage().instance().remove(&ArbitrationKey::ArbitratorList);
+    }
+
+    fn load_senior_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+        )
+        .or_else(|| env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList))
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_senior_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+            list,
+        );
+        env.storage()
+            .instance()
+            .remove(&ArbitrationKey::SeniorArbitratorList);
+    }
+
+    /// A supported refund token's entry (persistent; legacy instance before
+    /// schema 3).
+    fn load_supported_token(env: &Env, token: &Address) -> Option<SupportedRefundToken> {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_supported_token(env: &Env, token: &Address, entry: &SupportedRefundToken) {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::set_persistent(env, &key, entry);
+        env.storage().instance().remove(&key);
+    }
+
+    fn load_token_by_index(env: &Env, index: u64) -> Option<Address> {
+        let key = TokenKey::TokenByIndex(index);
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_token_by_index(env: &Env, index: u64, token: &Address) {
+        let key = TokenKey::TokenByIndex(index);
+        storage::set_persistent(env, &key, token);
+        env.storage().instance().remove(&key);
+    }
+
+    /// v2 -> v3: moves the arbitrator lists and supported-token entries out
+    /// of instance storage. Idempotent.
+    fn migrate_v2_to_v3(env: &Env) {
+        let arbitrators: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::ArbitratorList);
+        if let Some(list) = arbitrators {
+            Self::store_arbitrators(env, &list);
+        }
+        for arbitrator in Self::load_arbitrators(env).iter() {
+            if let Some(reputation) = Self::load_reputation(env, &arbitrator) {
+                Self::store_reputation(env, &arbitrator, &reputation);
+            }
+        }
+        let seniors: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList);
+        if let Some(list) = seniors {
+            Self::store_senior_arbitrators(env, &list);
+        }
+        let count: u64 = env.storage().instance().get(&TokenKey::TokenCount).unwrap_or(0);
+        for index in 0..count {
+            if let Some(token) = Self::load_token_by_index(env, index) {
+                Self::store_token_by_index(env, index, &token);
+                if let Some(entry) = Self::load_supported_token(env, &token) {
+                    Self::store_supported_token(env, &token, &entry);
+                }
+            }
+        }
+    }
+
     fn process_refund_internal(
         env: &Env,
         processed_by: Address,
@@ -8418,21 +8674,27 @@ impl RefundContract {
             .get(&DataKey::RefundCounter)
             .unwrap_or(0);
         for refund_id in 1..=counter {
-            let key = DataKey::Refund(refund_id);
-            // Read as a raw field map: decoding a legacy record directly as
-            // `Refund` traps in the host on the field-count mismatch.
-            let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
-                Some(fields) => fields,
-                None => continue,
-            };
-            if fields.contains_key(Symbol::new(env, "reason_code")) {
-                continue;
-            }
-            let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
-                .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
-            let refund = legacy.into_refund(RefundReasonCode::Other);
-            env.storage().instance().set(&key, &refund);
+            Self::migrate_legacy_refund(env, refund_id)?;
         }
+        Ok(())
+    }
+
+    /// Rewrites one refund stored before `reason_code` existed. Idempotent.
+    fn migrate_legacy_refund(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let key = DataKey::Refund(refund_id);
+        // Read as a raw field map: decoding a legacy record directly as
+        // `Refund` traps in the host on the field-count mismatch.
+        let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
+            Some(fields) => fields,
+            None => return Ok(()),
+        };
+        if fields.contains_key(Symbol::new(env, "reason_code")) {
+            return Ok(());
+        }
+        let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
+            .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
+        let refund = legacy.into_refund(RefundReasonCode::Other);
+        env.storage().instance().set(&key, &refund);
         Ok(())
     }
 
@@ -8857,6 +9119,7 @@ impl RefundContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()
@@ -10722,11 +10985,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -10766,11 +11025,7 @@ impl RefundContract {
             .get(&RefundExtKey::AssignmentConfig)
             .ok_or(Error::Core(CoreError::PolicyNotFound))?;
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -10824,11 +11079,7 @@ impl RefundContract {
             None => return Vec::new(&env),
         };
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let total = arbitrators.len() as u32;
         if total == 0 || count == 0 {
@@ -11155,21 +11406,15 @@ impl RefundContract {
             token: token.clone(),
             active: true,
         };
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token.clone()), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         let already_indexed = (0..count).any(|i| {
-            env.storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            Self::load_token_by_index(&env, i)
                 .map(|t| t == token)
                 .unwrap_or(false)
         });
         if !already_indexed {
-            env.storage()
-                .instance()
-                .set(&TokenKey::TokenByIndex(count), &token);
+            Self::store_token_by_index(&env, count, &token);
             env.storage()
                 .instance()
                 .set(&TokenKey::TokenCount, &(count + 1));
@@ -11200,16 +11445,11 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut entry: SupportedRefundToken = env
-            .storage()
-            .instance()
-            .get(&TokenKey::SupportedToken(token.clone()))
+        let mut entry: SupportedRefundToken = Self::load_supported_token(&env, &token)
             .ok_or(Error::Core(CoreError::RefundNotFound))?;
 
         entry.active = false;
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         Ok(())
     }
@@ -11227,15 +11467,9 @@ impl RefundContract {
         let mut results = Vec::new(&env);
         let mut i = 0u64;
         while i < count {
-            if let Some(token) = env
-                .storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            if let Some(token) = Self::load_token_by_index(&env, i)
             {
-                if let Some(entry) = env
-                    .storage()
-                    .instance()
-                    .get::<_, SupportedRefundToken>(&TokenKey::SupportedToken(token))
+                if let Some(entry) = Self::load_supported_token(&env, &token)
                 {
                     results.push_back(entry);
                 }
@@ -11615,16 +11849,10 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_senior_arbitrators(&env);
         if !list.contains(&arbitrator) {
             list.push_back(arbitrator);
-            env.storage()
-                .instance()
-                .set(&ArbitrationKey::SeniorArbitratorList, &list);
+            Self::store_senior_arbitrators(&env, &list);
         }
         Ok(())
     }
@@ -11704,11 +11932,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::CaseNotTimedOut));
         }
 
-        let senior_list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let senior_list: Vec<Address> = Self::load_senior_arbitrators(&env);
 
         if senior_list.len() == 0 {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -12361,3 +12585,6 @@ mod test_admin_rotation;
 
 #[cfg(test)]
 mod test_refund_events;
+
+#[cfg(test)]
+mod test_storage_ttl;
