@@ -55,7 +55,8 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `file_appeal()` — Customer files an appeal against a rejected refund.
 - `resolve_appeal()` — Admin resolves an appeal (uphold or deny).
 - `get_appeal()` — Retrieves an appeal by its ID.
-- `get_appeals_by_customer()` — Returns all appeals filed by a specific customer.
+- `get_appeals_by_customer(customer, limit, offset)` — Returns a page of appeals filed by a customer (max 100 per page).
+- `get_appeal_count_by_customer()` — Total number of appeals filed by a customer.
 
 ### Auto-Refund Triggers
 
@@ -137,7 +138,7 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `get_refund_count_by_status()` — Gets the count of refunds in a given status.
 - `get_merchant_refunds()` — Paginated refunds for a specific merchant.
 - `get_merchant_refunds_by_status()` — Paginated refunds for a merchant filtered by status.
-- `get_merchant_pending_refunds()` — All pending refunds for a merchant.
+- `get_merchant_pending_refunds()` — Paginated pending refunds for a merchant (max 100 per page).
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
 - `get_reason_code_analytics(window_start, window_end)` — Counts refunds by reason code within the given ledger-timestamp window, sorted by frequency. Cached per window and invalidated only when a refund inside that window is processed.
@@ -252,7 +253,7 @@ read-only helper returning `true` only while tripped and still within cooldown.
 
 ### Customer History
 
-- `get_customer_refund_history()` — Paginated refund history for a customer.
+- `get_customer_refund_history(customer, limit, offset)` — Paginated refund history for a customer, newest first (max 100 per page).
 - `get_customer_refund_count_public()` — Total count of refunds for a customer.
 - `get_customer_refund_summary()` — Summary stats for a customer's refunds.
 
@@ -359,7 +360,8 @@ to request again.
 - `issue_refund_voucher()` — Admin issues a refund credit voucher for an approved refund.
 - `redeem_refund_voucher()` — Customer redeems a refund voucher against a future payment.
 - `get_voucher()` — Gets a refund voucher by ID.
-- `get_customer_vouchers()` — Gets all refund vouchers issued to a customer.
+- `get_customer_vouchers(customer, limit, offset)` — Gets a page of refund vouchers issued to a customer (max 100 per page).
+- `get_customer_voucher_count()` — Total number of vouchers issued to a customer.
 
 #### Voucher expiry and value handling
 
@@ -473,9 +475,9 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 
 | Event             | Topic Name        | Payload Fields                                                             | Fires When                                                           |
 | ----------------- | ----------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `RefundRequested` | `RefundRequested` | `refund_id`, `payment_id`, `merchant`, `customer`, `amount`, `token`       | `request_refund()` creates refund in `Requested` status              |
-| `RefundApproved`  | `RefundApproved`  | `refund_id`, `payment_id`, `amount`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
-| `RefundRejected`  | `RefundRejected`  | `refund_id`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
+| `RefundRequestedEvent` | `refund_requested_event` | `refund_id`, `payment_id`, `customer`, `merchant`, `amount`, `token`, `reason_code`, `requested_at`       | `request_refund()` creates refund in `Requested` status              |
+| `RefundApprovedEvent`  | `refund_approved_event`  | `refund_id`, `payment_id`, `customer`, `merchant`, `amount`, `reason_code`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
+| `RefundDeniedEvent`    | `refund_denied_event`    | `refund_id`, `customer`, `merchant`, `amount`, `reason_code`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
 | `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |
 
 ### Auto-Refund Trigger Events
@@ -489,7 +491,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 
 | Event            | Topic Name       | Payload Fields                        | Fires When                                                  |
 | ---------------- | ---------------- | ------------------------------------- | ----------------------------------------------------------- |
-| `AppealFiled`    | `AppealFiled`    | `appeal_id`, `refund_id`, `appellant` | `file_appeal()` customer files appeal against rejection     |
+| `AppealFiledEvent`    | `appeal_filed_event`    | `appeal_id`, `refund_id`, `customer`, `merchant`, `appellant`, `reason_code`, `filed_at` | `file_appeal()` customer files appeal against rejection     |
 | `AppealResolved` | `AppealResolved` | `appeal_id`, `upheld`, `resolved_at`  | `resolve_appeal()` admin resolves appeal (upheld or denied) |
 
 ### Arbitration Case Events

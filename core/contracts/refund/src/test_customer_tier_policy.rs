@@ -148,3 +148,80 @@ fn existing_tier_policy_applied_correctly() {
     );
     assert_eq!(refund_id, 1u64, "refund within tier cap must succeed");
 }
+
+/// Issue #61: A customer whose verified tier is flagged as VIP by the merchant
+/// must have their eligible refund routed straight to `Approved` (instant
+/// refund) instead of sitting in `Requested` awaiting admin action.
+#[test]
+fn vip_tier_customer_gets_instant_refund_approval() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    make_policy(&env, &merchant, &client);
+
+    const VIP_TIER_ID: u32 = 9;
+    client.set_customer_tier(&admin, &customer, &VIP_TIER_ID);
+    client.set_customer_tier_policy(&merchant, &VIP_TIER_ID, &10000u32);
+    client.set_vip_tier_policy(&merchant, &VIP_TIER_ID, &true);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &500i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "vip instant refund"),
+        &RefundReasonCode::CustomerRequest,
+        &0u64,
+    );
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(
+        refund.status,
+        RefundStatus::Approved,
+        "VIP tier refund must be auto-approved instantly"
+    );
+}
+
+/// Issue #61: A non-VIP tier customer's refund still follows the normal
+/// approval workflow (i.e. is not auto-approved simply for having a tier).
+#[test]
+fn non_vip_tier_customer_does_not_get_instant_approval() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    make_policy(&env, &merchant, &client);
+
+    const TIER_ID: u32 = 4;
+    client.set_customer_tier(&admin, &customer, &TIER_ID);
+    client.set_customer_tier_policy(&merchant, &TIER_ID, &10000u32);
+    // Note: VIP flag intentionally not set for this tier.
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &500i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "non-vip refund"),
+        &RefundReasonCode::CustomerRequest,
+        &0u64,
+    );
+
+    let refund = client.get_refund(&refund_id);
+    assert_ne!(
+        refund.status,
+        RefundStatus::Approved,
+        "non-VIP tier refund must not be auto-approved"
+    );
+}

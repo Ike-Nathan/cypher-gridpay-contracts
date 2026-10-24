@@ -21,6 +21,7 @@ fn default_config(enabled: bool) -> CircuitBreakerConfig {
         measurement_window_seconds: 3600,
         cooldown_seconds: 600,
         enabled,
+        max_refund_volume: 0, // disabled by default in these rate-based tests
     }
 }
 
@@ -188,6 +189,42 @@ fn test_manual_reset_by_admin() {
 
     let state = client.get_circuit_breaker_state();
     assert!(!state.tripped);
+}
+
+/// Issue #59: an absolute rolling refund volume threshold (independent of the
+/// refund-rate percentage) must trip the circuit breaker once exceeded.
+#[test]
+fn test_circuit_breaker_trips_on_absolute_volume_threshold() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Low rate limit (allow up to 100%) but a strict absolute volume cap of 500.
+    let mut config = default_config(true);
+    config.max_refund_rate_bps = 10000;
+    config.max_refund_volume = 500;
+    client.set_circuit_breaker_config(&admin, &config);
+
+    // Refund of 600 stays within the 100% rate cap but exceeds the 500 volume cap.
+    let result = client.try_request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &600_i128,
+        &1000_i128,
+        &token,
+        &String::from_str(&env, "volume test"),
+        &RefundReasonCode::Other,
+        &0u64,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(Error::Core(CoreError::CircuitBreakerTripped)))
+    );
+
+    let state = client.get_circuit_breaker_state();
+    assert!(state.tripped, "breaker must trip on absolute volume threshold");
 }
 
 #[test]

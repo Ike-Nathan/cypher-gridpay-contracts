@@ -4,10 +4,12 @@ members = [
   "contracts/escrow",
   "contracts/payment",
   "contracts/refund",
+  "test_utils",
 ]
 
 [workspace.dependencies]
 soroban-sdk = "23"
+test_utils = { path = "test_utils" }
 
 [profile.release]
 opt-level = "z"

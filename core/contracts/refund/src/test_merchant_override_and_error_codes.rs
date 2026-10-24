@@ -466,3 +466,173 @@ fn test_merchant_override_flag_with_refund_policy() {
     // 3. Auto-refund should NOT execute
     // 4. Manual refund request should still work (policy still applies)
 }
+
+fn request_for(
+    client: &RefundContractClient,
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    payment_id: u64,
+) -> u64 {
+    client.request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &250,
+        &1_000,
+        token,
+        &String::from_str(env, "claim"),
+        &RefundReasonCode::ProductDefect,
+        &env.ledger().timestamp(),
+    )
+}
+
+fn deny(client: &RefundContractClient, env: &Env, admin: &Address, refund_id: u64) {
+    client.reject_refund(admin, &refund_id, &String::from_str(env, "denied"));
+}
+
+#[test]
+fn test_payment_merchant_can_override_denied_claim() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = request_for(&client, &env, &merchant, &customer, &token, 900);
+    deny(&client, &env, &admin, refund_id);
+    assert_eq!(
+        client.get_refund(&refund_id).status,
+        RefundStatus::PendingAppeal
+    );
+
+    client.merchant_override_denial(&merchant, &refund_id);
+
+    // The merchant's own authorization was required for the override.
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, merchant);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Approved);
+    assert!(refund.approved_at.is_some());
+    let approved = client.get_refunds_by_status(&RefundStatus::Approved, &10, &0);
+    assert!(approved.iter().any(|r| r.id == refund_id));
+}
+
+#[test]
+fn test_third_party_merchant_cannot_override_another_merchants_claim() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let other_merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // other_merchant is a real merchant with refunds of its own...
+    let _own = request_for(&client, &env, &other_merchant, &customer, &token, 901);
+    let refund_id = request_for(&client, &env, &merchant, &customer, &token, 902);
+    deny(&client, &env, &admin, refund_id);
+
+    // ...but it cannot override a claim on another merchant's payment.
+    assert_eq!(
+        client.try_merchant_override_denial(&other_merchant, &refund_id),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    // Neither can the customer or the admin use the merchant path.
+    assert_eq!(
+        client.try_merchant_override_denial(&customer, &refund_id),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    assert_eq!(
+        client.try_merchant_override_denial(&admin, &refund_id),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    assert_eq!(
+        client.get_refund(&refund_id).status,
+        RefundStatus::PendingAppeal
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_merchant_override_requires_merchant_signature() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let refund_id = request_for(&client, &env, &merchant, &customer, &token, 903);
+    deny(&client, &env, &admin, refund_id);
+
+    // Without the merchant's signature the call must fail even though the
+    // address matches.
+    env.set_auths(&[]);
+    client.merchant_override_denial(&merchant, &refund_id);
+}
+
+#[test]
+fn test_merchant_override_only_applies_to_denied_claims() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = request_for(&client, &env, &merchant, &customer, &token, 904);
+    assert_eq!(
+        client.try_merchant_override_denial(&merchant, &refund_id),
+        Err(Ok(Error::Core(CoreError::RefundNotRejected)))
+    );
+    assert_eq!(
+        client.try_merchant_override_denial(&merchant, &999),
+        Err(Ok(Error::Core(CoreError::RefundNotFound)))
+    );
+}
+
+#[test]
+fn test_merchant_override_reinstates_finalized_denial() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = request_for(&client, &env, &merchant, &customer, &token, 905);
+    deny(&client, &env, &admin, refund_id);
+    let deadline = client.get_refund(&refund_id).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&refund_id);
+    assert_eq!(client.get_accumulated_refunds(&905), 0);
+
+    client.merchant_override_denial(&merchant, &refund_id);
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+    // The reinstated refund counts toward the payment again.
+    assert_eq!(client.get_accumulated_refunds(&905), 250);
+    assert_eq!(client.get_payment_refund_usage(&905), (1, 250));
+}
+
+#[test]
+fn test_merchant_override_blocked_while_arbitration_open() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    for _ in 0..3 {
+        client.register_arbitrator(&admin, &Address::generate(&env));
+    }
+    let fee_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &fee_token).mint(&customer, &10_000);
+
+    let refund_id = request_for(&client, &env, &merchant, &customer, &fee_token, 906);
+    deny(&client, &env, &admin, refund_id);
+    client.escalate_to_arbitration(&customer, &refund_id, &fee_token, &300);
+
+    assert_eq!(
+        client.try_merchant_override_denial(&merchant, &refund_id),
+        Err(Ok(Error::Core(CoreError::InvalidStatus)))
+    );
+}

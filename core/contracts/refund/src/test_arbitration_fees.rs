@@ -573,3 +573,149 @@ fn test_fee_distribution_100_percent_treasury() {
     assert_eq!(treasury_final - treasury_initial, 1000);
     assert_eq!(client.get_accumulated_arbitration_fees(), 1000);
 }
+
+/// Runs a refund of `amount` through rejection and a unanimous arbitration
+/// ruling in the customer's favour. Returns (client, refund_id).
+fn arbitrate_refund_in_customer_favour<'a>(
+    env: &'a Env,
+    admin: &Address,
+    merchant: &Address,
+    customer: &Address,
+    arbitrators: [&Address; 3],
+    token_client: &token::Client,
+    amount: i128,
+) -> (RefundContractClient<'a>, u64) {
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(env, &contract_id);
+    client.initialize(admin);
+    for arbitrator in arbitrators {
+        client.register_arbitrator(admin, arbitrator);
+    }
+    // Fund the contract so the award can be paid out.
+    token_client.transfer(merchant, &contract_id, &5_000);
+
+    let refund_id = client.request_refund(
+        merchant,
+        &1u64,
+        customer,
+        &amount,
+        &10_000i128,
+        &token_client.address,
+        &String::from_str(env, "Test refund"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
+    client.reject_refund(admin, &refund_id, &String::from_str(env, "Rejected"));
+    let case_id = client.escalate_to_arbitration(customer, &refund_id, &token_client.address, &300);
+
+    let hash = BytesN::from_array(env, &[0u8; 32]);
+    for arbitrator in arbitrators {
+        client.cast_arbitration_vote(arbitrator, &case_id, &true, &hash);
+    }
+    client.close_arbitration_case(&case_id);
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+    (client, refund_id)
+}
+
+#[test]
+fn test_protocol_fee_deducted_from_arbitration_award() {
+    let (env, admin, merchant, customer, arb1, arb2, arb3, treasury, token_client) =
+        setup_test_env();
+    let (client, refund_id) = arbitrate_refund_in_customer_favour(
+        &env,
+        &admin,
+        &merchant,
+        &customer,
+        [&arb1, &arb2, &arb3],
+        &token_client,
+        1_000,
+    );
+    assert_eq!(client.get_arbitration_protocol_fee(), 200); // default 2%
+
+    let customer_before = token_client.balance(&customer);
+    let contract_before = token_client.balance(&client.address);
+    client.process_refund(&admin, &refund_id);
+
+    // Winning customer receives the award net of the 2% protocol fee...
+    assert_eq!(token_client.balance(&customer) - customer_before, 980);
+    // ...and the fee is credited to ConfigKey::AccumulatedFees and kept in
+    // the contract.
+    assert_eq!(
+        client.get_accumulated_protocol_fees(&token_client.address),
+        20
+    );
+    assert_eq!(contract_before - token_client.balance(&client.address), 980);
+
+    // The fee can be withdrawn by the admin.
+    assert_eq!(
+        client.withdraw_protocol_fees(&admin, &token_client.address, &treasury),
+        20
+    );
+    assert_eq!(token_client.balance(&treasury), 20);
+    assert_eq!(
+        client.get_accumulated_protocol_fees(&token_client.address),
+        0
+    );
+}
+
+#[test]
+fn test_protocol_fee_is_configurable() {
+    let (env, admin, merchant, customer, arb1, arb2, arb3, _, token_client) = setup_test_env();
+    let (client, refund_id) = arbitrate_refund_in_customer_favour(
+        &env,
+        &admin,
+        &merchant,
+        &customer,
+        [&arb1, &arb2, &arb3],
+        &token_client,
+        1_000,
+    );
+    client.set_arbitration_protocol_fee(&admin, &500); // 5%
+
+    let customer_before = token_client.balance(&customer);
+    client.process_refund(&admin, &refund_id);
+    assert_eq!(token_client.balance(&customer) - customer_before, 950);
+    assert_eq!(
+        client.get_accumulated_protocol_fees(&token_client.address),
+        50
+    );
+
+    assert_eq!(
+        client.try_set_arbitration_protocol_fee(&admin, &(MAX_ARBITRATION_PROTOCOL_FEE_BPS + 1)),
+        Err(Ok(Error::Core(CoreError::InvalidFeeConfig)))
+    );
+    assert_eq!(
+        client.try_set_arbitration_protocol_fee(&customer, &100),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+}
+
+#[test]
+fn test_protocol_fee_not_charged_on_non_arbitrated_refund() {
+    let (env, admin, merchant, customer, _, _, _, _, token_client) = setup_test_env();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    token_client.transfer(&merchant, &contract_id, &5_000);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &1_000i128,
+        &10_000i128,
+        &token_client.address,
+        &String::from_str(&env, "Direct refund"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
+    client.approve_refund(&admin, &refund_id);
+    let customer_before = token_client.balance(&customer);
+    client.process_refund(&admin, &refund_id);
+
+    assert_eq!(token_client.balance(&customer) - customer_before, 1_000);
+    assert_eq!(
+        client.get_accumulated_protocol_fees(&token_client.address),
+        0
+    );
+}
