@@ -4,8 +4,8 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-[lib]
-crate-type = ["lib"]
-
 [dependencies]
 soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
