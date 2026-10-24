@@ -1175,6 +1175,31 @@ pub struct CustomerRefundSummary {
     pub avg_processing_time: u64,
 }
 
+/// Issue #230: weighted serial-refunder score that separates high-volume
+/// buyers from customers who file refunds across many merchants.
+///
+/// `abuse_risk_bps = (denied * 3 + approved) * 10_000 / max(10, payments)`,
+/// capped at 10_000 and reduced by `CLEAN_PAYMENT_DECAY_BPS` for each
+/// consecutive payment completed without a refund.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct CustomerRefundProfile {
+    pub total_lifetime_payments_count: u64,
+    pub total_refunds_requested: u64,
+    pub approved_refunds_count: u64,
+    pub denied_refunds_count: u64,
+    pub distinct_merchants_refunded: u32,
+    pub consecutive_clean_payments: u64,
+    pub abuse_risk_bps: u32,
+    /// Customer is excluded from automated/fast-track refunds until this time.
+    pub auto_refund_disqualified_until: u64,
+}
+
+/// Issue #230: risk reduction per consecutive refund-free payment.
+pub const CLEAN_PAYMENT_DECAY_BPS: u32 = 500;
+/// Issue #230: minimum quarantine length once the threshold is crossed.
+pub const ABUSE_QUARANTINE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[derive(Clone)]
 #[contracttype]
 pub struct RefundAppeal {
@@ -1742,6 +1767,15 @@ pub enum RefundExtKey {
     AssignmentConfig,
     RotationIndex,
     RefundTTLConfig,
+}
+
+// Issue #230: customer abuse scoring
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum CustomerAbuseKey {
+    Profile(Address),
+    RefundedMerchant(Address, Address),
+    QuarantineThresholdBps,
 }
 
 // Issue #195: Batch decision types
@@ -2767,6 +2801,10 @@ impl RefundContract {
             .unwrap_or(604800);
         let now = env.ledger().timestamp();
 
+        let mut profile = Self::get_customer_refund_profile(env.clone(), refund.customer.clone());
+        profile.denied_refunds_count += 1;
+        Self::save_customer_refund_profile(env, &refund.customer, profile);
+
         refund.status = RefundStatus::PendingAppeal;
         refund.rejected_by = Some(admin.clone());
         // Denial time: the appeal window runs from here and is not restarted
@@ -3281,7 +3319,9 @@ impl RefundContract {
     /// * `trigger_id` - The ID of the trigger to evaluate.
     ///
     /// # Returns
-    /// `true` if the refund was triggered, `false` otherwise.
+    /// `true` if the refund was triggered, `false` otherwise. Issue #230: for a
+    /// quarantined customer the refund is created in `Requested` status for
+    /// manual review, the trigger is consumed and `false` is returned.
     ///
     /// # Errors
     /// Returns `InvalidAmount` if the calculated refund amount is non-positive.
@@ -3320,12 +3360,17 @@ impl RefundContract {
             payment.created_at,
             true,
         )?;
-        Self::process_refund_internal(&env, env.current_contract_address(), refund_id)?;
 
         trigger.active = false;
         env.storage()
             .instance()
             .set(&PolicyKey::AutoRefundTrigger(trigger_id), &trigger);
+
+        // Issue #230: a quarantined customer's claim was routed to manual review.
+        if Self::get_refund(&env, refund_id)?.status != RefundStatus::Approved {
+            return Ok(false);
+        }
+        Self::process_refund_internal(&env, env.current_contract_address(), refund_id)?;
 
         (AutoRefundTriggered {
             trigger_id,
@@ -7914,7 +7959,13 @@ impl RefundContract {
         // tier-specific refund cap.
         let is_vip_tier_customer = Self::is_vip_tier_customer(&env, &merchant, &customer);
 
-        let initial_status = if force_approved || is_vip_tier_customer {
+        // Issue #230: quarantined customers lose every automated path
+        // (auto-refund triggers, VIP fast-track, auto-approve threshold) but can
+        // still file the request for manual, evidence-backed review.
+        let mut profile = Self::get_customer_refund_profile(env.clone(), customer.clone());
+        let initial_status = if Self::is_auto_refund_disqualified(&env, &profile) {
+            RefundStatus::Requested
+        } else if force_approved || is_vip_tier_customer {
             RefundStatus::Approved
         } else {
             let effective_merchant = if let Some(policy) =
@@ -7943,6 +7994,18 @@ impl RefundContract {
         if initial_status == RefundStatus::Approved {
             Self::reserve_merchant_quota(&env, &merchant, amount)?;
         }
+
+        profile.total_refunds_requested += 1;
+        if initial_status == RefundStatus::Approved {
+            profile.approved_refunds_count += 1;
+        }
+        let merchant_key = CustomerAbuseKey::RefundedMerchant(customer.clone(), merchant.clone());
+        if !env.storage().instance().has(&merchant_key) {
+            env.storage().instance().set(&merchant_key, &true);
+            profile.distinct_merchants_refunded += 1;
+        }
+        profile.consecutive_clean_payments = 0;
+        Self::save_customer_refund_profile(&env, &customer, profile);
 
         let ttl_expires_at: Option<u64> = env
             .storage()
@@ -8088,6 +8151,9 @@ impl RefundContract {
         Self::reserve_merchant_quota(env, &refund.merchant, refund.amount)?;
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+        let mut profile = Self::get_customer_refund_profile(env.clone(), refund.customer.clone());
+        profile.approved_refunds_count += 1;
+        Self::save_customer_refund_profile(env, &refund.customer, profile);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
         refund.approved_at = Some(env.ledger().timestamp());
@@ -11797,6 +11863,120 @@ impl RefundContract {
             .instance()
             .set(&DataKey::CustomerTier(customer), &tier_id);
         Ok(())
+    }
+
+    /// Issue #230: set the abuse score at which customers are quarantined from
+    /// automated refunds (`0` disables quarantining).
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin and
+    /// `InvalidAmount` if `threshold_bps` exceeds 10_000.
+    pub fn set_abuse_quarantine_threshold(
+        env: Env,
+        admin: Address,
+        threshold_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if threshold_bps > 10_000 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&CustomerAbuseKey::QuarantineThresholdBps, &threshold_bps);
+        Ok(())
+    }
+
+    /// Issue #230: record a payment the customer completed, decaying their abuse
+    /// score. Callable by the admin or the configured payment contract.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if `caller` is neither.
+    pub fn record_customer_payment(
+        env: Env,
+        caller: Address,
+        customer: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let payment_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress);
+        if admin.as_ref() != Some(&caller) && payment_contract.as_ref() != Some(&caller) {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let mut profile = Self::get_customer_refund_profile(env.clone(), customer.clone());
+        profile.total_lifetime_payments_count += 1;
+        profile.consecutive_clean_payments += 1;
+        Self::save_customer_refund_profile(&env, &customer, profile);
+        Ok(())
+    }
+
+    /// Issue #230: get a customer's refund abuse profile.
+    pub fn get_customer_refund_profile(env: Env, customer: Address) -> CustomerRefundProfile {
+        env.storage()
+            .instance()
+            .get(&CustomerAbuseKey::Profile(customer))
+            .unwrap_or(CustomerRefundProfile {
+                total_lifetime_payments_count: 0,
+                total_refunds_requested: 0,
+                approved_refunds_count: 0,
+                denied_refunds_count: 0,
+                distinct_merchants_refunded: 0,
+                consecutive_clean_payments: 0,
+                abuse_risk_bps: 0,
+                auto_refund_disqualified_until: 0,
+            })
+    }
+
+    /// Recomputes `abuse_risk_bps`, (re)starts the quarantine when it reaches the
+    /// threshold, and persists the profile.
+    fn save_customer_refund_profile(
+        env: &Env,
+        customer: &Address,
+        mut profile: CustomerRefundProfile,
+    ) {
+        let weighted = (profile.denied_refunds_count as u128) * 3
+            + profile.approved_refunds_count as u128;
+        let denominator = core::cmp::max(10, profile.total_lifetime_payments_count) as u128;
+        let raw = core::cmp::min(weighted * 10_000 / denominator, 10_000) as u32;
+        let decay = (profile.consecutive_clean_payments as u128 * CLEAN_PAYMENT_DECAY_BPS as u128)
+            .min(10_000) as u32;
+        profile.abuse_risk_bps = raw.saturating_sub(decay);
+
+        let threshold = Self::abuse_quarantine_threshold(env);
+        if threshold > 0 && profile.abuse_risk_bps >= threshold {
+            profile.auto_refund_disqualified_until = env
+                .ledger()
+                .timestamp()
+                .saturating_add(ABUSE_QUARANTINE_PERIOD_SECS);
+        }
+
+        env.storage()
+            .instance()
+            .set(&CustomerAbuseKey::Profile(customer.clone()), &profile);
+    }
+
+    fn abuse_quarantine_threshold(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&CustomerAbuseKey::QuarantineThresholdBps)
+            .unwrap_or(0)
+    }
+
+    fn is_auto_refund_disqualified(env: &Env, profile: &CustomerRefundProfile) -> bool {
+        let threshold = Self::abuse_quarantine_threshold(env);
+        env.ledger().timestamp() < profile.auto_refund_disqualified_until
+            || (threshold > 0 && profile.abuse_risk_bps >= threshold)
     }
 
     /// Mark whether a given customer tier qualifies for VIP instant refund approval

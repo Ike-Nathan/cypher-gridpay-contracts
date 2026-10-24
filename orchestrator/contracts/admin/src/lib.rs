@@ -3,7 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 #[contracterror]
@@ -15,6 +16,21 @@ pub enum Error {
     RotationNotPending = 4,
     RotationTimelockActive = 5,
     RotationAlreadyPending = 6,
+    SchemaAlreadyAtTarget = 7,
+    SchemaMigrationFailed = 8,
+    UpgradeProposalNotFound = 9,
+    UpgradeTimelockNotExpired = 10,
+    InsufficientApprovals = 11,
+    UpgradeAlreadyExecuted = 12,
+    InvalidWasmHash = 13,
+    // Issue #235: canary upgrade verification
+    UpgradeProposalExpired = 14,
+    TargetNotPaused = 15,
+    PostUpgradeVerificationFailed = 16,
+    // Issue #240: protocol parameter guardrails
+    ParameterOutOfBounds = 17,
+    ParameterStepTooLarge = 18,
+    ParameterCooldownActive = 19,
 }
 
 /// Identifies which downstream contract address is being rotated.
@@ -92,6 +108,112 @@ pub enum DataKey {
     PendingPaymentRotation,
     PendingEscrowRotation,
     PendingRefundRotation,
+    SchemaVersion,
+    UpgradeProposal(u64),
+    UpgradeProposalCounter,
+    UpgradeTimelock,
+    UpgradeRequiredApprovals,
+    // Issue #240: global protocol parameter registry
+    ProtocolParameters,
+    ParameterLastUpdated(ProtocolParameter),
+}
+
+/// How long an upgrade proposal stays executable once its timelock has
+/// elapsed (Issue #235). Stale approved proposals cannot be executed weeks
+/// later.
+pub const UPGRADE_PROPOSAL_VALIDITY: u64 = 7 * 24 * 60 * 60;
+
+/// A WASM upgrade of a target contract awaiting approval and execution.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct UpgradeProposal {
+    pub contract_address: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub timelock_period: u64,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    /// Issue #235: schema version the target must report after the upgrade
+    /// (and optional migration) for the upgrade to be committed.
+    pub expected_post_schema_version: u32,
+    /// Issue #235: WASM hash the target must acknowledge having installed.
+    pub expected_wasm_hash: BytesN<32>,
+    /// Issue #235: when set, `migrate_schema(target_version)` is invoked on the
+    /// target in the same transaction as the upgrade.
+    pub run_migration_target: Option<u32>,
+    /// Issue #235: last timestamp at which the proposal may be executed.
+    pub expires_at: u64,
+}
+
+/// Emitted when an upgrade passes post-upgrade verification (Issue #235).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeVerified {
+    pub proposal_id: u64,
+    pub contract_address: Address,
+    pub pre_schema_version: u32,
+    pub post_schema_version: u32,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Immutable constitutional bounds on global economic parameters
+/// (Issue #240). No admin quorum can move a parameter outside these limits.
+pub struct GlobalParameterGuardrails;
+
+impl GlobalParameterGuardrails {
+    /// Hard ceiling on the protocol fee (5%).
+    pub const ABSOLUTE_MAX_FEE_BPS: u32 = 500;
+    /// Hard ceiling on the maximum allowed slippage (10%).
+    pub const ABSOLUTE_MAX_SLIPPAGE_BPS: u32 = 1_000;
+    /// Hard floor on the minimum finality delay.
+    pub const ABSOLUTE_MIN_FINALITY_DELAY_SECS: u64 = 60;
+    /// Hard floor on the minimum escrow hold time.
+    pub const ABSOLUTE_MIN_ESCROW_HOLD_SECS: u64 = 3_600;
+    /// Maximum change of a parameter per adjustment, relative to its current
+    /// value (25%).
+    pub const MAX_PARAMETER_STEP_CHANGE_BPS: u32 = 2_500;
+    /// Minimum time between two adjustments of the same parameter.
+    pub const MIN_PARAMETER_COOLDOWN_SECS: u64 = 86_400;
+}
+
+/// Identifies a global economic parameter for per-parameter cooldowns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ProtocolParameter {
+    MaxFeeBps,
+    MinFinalityDelaySecs,
+    MaxSlippageBps,
+    MinEscrowHoldSecs,
+}
+
+/// Global economic parameters shared by Payment, Escrow and Refund.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProtocolParameters {
+    pub max_fee_bps: u32,
+    pub min_finality_delay_secs: u64,
+    pub max_slippage_bps: u32,
+    pub min_escrow_hold_secs: u64,
+}
+
+/// A partial update of [`ProtocolParameters`]; `None` leaves a value as is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProtocolParameterPatch {
+    pub max_fee_bps: Option<u32>,
+    pub min_finality_delay_secs: Option<u64>,
+    pub max_slippage_bps: Option<u32>,
+    pub min_escrow_hold_secs: Option<u64>,
+}
+
+/// Broadcast of the synced registry to one downstream contract (Issue #240).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolParametersSynced {
+    pub target: ContractTarget,
+    pub contract_address: Address,
+    pub parameters: ProtocolParameters,
+    pub synced_at: u64,
 }
 
 /// Schema version written by `initialize`.
@@ -791,6 +913,10 @@ impl AdminContract {
     /// - `admin`: the admin address that must be authorized.
     /// - `contract_address`: the address of the contract to upgrade.
     /// - `new_wasm_hash`: the hash of the new WASM bytecode.
+    /// - `expected_post_schema_version`: the schema version the target must
+    ///   report once the upgrade (and optional migration) has run.
+    /// - `run_migration_target`: when set, `migrate_schema` is invoked on the
+    ///   target with this version in the same transaction as the upgrade.
     ///
     /// # Returns
     /// Returns the proposal ID on success.
@@ -804,6 +930,8 @@ impl AdminContract {
         admin: Address,
         contract_address: Address,
         new_wasm_hash: BytesN<32>,
+        expected_post_schema_version: u32,
+        run_migration_target: Option<u32>,
     ) -> Result<u64, Error> {
         admin.require_auth();
 
@@ -834,13 +962,20 @@ impl AdminContract {
             .get(&DataKey::UpgradeProposalCounter)
             .unwrap_or(0);
 
+        let proposed_at = env.ledger().timestamp();
         let proposal = UpgradeProposal {
             contract_address: contract_address.clone(),
             new_wasm_hash: new_wasm_hash.clone(),
-            proposed_at: env.ledger().timestamp(),
+            proposed_at,
             timelock_period,
             approvals: Vec::new(&env),
             executed: false,
+            expected_post_schema_version,
+            expected_wasm_hash: new_wasm_hash,
+            run_migration_target,
+            expires_at: proposed_at
+                .saturating_add(timelock_period)
+                .saturating_add(UPGRADE_PROPOSAL_VALIDITY),
         };
 
         env.storage()
@@ -863,7 +998,8 @@ impl AdminContract {
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
     /// `Error::Unauthorized` if the provided admin address does not match the stored admin,
     /// `Error::UpgradeProposalNotFound` if the proposal does not exist,
-    /// or `Error::UpgradeAlreadyExecuted` if the proposal has already been executed.
+    /// `Error::UpgradeAlreadyExecuted` if the proposal has already been executed,
+    /// or `Error::UpgradeProposalExpired` if the proposal is past `expires_at`.
     pub fn approve_upgrade(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
@@ -885,6 +1021,9 @@ impl AdminContract {
         if proposal.executed {
             return Err(Error::UpgradeAlreadyExecuted);
         }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::UpgradeProposalExpired);
+        }
 
         // Check if admin already approved
         for i in 0..proposal.approvals.len() {
@@ -903,6 +1042,14 @@ impl AdminContract {
 
     /// Executes an approved upgrade proposal after the timelock has expired.
     ///
+    /// Issue #235: the upgrade, the optional schema migration and the
+    /// post-upgrade verification run in one transaction. The target's
+    /// pre-upgrade schema version is captured, its `upgrade` entry point is
+    /// invoked (it must acknowledge `expected_wasm_hash`), `migrate_schema` is
+    /// run when `run_migration_target` is set, and the target must then report
+    /// `expected_post_schema_version`. Any failed check returns an error, which
+    /// reverts the upgrade and migration atomically.
+    ///
     /// # Parameters
     /// - `admin`: the admin address that must be authorized.
     /// - `proposal_id`: the ID of the upgrade proposal to execute.
@@ -913,7 +1060,11 @@ impl AdminContract {
     /// `Error::UpgradeProposalNotFound` if the proposal does not exist,
     /// `Error::UpgradeTimelockNotExpired` if the timelock period has not passed,
     /// `Error::InsufficientApprovals` if the required number of approvals has not been met,
-    /// or `Error::UpgradeAlreadyExecuted` if the proposal has already been executed.
+    /// `Error::UpgradeAlreadyExecuted` if the proposal has already been executed,
+    /// `Error::UpgradeProposalExpired` if the proposal is past `expires_at`,
+    /// `Error::TargetNotPaused` if a schema-migrating upgrade targets a live
+    /// contract, or `Error::PostUpgradeVerificationFailed` if the target does
+    /// not report the expected WASM hash or schema version afterwards.
     pub fn execute_upgrade(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
@@ -942,6 +1093,9 @@ impl AdminContract {
         if current_time < unlock_time {
             return Err(Error::UpgradeTimelockNotExpired);
         }
+        if current_time > proposal.expires_at {
+            return Err(Error::UpgradeProposalExpired);
+        }
 
         // Check approvals
         let required_approvals: u32 = env
@@ -949,7 +1103,7 @@ impl AdminContract {
             .instance()
             .get(&DataKey::UpgradeRequiredApprovals)
             .unwrap_or(1);
-        if proposal.approvals.len() < required_approvals as u64 {
+        if proposal.approvals.len() < required_approvals {
             return Err(Error::InsufficientApprovals);
         }
 
@@ -959,10 +1113,214 @@ impl AdminContract {
             .instance()
             .set(&DataKey::UpgradeProposal(proposal_id), &proposal);
 
-        // Execute the upgrade
-        env.deployer()
-            .update_current_contract_wasm(&proposal.contract_address, &proposal.new_wasm_hash);
+        let target = proposal.contract_address.clone();
+        let this = env.current_contract_address();
 
+        // Pre-upgrade checkpoint.
+        let pre_schema_version = Self::target_schema_version(&env, &target);
+        if proposal.run_migration_target.is_some()
+            && !Self::target_pause_state(&env, &target).globally_paused
+        {
+            return Err(Error::TargetNotPaused);
+        }
+
+        // Upgrade: only the target itself can swap its WASM, so it exposes an
+        // `upgrade` entry point that reports the hash it installed.
+        let installed_hash: BytesN<32> = env.invoke_contract(
+            &target,
+            &Symbol::new(&env, "upgrade"),
+            (this.clone(), proposal.new_wasm_hash.clone()).into_val(&env),
+        );
+        if installed_hash != proposal.expected_wasm_hash {
+            return Err(Error::PostUpgradeVerificationFailed);
+        }
+
+        if let Some(target_version) = proposal.run_migration_target {
+            env.invoke_contract::<Val>(
+                &target,
+                &Symbol::new(&env, "migrate_schema"),
+                (this, target_version).into_val(&env),
+            );
+        }
+
+        // Post-upgrade invariants: expected schema, no downgrade, and the
+        // target still answers its health query.
+        let post_schema_version = Self::target_schema_version(&env, &target);
+        if post_schema_version != proposal.expected_post_schema_version
+            || post_schema_version < pre_schema_version
+        {
+            return Err(Error::PostUpgradeVerificationFailed);
+        }
+        Self::target_pause_state(&env, &target);
+
+        (UpgradeVerified {
+            proposal_id,
+            contract_address: target,
+            pre_schema_version,
+            post_schema_version,
+            wasm_hash: proposal.new_wasm_hash,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reads a target contract's storage schema version.
+    fn target_schema_version(env: &Env, target: &Address) -> u32 {
+        env.invoke_contract(target, &Symbol::new(env, "get_schema_version"), Vec::new(env))
+    }
+
+    /// Reads a target contract's pause state; the call doubles as a health
+    /// probe because it panics if the target cannot answer.
+    fn target_pause_state(env: &Env, target: &Address) -> payments::PauseState {
+        env.invoke_contract(target, &Symbol::new(env, "get_pause_state"), Vec::new(env))
+    }
+
+    /// Returns the global protocol parameter registry (Issue #240).
+    ///
+    /// Payment, Escrow and Refund read their economic bounds from here; before
+    /// the first sync the conservative defaults are returned.
+    pub fn get_protocol_parameters(env: Env) -> ProtocolParameters {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProtocolParameters)
+            .unwrap_or(ProtocolParameters {
+                max_fee_bps: 100,
+                min_finality_delay_secs: 3_600,
+                max_slippage_bps: 100,
+                min_escrow_hold_secs: 86_400,
+            })
+    }
+
+    /// Validates and applies a patch to the global protocol parameter registry
+    /// and broadcasts the result to Payment, Escrow and Refund (Issue #240).
+    ///
+    /// Every patched value must lie within the [`GlobalParameterGuardrails`]
+    /// hard bounds, differ from its current value by at most
+    /// `MAX_PARAMETER_STEP_CHANGE_BPS`, and respect
+    /// `MIN_PARAMETER_COOLDOWN_SECS` since that parameter last changed. The
+    /// hard bounds are constitutional: no admin signature can bypass them. The
+    /// patch is all-or-nothing.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` before `initialize`, `Error::Unauthorized`
+    /// if the caller is not the stored admin, `Error::ParameterOutOfBounds`,
+    /// `Error::ParameterStepTooLarge` or `Error::ParameterCooldownActive` when
+    /// a patched value violates a guardrail.
+    pub fn sync_protocol_parameters(
+        env: Env,
+        admin: Address,
+        patch: ProtocolParameterPatch,
+    ) -> Result<ProtocolParameters, Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (payment_contract, escrow_contract, refund_contract) =
+            Self::get_contract_addresses(&env)?;
+
+        type G = GlobalParameterGuardrails;
+        let mut params = Self::get_protocol_parameters(env.clone());
+
+        if let Some(v) = patch.max_fee_bps {
+            if v > G::ABSOLUTE_MAX_FEE_BPS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MaxFeeBps,
+                params.max_fee_bps as u64,
+                v as u64,
+            )?;
+            params.max_fee_bps = v;
+        }
+        if let Some(v) = patch.min_finality_delay_secs {
+            if v < G::ABSOLUTE_MIN_FINALITY_DELAY_SECS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MinFinalityDelaySecs,
+                params.min_finality_delay_secs,
+                v,
+            )?;
+            params.min_finality_delay_secs = v;
+        }
+        if let Some(v) = patch.max_slippage_bps {
+            if v > G::ABSOLUTE_MAX_SLIPPAGE_BPS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MaxSlippageBps,
+                params.max_slippage_bps as u64,
+                v as u64,
+            )?;
+            params.max_slippage_bps = v;
+        }
+        if let Some(v) = patch.min_escrow_hold_secs {
+            if v < G::ABSOLUTE_MIN_ESCROW_HOLD_SECS {
+                return Err(Error::ParameterOutOfBounds);
+            }
+            Self::check_parameter_change(
+                &env,
+                ProtocolParameter::MinEscrowHoldSecs,
+                params.min_escrow_hold_secs,
+                v,
+            )?;
+            params.min_escrow_hold_secs = v;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolParameters, &params);
+
+        let now = env.ledger().timestamp();
+        for (target, contract_address) in [
+            (ContractTarget::Payment, payment_contract),
+            (ContractTarget::Escrow, escrow_contract),
+            (ContractTarget::Refund, refund_contract),
+        ] {
+            (ProtocolParametersSynced {
+                target,
+                contract_address,
+                parameters: params.clone(),
+                synced_at: now,
+            })
+            .publish(&env);
+        }
+
+        Ok(params)
+    }
+
+    /// Enforces the per-parameter step-change limit and cooldown, then records
+    /// the adjustment time. Unchanged values are accepted without touching the
+    /// cooldown.
+    fn check_parameter_change(
+        env: &Env,
+        parameter: ProtocolParameter,
+        current: u64,
+        new: u64,
+    ) -> Result<(), Error> {
+        if new == current {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::ParameterLastUpdated(parameter);
+        if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+            if now < last.saturating_add(GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS) {
+                return Err(Error::ParameterCooldownActive);
+            }
+        }
+
+        let delta = current.abs_diff(new) as u128;
+        let max_delta = current as u128
+            * GlobalParameterGuardrails::MAX_PARAMETER_STEP_CHANGE_BPS as u128
+            / 10_000;
+        if delta > max_delta {
+            return Err(Error::ParameterStepTooLarge);
+        }
+
+        env.storage().instance().set(&key, &now);
         Ok(())
     }
 
@@ -1339,7 +1697,7 @@ mod test {
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
 
         // Propose upgrade
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         assert_eq!(proposal_id, 0);
 
         // Verify proposal exists
@@ -1385,7 +1743,7 @@ mod test {
         client.configure_upgrade(&admin, &3600, &1);
 
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         client.approve_upgrade(&admin, &proposal_id);
 
         // Try to execute before timelock expires - should fail
@@ -1420,7 +1778,7 @@ mod test {
         client.configure_upgrade(&admin, &0, &2);
 
         let wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
-        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash);
+        let proposal_id = client.propose_upgrade(&admin, &payment_contract, &wasm_hash, &1, &None);
         client.approve_upgrade(&admin, &proposal_id);
 
         // Try to execute with only 1 approval - should fail
