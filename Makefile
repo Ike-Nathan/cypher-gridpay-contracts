@@ -4,6 +4,7 @@ all: test
 
 test: build
 	$(MAKE) -C core test
+	$(MAKE) -C core budget-bench
 	$(MAKE) -C orchestrator test
 
 # Refresh Soroban contract test snapshots after an SDK upgrade.
@@ -17,6 +18,11 @@ build:
 
 check-size:
 	$(MAKE) -C core check-size
+
+# Differential fuzzing (issue #253): native vs compiled-WASM execution.
+# Requires the WASM artifacts from `build`; fails if they are missing.
+differential: build
+	cd tests/e2e && REQUIRE_WASM=1 cargo test --test differential_wasm
 
 fmt:
 	$(MAKE) -C core fmt
@@ -38,4 +44,4 @@ clean:
 	$(MAKE) -C core clean
 	$(MAKE) -C orchestrator clean
 
-.PHONY: default all test build check-size fmt clippy check doc clean
+.PHONY: differential default all test build check-size fmt clippy check doc clean
