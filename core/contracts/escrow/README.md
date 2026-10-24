@@ -18,6 +18,25 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 - verify_escrow_participant: Verifies if a given address is a valid participant (customer or merchant) of an escrow.
 - verify_observer_access: Verifies whether an observer has active, non-expired read-only access.
 
+### Multi-party dispute commit-reveal voting
+
+Multi-party disputes use `commit_dispute_vote(escrow_id, voter, commitment)` and
+`reveal_dispute_vote(escrow_id, voter, vote_choice, salt)` instead of plaintext
+votes. A commitment is the SHA-256 hash of the concatenated XDR encodings of
+`escrow_id`, `voter`, `vote_choice`, and the 32-byte `salt`, in that order.
+`vote_choice` is `0` for the customer and `1` for the merchant; binding the
+escrow ID and voter prevents replaying another voter's commitment.
+
+The commit window lasts 3.5 days from dispute creation. Reveal opens after that
+deadline, or early once every eligible participant has committed. The reveal
+deadline is 7 days from dispute creation. Revealed votes count according to
+their configured voting weights, and a side needs more than half of the total
+eligible weight to meet quorum. A committed voter who does not reveal by the
+deadline receives the configured reputation loss penalty. If neither side
+meets quorum by the reveal deadline, the contract emits `DisputeEscalated` and
+uses the existing customer-refund fallback so the escrow is not locked
+indefinitely.
+
 The escrow dispute flow has two separate timeout paths, and they apply in different dispute rounds.
 
 - Escalation timeout applies while the escrow is in the Disputed state after a party escalates the dispute. `escalate_dispute` increments `escalation_level`, captures `escalated_at`, and adds a deadline at `now + escalation_timeout`. When that deadline is processed, `trigger_timeout_resolution` resolves the dispute under the configured `auto_resolve_in_favor_of` policy. This timeout is tied to the escalation event, not to a filed appeal.
