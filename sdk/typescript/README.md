@@ -70,6 +70,67 @@ const client = new PaymentsClient({
 const payment = await client.getPayment(paymentId);
 ```
 
+## Signing payment-channel settlements
+
+`settle_channel` verifies an ed25519 signature over a domain-separated digest
+(the full layout is in [SECURITY.md](../../SECURITY.md#61-signed-messages-and-domain-separation)):
+
+```text
+domain_hash = sha256(
+      "CYPHER_GRIDPAY_DOMAIN_V1"   24 bytes, ASCII (protocol + domain version)
+   || network_id                  32 bytes: sha256(network passphrase)
+   || contract_address            40 bytes: XDR ScVal of the contract address
+   || action_tag                  ASCII entry-point tag, e.g. "channel_settle"
+)
+
+struct_hash = action-specific (below)
+
+digest = sha256( 0x19 || 0x01 || domain_hash || struct_hash )   66-byte pre-image
+```
+
+The signer signs the 32-byte `digest` with ed25519.
+
+| Action tag | Entry point | `struct_hash` |
+|---|---|---|
+| `channel_settle` | `settle_channel(channel_id, merchant_amount, nonce, signature)` | `sha256(xdr(u64 channel_id) \|\| xdr(i128 merchant_amount) \|\| xdr(u64 nonce))` |
+
+`xdr(...)` is the XDR encoding of the value as a Soroban `ScVal` (what
+`to_xdr` produces on-chain): 12 bytes for a `u64`, 20 bytes for an `i128`.
+
+Computing it client-side:
+
+```ts
+import { Address, Networks, hash, nativeToScVal } from "@stellar/stellar-sdk";
+
+function channelSettleDigest(
+  networkPassphrase: string,
+  contractId: string,
+  channelId: bigint,
+  merchantAmount: bigint,
+  nonce: bigint,
+): Buffer {
+  const domainHash = hash(Buffer.concat([
+    Buffer.from("CYPHER_GRIDPAY_DOMAIN_V1", "ascii"),
+    hash(Buffer.from(networkPassphrase)),               // network_id
+    new Address(contractId).toScVal().toXDR(),          // 40 bytes
+    Buffer.from("channel_settle", "ascii"),
+  ]));
+  const structHash = hash(Buffer.concat([
+    nativeToScVal(channelId, { type: "u64" }).toXDR(),
+    nativeToScVal(merchantAmount, { type: "i128" }).toXDR(),
+    nativeToScVal(nonce, { type: "u64" }).toXDR(),
+  ]));
+  return hash(Buffer.concat([Buffer.from([0x19, 0x01]), domainHash, structHash]));
+}
+
+const signature = customerKeypair.sign(
+  channelSettleDigest(Networks.TESTNET, paymentContractId, channelId, amount, nonce),
+);
+```
+
+To check the encoding, compare it with the contract's own
+`channel_settle_digest(channel_id, merchant_amount, nonce)` (a read-only call).
+
 ## Error handling
 
 Contract errors surface as `Error` instances whose `code` is the generated
@@ -88,6 +149,36 @@ try {
   throw err;
 }
 ```
+
+For errors returned by Soroban RPC, decode the contract domain and numeric
+contract error code directly. Unknown codes remain available on the returned
+error's `code` field.
+
+```ts
+import { decodeSorobanContractError } from "@cypher-gridpay/contracts-sdk";
+
+try {
+  await client.completePayment(paymentId);
+} catch (error) {
+  const contractError = decodeSorobanContractError(error, "payment");
+  if (contractError) {
+    console.error(contractError.code, contractError.errorName, contractError.resolution);
+  }
+  throw error;
+}
+```
+
+## Events and transactions
+
+`parseContractEvent` converts Soroban XDR topics and values into a named,
+typed event. `pollContractEvents` reads one RPC page at a time and only saves
+the cursor after every event callback succeeds, so applications can resume
+without acknowledging unprocessed events.
+
+`executeSorobanTransaction` provides the common simulate, restore, assemble,
+submit, and exponential-backoff polling flow. Supply callbacks for signing,
+transaction assembly, `RestoreFootprintOp` submission, and optional fee-bump
+construction so the application retains control of keys and fee sources.
 
 ## Why generated bindings
 

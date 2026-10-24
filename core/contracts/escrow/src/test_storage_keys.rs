@@ -637,3 +637,75 @@ fn test_namespaced_keys_hold_independent_values() {
     assert_eq!(threshold, 555);
     assert_eq!(weight, 666);
 }
+
+/// Instance-storage budget: the pause-history ring buffer (free-text reasons)
+/// lives in persistent storage, so instance storage stays under
+/// `MAX_INSTANCE_STORAGE_BYTES` with the buffer full.
+mod instance_budget {
+    use crate::storage::assert_instance_storage_within_budget;
+    use crate::{ConfigKey, DataKey, EscrowContract, EscrowContractClient, PauseHistory, PAUSE_HISTORY_LIMIT};
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    const LONG_REASON: &str = "Emergency pause: an oracle feed reported a price outside the configured \
+        deviation band and the operations team is investigating whether the feed or the market is at \
+        fault before any further escrow releases are allowed to proceed.";
+
+    fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        (client, contract_id, admin)
+    }
+
+    #[test]
+    fn full_pause_history_keeps_instance_storage_under_budget() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        let reason = String::from_str(&env, LONG_REASON);
+        // More cycles than the ring buffer holds, every slot written.
+        for _ in 0..(PAUSE_HISTORY_LIMIT + 5) {
+            client.pause_contract(&admin, &reason);
+            client.unpause_contract(&admin);
+        }
+
+        assert_instance_storage_within_budget(&env, &contract_id);
+        assert_eq!(
+            client.get_pause_history(&(PAUSE_HISTORY_LIMIT as u32), &0).len() as u64,
+            PAUSE_HISTORY_LIMIT
+        );
+        env.as_contract(&contract_id, || {
+            for slot in 0..PAUSE_HISTORY_LIMIT {
+                let key = DataKey::Config(ConfigKey::PauseHistoryEntry(slot));
+                assert!(env.storage().persistent().has(&key));
+                assert!(!env.storage().instance().has(&key));
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_instance_slot_is_still_read_and_moved_on_overwrite() {
+        let env = Env::default();
+        let (client, contract_id, admin) = setup(&env);
+        client.pause_contract(&admin, &String::from_str(&env, "first"));
+        // Simulate a contract that recorded this entry before the move.
+        let key = DataKey::Config(ConfigKey::PauseHistoryEntry(0));
+        env.as_contract(&contract_id, || {
+            let entry: PauseHistory = env.storage().persistent().get(&key).unwrap();
+            env.storage().persistent().remove(&key);
+            env.storage().instance().set(&key, &entry);
+        });
+
+        let history = client.get_pause_history(&10, &0);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().reason, String::from_str(&env, "first"));
+
+        // Unpausing rewrites the slot, which moves it to persistent storage.
+        client.unpause_contract(&admin);
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().persistent().has(&key));
+            assert!(!env.storage().instance().has(&key));
+        });
+    }
+}

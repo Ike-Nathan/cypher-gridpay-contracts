@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String, Vec};
 
 fn setup(env: &Env) -> (RefundContractClient, Address) {
     let contract_id = env.register(RefundContract, ());
@@ -634,5 +634,248 @@ fn test_merchant_override_blocked_while_arbitration_open() {
     assert_eq!(
         client.try_merchant_override_denial(&merchant, &refund_id),
         Err(Ok(Error::Core(CoreError::InvalidStatus)))
+    );
+}
+
+// ── Issue #234: category terms and restocking fees ──────────────────────────
+
+/// Registers a funded token and returns `(token, contract address)`.
+fn funded_token(env: &Env, client: &RefundContractClient) -> Address {
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    soroban_sdk::token::StellarAssetClient::new(env, &token).mint(&client.address, &100_000);
+    token
+}
+
+/// Requests, approves and processes a refund of `amount` out of a 10_000
+/// payment and returns `(customer balance, merchant balance)`.
+fn process_with_reason(
+    env: &Env,
+    client: &RefundContractClient,
+    admin: &Address,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    payment_id: u64,
+    amount: i128,
+    reason_code: RefundReasonCode,
+) -> (i128, i128) {
+    let refund_id = client.request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &amount,
+        &10_000,
+        token,
+        &String::from_str(env, "restocking"),
+        &reason_code,
+        &env.ledger().timestamp(),
+    );
+    if client.get_refund(&refund_id).status == RefundStatus::Requested {
+        client.approve_refund(admin, &refund_id);
+    }
+    client.process_refund(admin, &refund_id);
+    let balances = soroban_sdk::token::Client::new(env, token);
+    (balances.balance(customer), balances.balance(merchant))
+}
+
+#[test]
+fn test_restocking_fee_split_between_customer_and_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let token = funded_token(&env, &client);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    // 5% restocking fee, capped at 300.
+    client.set_refund_eligibility_terms(
+        &merchant,
+        &customer,
+        &0,
+        &500,
+        &300,
+        &true,
+        &Vec::new(&env),
+    );
+
+    let (customer_bal, merchant_bal) = process_with_reason(
+        &env,
+        &client,
+        &admin,
+        &merchant,
+        &customer,
+        &token,
+        1,
+        4_000,
+        RefundReasonCode::CustomerRequest,
+    );
+    assert_eq!((customer_bal, merchant_bal), (3_800, 200));
+
+    // The cap bounds the fee: 5% of 10_000 = 500 > 300.
+    let (customer_bal, merchant_bal) = process_with_reason(
+        &env,
+        &client,
+        &admin,
+        &merchant,
+        &customer,
+        &token,
+        2,
+        10_000,
+        RefundReasonCode::CustomerRequest,
+    );
+    assert_eq!((customer_bal, merchant_bal), (3_800 + 9_700, 200 + 300));
+}
+
+#[test]
+fn test_statutory_and_configured_exemptions_skip_restocking_fee() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let token = funded_token(&env, &client);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    client.set_refund_eligibility_terms(
+        &merchant,
+        &customer,
+        &0,
+        &2_500,
+        &10_000,
+        &true,
+        &Vec::from_array(&env, [RefundReasonCode::NonDelivery]),
+    );
+
+    // Statutory exemptions hold even though the merchant did not list them.
+    let mut payment_id = 0;
+    for reason in [
+        RefundReasonCode::Unauthorized,
+        RefundReasonCode::DuplicateCharge,
+        RefundReasonCode::ProductDefect,
+        RefundReasonCode::NonDelivery,
+    ] {
+        payment_id += 1;
+        let (customer_bal, merchant_bal) = process_with_reason(
+            &env, &client, &admin, &merchant, &customer, &token, payment_id, 1_000, reason,
+        );
+        assert_eq!(customer_bal, payment_id as i128 * 1_000);
+        assert_eq!(merchant_bal, 0);
+    }
+}
+
+#[test]
+fn test_restocking_fee_only_applies_to_matching_category() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let token = funded_token(&env, &client);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let physical = 1u64 << PaymentCategory::PhysicalGoods.to_index();
+    client.set_refund_eligibility_terms(
+        &merchant,
+        &customer,
+        &physical,
+        &500,
+        &1_000,
+        &true,
+        &Vec::new(&env),
+    );
+    client.tag_payment_category(&merchant, &1, &PaymentCategory::PhysicalGoods);
+    client.tag_payment_category(&merchant, &2, &PaymentCategory::DigitalGoods);
+
+    let (_, merchant_bal) = process_with_reason(
+        &env,
+        &client,
+        &admin,
+        &merchant,
+        &customer,
+        &token,
+        1,
+        2_000,
+        RefundReasonCode::CustomerRequest,
+    );
+    assert_eq!(merchant_bal, 100);
+
+    // Digital goods (and untagged payments) are outside the mask.
+    let (_, merchant_bal) = process_with_reason(
+        &env,
+        &client,
+        &admin,
+        &merchant,
+        &customer,
+        &token,
+        2,
+        2_000,
+        RefundReasonCode::CustomerRequest,
+    );
+    assert_eq!(merchant_bal, 100);
+}
+
+#[test]
+fn test_restocking_fee_bps_is_capped() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    assert_eq!(
+        client.try_set_refund_eligibility_terms(
+            &merchant,
+            &customer,
+            &0,
+            &(MAX_RESTOCKING_FEE_BPS + 1),
+            &0,
+            &true,
+            &Vec::new(&env),
+        ),
+        Err(Ok(Error::Ext(ExtError::RestockingFeeTooHigh)))
+    );
+}
+
+#[test]
+fn test_partial_consumption_refund_rejected_when_disallowed() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let digital = 1u64 << PaymentCategory::DigitalGoods.to_index();
+    client.set_refund_eligibility_terms(
+        &merchant,
+        &customer,
+        &digital,
+        &0,
+        &0,
+        &false,
+        &Vec::new(&env),
+    );
+    client.tag_payment_category(&merchant, &1, &PaymentCategory::DigitalGoods);
+
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "partly used");
+    assert_eq!(
+        client.try_request_refund(
+            &merchant,
+            &1,
+            &customer,
+            &4_000,
+            &10_000,
+            &token,
+            &reason,
+            &RefundReasonCode::CustomerRequest,
+            &0,
+        ),
+        Err(Ok(Error::Ext(ExtError::PartialRefundNotAllowed)))
+    );
+    // A full refund is still allowed, and the rule stays `Allow`.
+    client.request_refund(
+        &merchant,
+        &1,
+        &customer,
+        &10_000,
+        &10_000,
+        &token,
+        &reason,
+        &RefundReasonCode::CustomerRequest,
+        &0,
+    );
+    assert_eq!(
+        client.check_refund_eligibility(&merchant, &customer),
+        EligibilityRule::Allow
     );
 }

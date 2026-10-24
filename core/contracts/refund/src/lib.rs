@@ -4,6 +4,7 @@ use soroban_sdk::{
     BytesN, Env, FromVal, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
+pub mod reentrancy;
 pub mod storage;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
@@ -106,6 +107,7 @@ pub enum DataKey {
     AppealWindowSeconds,
     // Issue #389: two-step admin rotation
     PendingAdmin,
+    PendingAdminProposedAt,
     // Issue #61: VIP tier policy verification for instant refund approval
     VipTierPolicy(Address, u32),
 }
@@ -115,6 +117,7 @@ pub enum DataKey {
 pub enum ArbitrationKey {
     ArbitrationCase(u64),
     ArbitrationCounter,
+    /// Legacy (schema < 3): every arbitrator in one instance `Vec`.
     ArbitratorList,
     ArbitratorsVoted(u64),
     ArbitratorVote(u64, Address),
@@ -122,6 +125,7 @@ pub enum ArbitrationKey {
     AccumulatedTreasuryFees,
     ArbitrationStakeConfig,
     ArbitrationStake(u64),
+    /// Persistent (instance before schema 3): one per registered arbitrator.
     ArbitratorReputation(Address),
     ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
@@ -133,10 +137,22 @@ pub enum ArbitrationKey {
     // Uniqueness guard: maps refund_id -> case_id so the same refund
     // cannot be escalated into multiple parallel arbitration cases.
     CaseByRefund(u64),
+    /// Persistent shard `i` of the arbitrator registry (schema 3+).
+    ArbitratorShard(u32),
+    /// Instance: number of registered arbitrators (schema 3+).
+    ArbitratorCount,
+    /// Persistent shard `i` of the senior arbitrator list (schema 3+).
+    SeniorArbitratorShard(u32),
+    /// Instance: number of senior arbitrators (schema 3+).
+    SeniorArbitratorCount,
     // Time-decay settings for inactive arbitrators' reputation scores
     ReputationDecayConfig,
     // Participation stake deposited by an arbitrator (slashable by admin)
     ArbitratorStake(Address),
+    // Issue #221: Selected juror panel for a case
+    ArbitrationPanel(u64),
+    // Issue #221: Recusal records (case_id, arbitrator) → true
+    RecusalRecord(u64, Address),
 }
 
 // Protocol-level fee configuration and accounting.
@@ -232,6 +248,10 @@ pub enum SystemKey {
     // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
     // processed refund can invalidate only the windows it actually falls within.
     AnalyticsCacheWindows,
+    // Issue #3: escrow lock guard.  Maps payment_id -> escrow_id when funds
+    // are still held in a settlement tranche or cross-contract escrow that
+    // must unlock before the refund payout can proceed.
+    PaymentEscrowLock(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,8 +287,11 @@ pub enum VoucherKey {
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum TokenKey {
+    /// Persistent (schema 3+; instance before): one entry per token.
     SupportedToken(Address),
+    /// Instance: number of registered tokens.
     TokenCount,
+    /// Persistent (schema 3+; instance before): the token at index `i`.
     TokenByIndex(u64),
 }
 
@@ -390,6 +413,10 @@ pub enum CoreError {
     AutoApproveThresholdExceedsCeiling = 32,
     /// Mandatory cooldown period between customer refunds is active. Resolution: wait until cooldown period elapses.
     RefundCooldownActive = 33,
+    /// Refund payout is blocked because the underlying escrow has not yet been
+    /// released.  Resolution: call release_escrow_lock once the upstream
+    /// settlement tranche unlocks, then retry process_refund.
+    EscrowStillLocked = 34,
 }
 
 /// Extended refund features: hooks, vouchers, eligibility, fraud detection, and admin rotation.
@@ -471,21 +498,8 @@ pub enum ExtError {
     TooManyTriggerConditions = 70,
     // Slash amount exceeds the arbitrator's deposited stake
     InsufficientArbitratorStake = 71,
-    // A refund's evidence transcript is full (MAX_EVIDENCE_ITEMS).
-    EvidenceLimitExceeded = 72,
-    // Evidence stage out of turn (no InitialClaim yet, or a surrebuttal
-    // before any rebuttal) or submitted by the wrong party for the stage.
-    EvidenceOutOfOrder = 73,
-    // The rebuttal window has closed; no more evidence is accepted.
-    EvidenceWindowClosed = 74,
-    // A denial or arbitration vote before the merchant's rebuttal deadline
-    // (and without a waiver).
-    RebuttalWindowOpen = 75,
-    // The same refund id appears more than once in a batch.
-    DuplicateBatchEntry = 76,
-    // The refund contract's balance of a token can't cover the batch's
-    // refunds in that token.
-    InsufficientBatchLiquidity = 77,
+    /// The admin rotation delay has not elapsed.
+    AdminRotationDelayNotElapsed = 72,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -620,6 +634,19 @@ pub struct RefundApprovedEvent {
     pub approved_at: u64,
 }
 
+/// Issue #3: Emitted when a refund is approved but the underlying funds are
+/// still locked in a settlement tranche / cross-contract escrow.  The customer
+/// payout is deferred until `release_escrow_lock` is called by an admin.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowUnlockPending {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefundDeniedEvent {
@@ -744,6 +771,55 @@ pub struct StakeForfeited {
     pub amount: i128,
 }
 
+/// Issue #221: Selected juror panel for a VRF-based arbitration case.
+///
+/// Stores the final panel of arbitrators chosen by `select_arbitration_panel`,
+/// the entropy seed used, and per-juror effective weights so audit tooling can
+/// reproduce the draw.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ArbitrationPanel {
+    /// The arbitration case this panel belongs to.
+    pub case_id: u64,
+    /// Ordered list of selected juror addresses.
+    pub jurors: Vec<Address>,
+    /// Number of jurors (always odd: 3, 5, or 7).
+    pub panel_size: u32,
+    /// Entropy seed supplied by the caller (commit-reveal beacon).
+    pub entropy_seed: BytesN<32>,
+    /// Timestamp at which the panel was finalized.
+    pub selected_at: u64,
+}
+
+/// Issue #221: Recusal record stored when an arbitrator is recused from a case.
+#[derive(Clone)]
+#[contracttype]
+pub struct RecusalRecord {
+    pub case_id: u64,
+    pub arbitrator: Address,
+    pub replacement: Option<Address>,
+    pub recused_at: u64,
+}
+
+/// Emitted when a VRF-weighted panel is selected for an arbitration case.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrationPanelSelected {
+    pub case_id: u64,
+    pub panel_size: u32,
+    pub selected_at: u64,
+}
+
+/// Emitted when an arbitrator is recused from a panel and a replacement is drawn.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorRecused {
+    pub case_id: u64,
+    pub recused: Address,
+    pub replacement: Option<Address>,
+    pub recused_at: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct ArbitrationFeeConfig {
@@ -799,6 +875,10 @@ pub const DEFAULT_REPUTATION_DECAY_BPS: u32 = 1_000;
 pub const DEFAULT_REPUTATION_INACTIVITY_SECS: u64 = 60 * 24 * 60 * 60;
 // Cap on compounded periods; after this many the score is effectively zero.
 const MAX_REPUTATION_DECAY_PERIODS: u64 = 64;
+// Ranking uses an 80% prior with the weight of 20 cases.
+const ARBITRATOR_PRIOR_CASES: u128 = 20;
+const ARBITRATOR_PRIOR_WINS: u128 = 16;
+pub const ADMIN_ROTATION_DELAY_SECS: u64 = 24 * 60 * 60;
 
 // Default protocol maintenance fee on arbitration awards: 2%.
 pub const DEFAULT_ARBITRATION_PROTOCOL_FEE_BPS: u32 = 200;
@@ -820,6 +900,7 @@ pub struct ArbitratorScoreUpdated {
     pub arbitrator: Address,
     pub old_score: i128,
     pub new_score: i128,
+    pub confidence_score: u32,
 }
 
 #[contractevent]
@@ -930,6 +1011,14 @@ pub struct RefundVoucher {
     pub remaining_balance: i128,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherBackingReleased {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+}
+
 // Issue #194: Tiered arbitration escalation
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -995,7 +1084,22 @@ pub struct RefundEligibilityEntry {
     pub rule: EligibilityRule,
     pub reason_hash: BytesN<32>,
     pub set_at: u64,
+    /// Issue #234: payment categories (bit = `PaymentCategory::to_index`) the
+    /// terms below apply to; `0` applies them to every payment.
+    pub category_bitmask: u64,
+    /// Issue #234: restocking fee retained for the merchant, in bps of the
+    /// refund amount (at most `MAX_RESTOCKING_FEE_BPS`).
+    pub restocking_fee_bps: u32,
+    /// Issue #234: upper bound on a single restocking fee.
+    pub max_restocking_fee_cap: i128,
+    /// Issue #234: whether a partial refund (partially consumed payment) is allowed.
+    pub allow_partial_consumption: bool,
+    /// Issue #234: reason codes that never incur the restocking fee.
+    pub exempt_reason_codes: Vec<RefundReasonCode>,
 }
+
+/// Issue #234: maximum merchant restocking fee (25%).
+pub const MAX_RESTOCKING_FEE_BPS: u32 = 2_500;
 
 /// Storage key for eligibility entries: keyed by (merchant, customer).
 #[derive(Clone, Debug, PartialEq)]
@@ -1009,6 +1113,10 @@ pub enum EligibilityKey {
     MerchantCustomerCount(Address),
     /// Admin-assigned standing of a merchant. Absent means `Active`.
     MerchantStatus(Address),
+    /// Auto-throttling thresholds (unset: auto-throttling is off).
+    RiskThresholds,
+    /// A merchant's refund-risk counters for the current 30-day window.
+    MerchantRisk(Address),
 }
 
 /// Standing of a merchant with the platform. Only `Active` merchants may
@@ -1020,7 +1128,53 @@ pub enum MerchantStatus {
     Active,
     Suspended,
     Sanctioned,
+    /// Refunds can still be requested, but they only settle when the admin
+    /// processes them (manual sign-off), and the merchant's own overrides
+    /// are blocked. Set automatically by refund-risk throttling, or by admin.
+    Restricted,
 }
+
+/// Refund-risk thresholds for automatic merchant throttling, in basis points
+/// of a merchant's substantiated refunds in the current 30-day window.
+///
+/// The ratio is `high_risk_refund_count * 10_000 / refund_count`, where
+/// high-risk means `Unauthorized`, `NonDelivery` or `ProductDefect`. Nothing
+/// happens until the window holds at least `min_sample_tx_count` refunds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRiskThresholds {
+    pub warning_ratio_bps: u32,
+    pub restricted_ratio_bps: u32,
+    pub suspended_ratio_bps: u32,
+    pub min_sample_tx_count: u32,
+}
+
+/// A merchant's substantiated refunds in the current 30-day window. Only
+/// processed refunds (approved, auto-refunded, or upheld in arbitration) are
+/// counted; requests that were denied or never approved are not.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRiskWindow {
+    pub window_start: u64,
+    pub refund_count: u32,
+    pub high_risk_refund_count: u32,
+    pub total_refund_volume: i128,
+}
+
+/// Emitted when refund-risk throttling changes a merchant's standing, or (with
+/// `to == from`) when a merchant crosses the warning ratio.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAutoThrottled {
+    pub merchant: Address,
+    pub from: MerchantStatus,
+    pub to: MerchantStatus,
+    pub ratio_bps: u32,
+    pub sample_size: u32,
+}
+
+/// Length of the refund-risk window.
+pub const MERCHANT_RISK_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1069,6 +1223,11 @@ pub struct Refund {
     pub appeal_deadline: Option<u64>,
     // Issue #199: TTL expiry
     pub expires_at: Option<u64>,
+    // Issue #3: Escrow-lock guard.  When the underlying funds are still held
+    // in a time-delayed settlement tranche or cross-contract escrow at
+    // approval time, this field is set to the escrow ID that must be released
+    // before `process_refund` is allowed to pay out the customer.
+    pub escrow_lock_ref: Option<u64>,
 }
 
 // Schema v1 shape of `Refund`, written before `reason_code` was added
@@ -1116,6 +1275,8 @@ impl LegacyRefundV1 {
             rejected_by: self.rejected_by,
             appeal_deadline: self.appeal_deadline,
             expires_at: self.expires_at,
+            // Legacy records predate the escrow-lock guard; no lock pending.
+            escrow_lock_ref: None,
         }
     }
 }
@@ -1165,6 +1326,31 @@ pub struct CustomerRefundSummary {
     pub total_amount_refunded: i128,
     pub avg_processing_time: u64,
 }
+
+/// Issue #230: weighted serial-refunder score that separates high-volume
+/// buyers from customers who file refunds across many merchants.
+///
+/// `abuse_risk_bps = (denied * 3 + approved) * 10_000 / max(10, payments)`,
+/// capped at 10_000 and reduced by `CLEAN_PAYMENT_DECAY_BPS` for each
+/// consecutive payment completed without a refund.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct CustomerRefundProfile {
+    pub total_lifetime_payments_count: u64,
+    pub total_refunds_requested: u64,
+    pub approved_refunds_count: u64,
+    pub denied_refunds_count: u64,
+    pub distinct_merchants_refunded: u32,
+    pub consecutive_clean_payments: u64,
+    pub abuse_risk_bps: u32,
+    /// Customer is excluded from automated/fast-track refunds until this time.
+    pub auto_refund_disqualified_until: u64,
+}
+
+/// Issue #230: risk reduction per consecutive refund-free payment.
+pub const CLEAN_PAYMENT_DECAY_BPS: u32 = 500;
+/// Issue #230: minimum quarantine length once the threshold is crossed.
+pub const ABUSE_QUARANTINE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 #[contracttype]
@@ -1252,6 +1438,31 @@ pub struct ContractStateMatchCondition {
     pub expected: Bytes,
 }
 
+/// Issue #2: SLA-breach oracle condition.
+///
+/// When evaluated, this condition makes a cross-contract call to
+/// `oracle_contract` invoking `get_sla_metric(metric_key)` which is expected
+/// to return an `i128` representing the current metric in basis-points
+/// (e.g. 9940 = 99.40 % uptime).  The condition is **met** (i.e. the
+/// auto-refund fires) when the returned metric is strictly below
+/// `sla_threshold_bps`.
+///
+/// Examples
+/// --------
+/// * GridPay power uptime SLA: threshold = 9950 (99.50 %), oracle reports
+///   9930 → breach → refund triggers.
+/// * API availability: threshold = 9990, oracle reports 9988 → breach.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SlaBreachCondition {
+    /// The oracle contract that exposes `get_sla_metric(metric_key: Bytes) -> i128`.
+    pub oracle_contract: Address,
+    /// SLA floor in basis points (0–10 000).  Breach when metric < threshold.
+    pub sla_threshold_bps: i128,
+    /// Opaque key forwarded to the oracle to identify which metric to query.
+    pub metric_key: Bytes,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum AutoRefundCondition {
@@ -1260,6 +1471,8 @@ pub enum AutoRefundCondition {
     // Composite condition: met only when every inner condition is met.
     // Evaluation short-circuits on the first unmet condition.
     All(Vec<AutoRefundCondition>),
+    /// Issue #2: SLA breach verified against a signed oracle telemetry report.
+    SlaBreach(SlaBreachCondition),
 }
 
 // Upper bound on leaf conditions per trigger, so evaluating a trigger (each
@@ -1509,8 +1722,16 @@ pub struct NetRefund {
 #[derive(Clone)]
 #[contracttype]
 pub struct RefundCooldownConfig {
-    pub cooldown_seconds: u64, // Minimum time between refund requests per customer
+    pub cooldown_seconds: u64, // Minimum time between refund requests per customer (base window)
     pub enabled: bool,         // Whether cooldown is enforced
+    /// Issue #4: Maximum consecutive rejected/denied attempts before the
+    /// backoff multiplier is capped.  0 means no cap (unbounded growth).
+    pub max_attempts: u32,
+    /// Issue #4: Multiplier applied per denied attempt.  The effective
+    /// cooldown after `n` consecutive denials is:
+    ///   `cooldown_seconds × backoff_multiplier^(n-1)` (capped at u64::MAX).
+    /// A value of 1 disables backoff (flat cooldown).
+    pub backoff_multiplier: u32,
 }
 
 /// Tracks the last refund request time for a customer
@@ -1520,6 +1741,10 @@ pub struct CustomerRefundCooldown {
     pub customer: Address,
     pub last_refund_requested_at: u64,
     pub cooldown_seconds: u64,
+    /// Issue #4: Number of consecutive denied/rejected refund attempts on
+    /// any payment by this customer.  Reset to 0 on a successfully processed
+    /// refund.
+    pub consecutive_denied_attempts: u32,
 }
 
 #[contractevent]
@@ -1732,6 +1957,15 @@ pub enum RefundExtKey {
     RefundTTLConfig,
 }
 
+// Issue #230: customer abuse scoring
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum CustomerAbuseKey {
+    Profile(Address),
+    RefundedMerchant(Address, Address),
+    QuarantineThresholdBps,
+}
+
 // Issue #195: Batch decision types
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -1909,6 +2143,24 @@ pub struct MigrationReport {
     pub dry_run: bool,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Refunds
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most refunds `migrate_schema_step` migrates per call.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct RefundContract;
 
@@ -2011,6 +2263,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
@@ -2061,6 +2314,111 @@ impl RefundContract {
         }
     }
 
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of refunds at a
+    /// time, so contracts with many refunds stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over refund ids
+    /// `1..=refund counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` refunds
+    /// (capped at [`MAX_MIGRATION_BATCH`]). After the last one, the non-record
+    /// steps run, the schema version is written and the guard is lifted. Every
+    /// step is idempotent, so retrying a batch is safe; read-only queries keep
+    /// working throughout.
+    ///
+    /// # Errors
+    /// `Unauthorized`, `SchemaAlreadyAtTarget`, `InvalidMigrationBatch` for a
+    /// batch size of 0, `SchemaMigrationFailed` for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if batch_size == 0 {
+            return Err(Error::Ext(ExtError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::RefundCounter)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::MigrationInProgress, &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for refund_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                // Legacy records first: the v2 step reads them as `Refund`.
+                Self::migrate_legacy_refund(&env, refund_id)?;
+                Self::migrate_refund_v1_to_v2(&env, refund_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&SystemKey::SchemaVersion, &cursor.to_version);
+            env.storage().instance().remove(&SystemKey::MigrationInProgress);
+        }
+        storage::set_persistent(&env, &SystemKey::MigrationCursor, &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &SystemKey::MigrationCursor)
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&SystemKey::MigrationInProgress)
+            .unwrap_or(false)
+        {
+            return Err(Error::Ext(ExtError::MigrationInProgress));
+        }
+        Ok(())
+    }
+
     /// Runs the data transformations registered for every schema version step
     /// between `from_version` (exclusive) and `to_version` (inclusive).
     ///
@@ -2086,6 +2444,11 @@ impl RefundContract {
                 Self::migrate_legacy_refunds(env)?;
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: arbitrator lists and supported-token entries move from
+            // instance to persistent storage.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
@@ -2105,43 +2468,50 @@ impl RefundContract {
             .unwrap_or(0);
 
         for refund_id in 1..=counter {
-            let refund: Refund = env
-                .storage()
-                .instance()
-                .get(&DataKey::Refund(refund_id))
-                .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
-
-            // Corrupted record: the id and the stored record must agree.
-            if refund.id != refund_id {
-                return Err(Error::Ext(ExtError::SchemaMigrationFailed));
-            }
-
-            // Status index membership (RefundsByStatus / RefundStatusIndex).
-            if !env
-                .storage()
-                .instance()
-                .has(&DataKey::RefundStatusIndex(refund_id))
-            {
-                Self::add_to_status_index(env, refund.status.clone(), refund_id);
-            }
-
-            // Rejection bookkeeping used by the appeal window checks.
-            if refund.status == RefundStatus::Rejected
-                && !env
-                    .storage()
-                    .instance()
-                    .has(&SystemKey::RefundRejectedAt(refund_id))
-            {
-                let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
-                env.storage()
-                    .instance()
-                    .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
-            }
-
-            // Per-customer history index.
-            Self::index_refund_for_customer(env, &refund.customer, refund_id);
+            Self::migrate_refund_v1_to_v2(env, refund_id)?;
         }
 
+        Ok(())
+    }
+
+    /// v1 -> v2 for one refund: status index, rejection timestamp, customer
+    /// history. Idempotent.
+    fn migrate_refund_v1_to_v2(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the stored record must agree.
+        if refund.id != refund_id {
+            return Err(Error::Ext(ExtError::SchemaMigrationFailed));
+        }
+
+        // Status index membership (RefundsByStatus / RefundStatusIndex).
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::RefundStatusIndex(refund_id))
+        {
+            Self::add_to_status_index(env, refund.status.clone(), refund_id);
+        }
+
+        // Rejection bookkeeping used by the appeal window checks.
+        if refund.status == RefundStatus::Rejected
+            && !env
+                .storage()
+                .instance()
+                .has(&SystemKey::RefundRejectedAt(refund_id))
+        {
+            let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
+            env.storage()
+                .instance()
+                .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
+        }
+
+        // Per-customer history index.
+        Self::index_refund_for_customer(env, &refund.customer, refund_id);
         Ok(())
     }
 
@@ -2203,6 +2573,9 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdminProposedAt, &env.ledger().timestamp());
 
         (AdminRotationProposed {
             current_admin: admin,
@@ -2216,12 +2589,13 @@ impl RefundContract {
     /// Accept a pending admin rotation, finalizing the transition (Issue #389).
     ///
     /// Must be called by the address previously proposed via
-    /// [`Self::propose_admin`]. Replaces `DataKey::Admin` with the caller and
-    /// clears the pending slot.
+    /// [`Self::propose_admin`], after [`ADMIN_ROTATION_DELAY_SECS`] has elapsed.
+    /// Replaces `DataKey::Admin` with the caller and clears the pending slot.
     ///
     /// # Errors
     /// Returns `NoPendingAdmin` if no rotation has been proposed.
     /// Returns `NotPendingAdmin` if the caller is not the proposed admin.
+    /// Returns `AdminRotationDelayNotElapsed` if the security delay is active.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         new_admin.require_auth();
 
@@ -2234,6 +2608,15 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::NotPendingAdmin));
         }
 
+        let proposed_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminProposedAt)
+            .unwrap_or(env.ledger().timestamp());
+        if env.ledger().timestamp().saturating_sub(proposed_at) < ADMIN_ROTATION_DELAY_SECS {
+            return Err(Error::Ext(ExtError::AdminRotationDelayNotElapsed));
+        }
+
         let previous_admin: Address = env
             .storage()
             .instance()
@@ -2242,6 +2625,9 @@ impl RefundContract {
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminProposedAt);
 
         (AdminRotationAccepted {
             previous_admin,
@@ -2281,6 +2667,9 @@ impl RefundContract {
             .get(&DataKey::PendingAdmin)
             .ok_or(Error::Ext(ExtError::NoPendingAdmin))?;
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminProposedAt);
 
         (AdminRotationCancelled {
             admin,
@@ -2353,10 +2742,7 @@ impl RefundContract {
             .get(&TokenKey::TokenCount)
             .unwrap_or(0);
         if token_count > 0 {
-            let supported: Option<SupportedRefundToken> = env
-                .storage()
-                .instance()
-                .get(&TokenKey::SupportedToken(token.clone()));
+            let supported: Option<SupportedRefundToken> = Self::load_supported_token(&env, &token);
             match supported {
                 Some(t) if t.active => {}
                 _ => return Err(Error::Ext(ExtError::UnsupportedRefundToken)),
@@ -2416,6 +2802,107 @@ impl RefundContract {
         admin.require_auth();
 
         Self::approve_refund_internal(&env, admin, refund_id)
+    }
+
+    /// Issue #3: Register a pending settlement-escrow lock for a payment.
+    ///
+    /// When the funds for `payment_id` are still held in a time-delayed
+    /// settlement tranche or cross-contract escrow, call this before (or at
+    /// the same time as) approving the refund.  Any subsequently approved
+    /// refund on this payment will have its payout blocked until
+    /// `release_escrow_lock` is called.
+    ///
+    /// # Arguments
+    /// * `admin` - Contract admin (must be authorized).
+    /// * `payment_id` - The payment whose funds are escrowed.
+    /// * `escrow_id` - The upstream escrow that must be released first.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn set_payment_escrow_lock(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_payment_escrow_lock")?;
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&SystemKey::PaymentEscrowLock(payment_id), &escrow_id);
+        Ok(())
+    }
+
+    /// Issue #3: Clear the settlement-escrow lock for a payment, unblocking
+    /// any pending refund payouts.
+    ///
+    /// Call this once the upstream escrow/settlement tranche has been
+    /// released.  After this, `process_refund` on any approved refund for
+    /// `payment_id` will proceed normally.
+    ///
+    /// For every approved refund on the payment that still carries the lock
+    /// reference, this function clears `escrow_lock_ref` on the `Refund`
+    /// record so that process_refund can proceed without re-checking the
+    /// global lock.
+    ///
+    /// # Arguments
+    /// * `admin` - Contract admin (must be authorized).
+    /// * `payment_id` - The payment whose escrow lock is being cleared.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn release_escrow_lock(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "release_escrow_lock")?;
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        // Remove the global lock entry.
+        env.storage()
+            .instance()
+            .remove(&SystemKey::PaymentEscrowLock(payment_id));
+        // Walk all approved refunds for this payment and clear the per-refund
+        // lock reference so process_refund can proceed without re-checking.
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+        for refund_id in 1..=counter {
+            if let Some(mut refund) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Refund>(&DataKey::Refund(refund_id))
+            {
+                if refund.payment_id == payment_id
+                    && refund.status == RefundStatus::Approved
+                    && refund.escrow_lock_ref.is_some()
+                {
+                    refund.escrow_lock_ref = None;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Refund(refund_id), &refund);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject a pending refund request.
@@ -2490,6 +2977,8 @@ impl RefundContract {
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
         Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
         Self::record_payment_rejection(&env, refund.payment_id);
+        // Issue #4: increment the exponential-backoff denial counter for this customer.
+        Self::record_customer_denied_attempt(&env, &refund.customer);
         env.storage()
             .instance()
             .set(&SystemKey::RefundRejectedAt(refund_id), &denied_at);
@@ -2634,6 +3123,10 @@ impl RefundContract {
             .get(&DataKey::AppealWindowSeconds)
             .unwrap_or(604800);
         let now = env.ledger().timestamp();
+
+        let mut profile = Self::get_customer_refund_profile(env.clone(), refund.customer.clone());
+        profile.denied_refunds_count += 1;
+        Self::save_customer_refund_profile(env, &refund.customer, profile);
 
         refund.status = RefundStatus::PendingAppeal;
         refund.rejected_by = Some(admin.clone());
@@ -3043,6 +3536,7 @@ impl RefundContract {
     /// Returns `InvalidStatus` if the refund is not in `Approved` status.
     /// Returns `TotalRefundsExceedPayment` if processing would exceed the original payment.
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "process_refund")?;
         admin.require_auth();
 
@@ -3151,7 +3645,9 @@ impl RefundContract {
     /// * `trigger_id` - The ID of the trigger to evaluate.
     ///
     /// # Returns
-    /// `true` if the refund was triggered, `false` otherwise.
+    /// `true` if the refund was triggered, `false` otherwise. Issue #230: for a
+    /// quarantined customer the refund is created in `Requested` status for
+    /// manual review, the trigger is consumed and `false` is returned.
     ///
     /// # Errors
     /// Returns `InvalidAmount` if the calculated refund amount is non-positive.
@@ -3190,12 +3686,17 @@ impl RefundContract {
             payment.created_at,
             true,
         )?;
-        Self::process_refund_internal(&env, env.current_contract_address(), refund_id)?;
 
         trigger.active = false;
         env.storage()
             .instance()
             .set(&PolicyKey::AutoRefundTrigger(trigger_id), &trigger);
+
+        // Issue #230: a quarantined customer's claim was routed to manual review.
+        if Self::get_refund(&env, refund_id)?.status != RefundStatus::Approved {
+            return Ok(false);
+        }
+        Self::process_refund_internal(&env, env.current_contract_address(), refund_id)?;
 
         (AutoRefundTriggered {
             trigger_id,
@@ -3504,18 +4005,12 @@ impl RefundContract {
         if admin != stored_admin {
             return Err(Error::Core(CoreError::Unauthorized));
         }
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_arbitrators(&env);
         if list.contains(&arbitrator) {
             return Err(Error::Core(CoreError::Unauthorized));
         }
         list.push_back(arbitrator.clone());
-        env.storage()
-            .instance()
-            .set(&ArbitrationKey::ArbitratorList, &list);
+        Self::store_arbitrators(&env, &list);
 
         // Initialize reputation for new arbitrator
         let reputation = ArbitratorReputation {
@@ -3527,10 +4022,7 @@ impl RefundContract {
             score: 100, // Starting score
             last_active: env.ledger().timestamp(),
         };
-        env.storage().instance().set(
-            &ArbitrationKey::ArbitratorReputation(arbitrator),
-            &reputation,
-        );
+        Self::store_reputation(&env, &arbitrator, &reputation);
 
         Ok(())
     }
@@ -3585,11 +4077,7 @@ impl RefundContract {
             }
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -3630,6 +4118,7 @@ impl RefundContract {
         fee_token: Address,
         fee_amount: i128,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         caller.require_auth();
 
         let refund: Refund = env
@@ -3676,11 +4165,7 @@ impl RefundContract {
             .unwrap_or(0);
         let case_id = counter + 1;
 
-        let arbitrators = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::load_arbitrators(&env);
         if arbitrators.len() < 3 {
             return Err(Error::Core(CoreError::QuorumNotReached));
         }
@@ -3886,6 +4371,7 @@ impl RefundContract {
     /// Returns `RefundNotFound` if the case does not exist.
     /// Returns `InvalidStatus` if the case is not open or quorum (3 votes) has not been reached.
     pub fn close_arbitration_case(env: Env, case_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         let mut case: ArbitrationCase = env
             .storage()
             .instance()
@@ -4092,10 +4578,7 @@ impl RefundContract {
             };
 
             // Get current reputation
-            let mut reputation: ArbitratorReputation = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(voter.clone()))
+            let mut reputation: ArbitratorReputation = Self::load_reputation(&env, &voter)
                 .unwrap_or(ArbitratorReputation {
                     arbitrator: voter.clone(),
                     total_cases: 0,
@@ -4137,16 +4620,14 @@ impl RefundContract {
             reputation.last_active = current_time;
 
             // Store updated reputation
-            env.storage().instance().set(
-                &ArbitrationKey::ArbitratorReputation(voter.clone()),
-                &reputation,
-            );
+            Self::store_reputation(&env, &voter, &reputation);
 
             // Emit score update event
             ArbitratorScoreUpdated {
                 arbitrator: voter.clone(),
                 old_score,
                 new_score: reputation.score,
+                confidence_score: Self::arbitrator_confidence_score(&reputation),
             }
             .publish(&env);
         }
@@ -4646,9 +5127,7 @@ impl RefundContract {
         env: Env,
         arbitrator: Address,
     ) -> Option<ArbitratorReputation> {
-        env.storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorReputation(arbitrator))
+        Self::load_reputation(&env, &arbitrator)
             .map(|rep| Self::decayed_reputation(&env, rep))
     }
 
@@ -4727,17 +5206,23 @@ impl RefundContract {
         rep
     }
 
+    /// Return a Bayesian-smoothed majority-vote rate in basis points.
+    fn arbitrator_confidence_score(reputation: &ArbitratorReputation) -> u32 {
+        let cases = reputation.total_cases as u128;
+        let majority_votes =
+            core::cmp::min(reputation.majority_votes, reputation.total_cases) as u128;
+        let numerator = ARBITRATOR_PRIOR_WINS + majority_votes;
+        let denominator = ARBITRATOR_PRIOR_CASES + cases;
+        ((numerator * 10_000) / denominator) as u32
+    }
+
     /// Get the top arbitrators sorted by score (highest first)
     /// Returns up to `limit` arbitrators
     pub fn get_top_arbitrators(env: Env, limit: u32) -> Vec<ArbitratorReputation> {
         let mut results = Vec::new(&env);
 
         // Get all arbitrators from the arbitrator list
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.len() == 0 {
             return results;
@@ -4746,12 +5231,7 @@ impl RefundContract {
         // Collect all reputations
         let mut reputations = Vec::new(&env);
         for arbitrator in arbitrators.iter() {
-            if let Some(reputation) = env
-                .storage()
-                .instance()
-                .get::<ArbitrationKey, ArbitratorReputation>(&ArbitrationKey::ArbitratorReputation(
-                    arbitrator.clone(),
-                ))
+            if let Some(reputation) = Self::load_reputation(&env, &arbitrator)
             {
                 // Rank by decayed score so long-inactive arbitrators drop.
                 reputations.push_back(Self::decayed_reputation(&env, reputation));
@@ -4766,7 +5246,11 @@ impl RefundContract {
                 let rep_j = reputations.get(j).unwrap();
                 let rep_j_plus_1 = reputations.get(j + 1).unwrap();
 
-                if rep_j.score < rep_j_plus_1.score {
+                let rank_j = Self::arbitrator_confidence_score(&rep_j);
+                let rank_j_plus_1 = Self::arbitrator_confidence_score(&rep_j_plus_1);
+                if rank_j < rank_j_plus_1
+                    || (rank_j == rank_j_plus_1 && rep_j.score < rep_j_plus_1.score)
+                {
                     // Swap
                     let temp = rep_j_plus_1.clone();
                     reputations.set(j + 1, rep_j.clone());
@@ -4803,20 +5287,13 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::InvalidScoreThreshold));
         }
 
-        let mut arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let mut removed_count: u32 = 0;
         let mut new_arbitrators = Vec::new(&env);
 
         for arbitrator in arbitrators.iter() {
-            let reputation: Option<ArbitratorReputation> = env
-                .storage()
-                .instance()
-                .get(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+            let reputation: Option<ArbitratorReputation> = Self::load_reputation(&env, &arbitrator);
 
             let should_remove = if let Some(rep) = reputation {
                 Self::decayed_reputation(&env, rep).score < min_score
@@ -4826,9 +5303,7 @@ impl RefundContract {
 
             if should_remove {
                 // Remove reputation data
-                env.storage()
-                    .instance()
-                    .remove(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
+                Self::remove_reputation(&env, &arbitrator);
 
                 // Emit deregistration event
                 ArbitratorDeregistered {
@@ -4850,6 +5325,456 @@ impl RefundContract {
             .set(&ArbitrationKey::ArbitratorList, &new_arbitrators);
 
         Ok(removed_count)
+    }
+
+    // ── Issue #221: VRF / commit-reveal stratified juror panel selection ────
+
+    /// Selects a stake-and-reputation-weighted pseudo-random juror panel for
+    /// an open arbitration case using a commit-reveal entropy beacon.
+    ///
+    /// ## Selection algorithm
+    /// 1. Collect every address in `ArbitratorList` that has a non-zero
+    ///    effective weight (`stake_amount * reputation_score`) and passes the
+    ///    conflict-of-interest check (must not equal `refund.customer`,
+    ///    `refund.merchant`, or any address that adjudicated a prior round of
+    ///    the same payment).
+    /// 2. Derive deterministic entropy from
+    ///    `sha256(entropy_seed || refund_id_bytes || case_id_bytes)`.
+    /// 3. Run a weighted selection-without-replacement loop: at each round
+    ///    re-hash the running digest, use the 8-byte prefix as a u64, take
+    ///    `cursor = value % total_remaining_weight`, walk the candidate list
+    ///    until the cumulative weight crosses `cursor`, pick that candidate,
+    ///    remove them from the pool, and repeat until `panel_size` jurors are
+    ///    chosen.
+    /// 4. Write the panel to `ArbitrationKey::ArbitrationPanel(case_id)` and
+    ///    update `ArbitrationCase.arbitrators` so existing voting paths work
+    ///    without modification.
+    ///
+    /// ## Arguments
+    /// * `caller`        — any address (permissionless after escalation).
+    /// * `case_id`       — the open arbitration case.
+    /// * `panel_size`    — must be odd and in {3, 5, 7}.
+    /// * `entropy_seed`  — 32-byte commit-reveal beacon supplied by the caller.
+    ///
+    /// ## Errors
+    /// * `InvalidPanelSize`      — panel_size is even or outside {3,5,7}.
+    /// * `RefundNotFound`        — case does not exist.
+    /// * `InvalidStatus`         — case is not `Open`.
+    /// * `PanelAlreadySelected`  — a panel was already committed for this case.
+    /// * `QuorumNotReached`      — not enough eligible (non-conflicted) arbitrators.
+    pub fn select_arbitration_panel(
+        env: Env,
+        caller: Address,
+        case_id: u64,
+        panel_size: u32,
+        entropy_seed: BytesN<32>,
+    ) -> Result<Vec<Address>, Error> {
+        caller.require_auth();
+
+        // panel_size must be odd and in {3, 5, 7}
+        if panel_size % 2 == 0 || panel_size < 3 || panel_size > 7 {
+            return Err(Error::Ext(ExtError::InvalidPanelSize));
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        // Reject if a panel was already committed.
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::ArbitrationPanel(case_id))
+        {
+            return Err(Error::Ext(ExtError::PanelAlreadySelected));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Collect all registered arbitrators.
+        let all_arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        // Build candidate list: (address, effective_weight).
+        // effective_weight = stake_amount * reputation_score.
+        // Conflict-of-interest exclusion: skip customer, merchant, and any
+        // address that voted in a prior round of the same payment.
+        let mut candidates: Vec<(Address, u64)> = Vec::new(&env);
+        let mut total_weight: u64 = 0u64;
+
+        for addr in all_arbitrators.iter() {
+            // Conflict-of-interest checks.
+            if addr == refund.customer || addr == refund.merchant {
+                continue;
+            }
+            // Skip anyone already recused from this case.
+            if env
+                .storage()
+                .instance()
+                .has(&ArbitrationKey::RecusalRecord(case_id, addr.clone()))
+            {
+                continue;
+            }
+
+            // Compute effective weight.
+            let rep: Option<ArbitratorReputation> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorReputation(addr.clone()));
+            let rep_score: u64 = rep.map(|r| r.score.max(0) as u64).unwrap_or(1);
+
+            let arb_stake: Option<i128> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorStake(addr.clone()));
+            let stake_units: u64 = arb_stake
+                .map(|s| (s / 1_000_000).max(1) as u64)
+                .unwrap_or(1);
+
+            let eff_weight = rep_score.saturating_mul(stake_units);
+            if eff_weight == 0 {
+                continue;
+            }
+
+            candidates.push_back((addr.clone(), eff_weight));
+            total_weight = total_weight.saturating_add(eff_weight);
+        }
+
+        if candidates.len() < panel_size {
+            return Err(Error::Core(CoreError::QuorumNotReached));
+        }
+
+        // Derive initial entropy:
+        // sha256( entropy_seed || refund_id_be8 || case_id_be8 )
+        let seed_bytes = entropy_seed.to_array();
+        let refund_id_bytes = refund.id.to_be_bytes();
+        let case_id_bytes = case_id.to_be_bytes();
+
+        let mut hash_input = [0u8; 48]; // 32 + 8 + 8
+        hash_input[..32].copy_from_slice(&seed_bytes);
+        hash_input[32..40].copy_from_slice(&refund_id_bytes);
+        hash_input[40..48].copy_from_slice(&case_id_bytes);
+
+        let mut running_hash: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_array(&env, &hash_input))
+            .into();
+
+        let now = env.ledger().timestamp();
+        let mut panel = Vec::new(&env);
+        let mut remaining_weight = total_weight;
+
+        // Weighted selection-without-replacement.
+        let mut candidate_count = candidates.len();
+        let mut selected_indices: Vec<u32> = Vec::new(&env);
+
+        let mut round: u32 = 0;
+        while panel.len() < panel_size {
+            // Re-hash for each round: sha256(prev_hash || round_be4)
+            let round_bytes = round.to_be_bytes();
+            let mut rehash_input = [0u8; 36]; // 32 + 4
+            let prev = running_hash.to_array();
+            rehash_input[..32].copy_from_slice(&prev);
+            rehash_input[32..36].copy_from_slice(&round_bytes);
+            running_hash = env
+                .crypto()
+                .sha256(&Bytes::from_array(&env, &rehash_input))
+                .into();
+
+            // Take first 8 bytes as u64 cursor.
+            let hash_arr = running_hash.to_array();
+            let cursor_full = u64::from_be_bytes([
+                hash_arr[0], hash_arr[1], hash_arr[2], hash_arr[3],
+                hash_arr[4], hash_arr[5], hash_arr[6], hash_arr[7],
+            ]);
+            if remaining_weight == 0 {
+                break;
+            }
+            let mut cursor = cursor_full % remaining_weight;
+
+            // Walk candidates to find the picked one.
+            let mut picked_idx: u32 = 0;
+            let mut cumulative: u64 = 0;
+            let mut found = false;
+            let mut ci: u32 = 0;
+            while ci < candidates.len() {
+                if selected_indices.contains(&ci) {
+                    ci += 1;
+                    continue;
+                }
+                let (_, w) = candidates.get(ci).unwrap();
+                if cursor < cumulative + w {
+                    picked_idx = ci;
+                    found = true;
+                    break;
+                }
+                cumulative += w;
+                ci += 1;
+            }
+
+            if !found {
+                // Safety fallback: pick the last unselected candidate.
+                let mut fi: u32 = candidates.len();
+                while fi > 0 {
+                    fi -= 1;
+                    if !selected_indices.contains(&fi) {
+                        picked_idx = fi;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if found {
+                let (addr, w) = candidates.get(picked_idx).unwrap();
+                panel.push_back(addr.clone());
+                selected_indices.push_back(picked_idx);
+                remaining_weight = remaining_weight.saturating_sub(w);
+            }
+
+            round += 1;
+            // Safety guard against infinite loop.
+            if round > panel_size * 4 {
+                break;
+            }
+        }
+
+        if panel.len() < panel_size {
+            return Err(Error::Core(CoreError::QuorumNotReached));
+        }
+
+        // Persist the panel.
+        let arb_panel = ArbitrationPanel {
+            case_id,
+            jurors: panel.clone(),
+            panel_size,
+            entropy_seed,
+            selected_at: now,
+        };
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationPanel(case_id),
+            &arb_panel,
+        );
+
+        // Update the case's arbitrator list so existing cast_arbitration_vote works.
+        case.arbitrators = panel.clone();
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationCase(case_id),
+            &case,
+        );
+
+        ArbitrationPanelSelected {
+            case_id,
+            panel_size,
+            selected_at: now,
+        }
+        .publish(&env);
+
+        Ok(panel)
+    }
+
+    /// Returns the selected panel for an arbitration case, if one exists.
+    pub fn get_arbitration_panel(
+        env: Env,
+        case_id: u64,
+    ) -> Result<ArbitrationPanel, Error> {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationPanel(case_id))
+            .ok_or(Error::Ext(ExtError::PanelNotSelected))
+    }
+
+    /// Recuses an arbitrator from an open panel and automatically draws a
+    /// replacement juror from the remaining eligible pool.
+    ///
+    /// May be called by the arbitrator themselves or by the contract admin.
+    /// If no eligible replacement exists the recusal is recorded and the panel
+    /// shrinks; callers should check the updated panel after recusal.
+    ///
+    /// ## Arguments
+    /// * `caller`     — the arbitrator being recused, or the admin.
+    /// * `case_id`    — the open arbitration case.
+    /// * `arbitrator` — address being recused from the panel.
+    ///
+    /// ## Errors
+    /// * `RefundNotFound`    — case does not exist.
+    /// * `InvalidStatus`     — case is not `Open`.
+    /// * `PanelNotSelected`  — no VRF panel has been committed for this case.
+    /// * `NotArbitrator`     — `arbitrator` is not on the current panel.
+    /// * `AlreadyRecused`    — already recused from this case.
+    /// * `Unauthorized`      — caller is neither the arbitrator nor the admin.
+    pub fn recuse_arbitrator(
+        env: Env,
+        caller: Address,
+        case_id: u64,
+        arbitrator: Address,
+    ) -> Result<Option<Address>, Error> {
+        caller.require_auth();
+
+        // Caller must be the arbitrator being recused or the admin.
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if caller != arbitrator && caller != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        // Panel must exist.
+        let mut panel: ArbitrationPanel = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationPanel(case_id))
+            .ok_or(Error::Ext(ExtError::PanelNotSelected))?;
+
+        // Prevent double-recusal — check this BEFORE the panel membership
+        // check so a recused arbitrator (who is no longer on the panel) gets
+        // the correct error rather than NotArbitrator.
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::RecusalRecord(case_id, arbitrator.clone()))
+        {
+            return Err(Error::Ext(ExtError::AlreadyRecused));
+        }
+
+        // Arbitrator must be on the panel.
+        if !panel.jurors.contains(&arbitrator) {
+            return Err(Error::Core(CoreError::NotArbitrator));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Remove arbitrator from panel and case arbitrator list.
+        let mut new_jurors: Vec<Address> = Vec::new(&env);
+        for addr in panel.jurors.iter() {
+            if addr != arbitrator {
+                new_jurors.push_back(addr.clone());
+            }
+        }
+        let mut new_case_arbitrators: Vec<Address> = Vec::new(&env);
+        for addr in case.arbitrators.iter() {
+            if addr != arbitrator {
+                new_case_arbitrators.push_back(addr.clone());
+            }
+        }
+
+        // Attempt replacement draw: pick the highest-weight eligible arbitrator
+        // not already on the panel and not conflicted.
+        let all_arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut replacement: Option<Address> = None;
+        let mut best_weight: u64 = 0;
+
+        for addr in all_arbitrators.iter() {
+            if new_jurors.contains(&addr) {
+                continue;
+            }
+            if addr == arbitrator {
+                continue;
+            }
+            if addr == refund.customer || addr == refund.merchant {
+                continue;
+            }
+            if env
+                .storage()
+                .instance()
+                .has(&ArbitrationKey::RecusalRecord(case_id, addr.clone()))
+            {
+                continue;
+            }
+
+            let rep: Option<ArbitratorReputation> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorReputation(addr.clone()));
+            let rep_score: u64 = rep.map(|r| r.score.max(0) as u64).unwrap_or(1);
+            let arb_stake: Option<i128> = env
+                .storage()
+                .instance()
+                .get(&ArbitrationKey::ArbitratorStake(addr.clone()));
+            let stake_units: u64 = arb_stake
+                .map(|s| (s / 1_000_000).max(1) as u64)
+                .unwrap_or(1);
+            let eff_weight = rep_score.saturating_mul(stake_units);
+
+            if eff_weight > best_weight {
+                best_weight = eff_weight;
+                replacement = Some(addr.clone());
+            }
+        }
+
+        // Add replacement to panel if found.
+        if let Some(ref repl) = replacement {
+            new_jurors.push_back(repl.clone());
+            new_case_arbitrators.push_back(repl.clone());
+        }
+
+        panel.jurors = new_jurors;
+        case.arbitrators = new_case_arbitrators;
+
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationPanel(case_id),
+            &panel,
+        );
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitrationCase(case_id),
+            &case,
+        );
+
+        // Record recusal.
+        let record = RecusalRecord {
+            case_id,
+            arbitrator: arbitrator.clone(),
+            replacement: replacement.clone(),
+            recused_at: now,
+        };
+        env.storage().instance().set(
+            &ArbitrationKey::RecusalRecord(case_id, arbitrator.clone()),
+            &record,
+        );
+
+        ArbitratorRecused {
+            case_id,
+            recused: arbitrator,
+            replacement: replacement.clone(),
+            recused_at: now,
+        }
+        .publish(&env);
+
+        Ok(replacement)
     }
 
     /// Retrieve the details of an arbitration case by its ID.
@@ -4961,6 +5886,7 @@ impl RefundContract {
         token: Address,
         recipient: Address,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -4974,6 +5900,44 @@ impl RefundContract {
         let accumulated: i128 = env.storage().instance().get(&key).unwrap_or(0);
         if accumulated <= 0 {
             return Err(Error::Core(CoreError::InsufficientTreasuryFees));
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &accumulated,
+        );
+        Ok(accumulated)
+    }
+
+    /// Sweep every accumulated protocol fee in `token` to `recipient`.
+    ///
+    /// Same as [`withdraw_protocol_fees`](Self::withdraw_protocol_fees),
+    /// except that nothing accumulated is not an error: it returns `0` and
+    /// transfers nothing, so a caller harvesting several contracts can skip an
+    /// empty one without reverting the rest.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn sweep_protocol_fees(
+        env: Env,
+        admin: Address,
+        token: Address,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        let key = ConfigKey::AccumulatedFees(token.clone());
+        let accumulated: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if accumulated <= 0 {
+            return Ok(0);
         }
         env.storage().instance().set(&key, &0i128);
         token::Client::new(&env, &token).transfer(
@@ -5343,16 +6307,13 @@ impl RefundContract {
         arbitrator: Address,
         amount: i128,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         arbitrator.require_auth();
         if amount <= 0 {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
@@ -5419,6 +6380,7 @@ impl RefundContract {
         slash_amount: i128,
         recipient: Address,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -6862,6 +7824,21 @@ impl RefundContract {
     }
 
     fn add_to_status_index(env: &Env, status: RefundStatus, refund_id: u64) {
+        // Issue #243: every finalized refund is committed to the archived-record
+        // Merkle accumulator as the SHA-256 of its XDR.
+        if matches!(
+            status,
+            RefundStatus::Processed | RefundStatus::Rejected | RefundStatus::PermanentlyDenied
+        ) {
+            if let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+            {
+                storage::append_archived_leaf(env, storage::archived_record_leaf(env, &refund));
+            }
+        }
+
         let count = Self::get_refund_count_by_status(env, status.clone());
         env.storage()
             .instance()
@@ -7540,7 +8517,7 @@ impl RefundContract {
         }
 
         // Suspended or sanctioned merchants may not issue refunds.
-        Self::require_merchant_active(&env, &merchant)?;
+        Self::require_merchant_not_suspended(&env, &merchant)?;
 
         Self::check_customer_refund_cooldown(&env, &customer)?;
 
@@ -7585,6 +8562,17 @@ impl RefundContract {
         if eligibility_rule == EligibilityRule::Block {
             return Err(Error::Ext(ExtError::CustomerBlockedFromRefund));
         }
+        // Issue #234: categories such as consumed digital credits only allow
+        // refunding the full payment.
+        if amount < original_payment_amount {
+            if let Some(terms) =
+                Self::matching_eligibility_terms(&env, &merchant, &customer, payment_id)
+            {
+                if !terms.allow_partial_consumption {
+                    return Err(Error::Ext(ExtError::PartialRefundNotAllowed));
+                }
+            }
+        }
 
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
@@ -7611,7 +8599,13 @@ impl RefundContract {
         // tier-specific refund cap.
         let is_vip_tier_customer = Self::is_vip_tier_customer(&env, &merchant, &customer);
 
-        let initial_status = if force_approved || is_vip_tier_customer {
+        // Issue #230: quarantined customers lose every automated path
+        // (auto-refund triggers, VIP fast-track, auto-approve threshold) but can
+        // still file the request for manual, evidence-backed review.
+        let mut profile = Self::get_customer_refund_profile(env.clone(), customer.clone());
+        let initial_status = if Self::is_auto_refund_disqualified(&env, &profile) {
+            RefundStatus::Requested
+        } else if force_approved || is_vip_tier_customer {
             RefundStatus::Approved
         } else {
             let effective_merchant = if let Some(policy) =
@@ -7640,6 +8634,18 @@ impl RefundContract {
         if initial_status == RefundStatus::Approved {
             Self::reserve_merchant_quota(&env, &merchant, amount)?;
         }
+
+        profile.total_refunds_requested += 1;
+        if initial_status == RefundStatus::Approved {
+            profile.approved_refunds_count += 1;
+        }
+        let merchant_key = CustomerAbuseKey::RefundedMerchant(customer.clone(), merchant.clone());
+        if !env.storage().instance().has(&merchant_key) {
+            env.storage().instance().set(&merchant_key, &true);
+            profile.distinct_merchants_refunded += 1;
+        }
+        profile.consecutive_clean_payments = 0;
+        Self::save_customer_refund_profile(&env, &customer, profile);
 
         let ttl_expires_at: Option<u64> = env
             .storage()
@@ -7678,6 +8684,9 @@ impl RefundContract {
             appeal_deadline: None,
             // Issue #199: TTL expiry
             expires_at: ttl_expires_at,
+            // Issue #3: new refunds start with no escrow lock; set via
+            // set_payment_escrow_lock() if upstream funds are still locked.
+            escrow_lock_ref: None,
         };
 
         env.storage()
@@ -7775,14 +8784,27 @@ impl RefundContract {
             }
         }
 
+        // Issue #3: Escrow-lock guard.
+        // If the underlying funds are still locked in a settlement tranche or
+        // cross-contract escrow, record the escrow ID on the refund so that
+        // process_refund_internal can block payout until the lock is released.
+        let escrow_lock_ref: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::PaymentEscrowLock(refund.payment_id));
+
         // Reserve merchant quota at approval time, in the same step that flips
         // the status, so approved-but-unprocessed refunds count against it.
         Self::reserve_merchant_quota(env, &refund.merchant, refund.amount)?;
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+        let mut profile = Self::get_customer_refund_profile(env.clone(), refund.customer.clone());
+        profile.approved_refunds_count += 1;
+        Self::save_customer_refund_profile(env, &refund.customer, profile);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
         refund.approved_at = Some(env.ledger().timestamp());
+        refund.escrow_lock_ref = escrow_lock_ref;
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
@@ -7800,10 +8822,135 @@ impl RefundContract {
         })
         .publish(env);
 
+        // Issue #3: if escrow is still locked, emit the deferred-payout event.
+        if let Some(escrow_id) = escrow_lock_ref {
+            (EscrowUnlockPending {
+                refund_id,
+                payment_id: refund.payment_id,
+                escrow_id,
+                customer: refund.customer.clone(),
+                amount: refund.amount,
+            })
+            .publish(env);
+        }
+
         // Issue #144: Invoke notification hooks
         Self::invoke_hooks(env, RefundEventType::Approved, refund_id);
 
         Ok(())
+    }
+
+    /// The arbitrator registry, kept in persistent shards with only its
+    /// length in instance storage; falls back to the legacy instance list on
+    /// a contract not yet migrated to schema 3.
+    fn load_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(env, &ArbitrationKey::ArbitratorCount, ArbitrationKey::ArbitratorShard)
+            .or_else(|| env.storage().instance().get(&ArbitrationKey::ArbitratorList))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// An arbitrator's reputation record: persistent, one per registered
+    /// arbitrator (legacy instance before schema 3).
+    fn load_reputation(env: &Env, arbitrator: &Address) -> Option<ArbitratorReputation> {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_reputation(env: &Env, arbitrator: &Address, reputation: &ArbitratorReputation) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        storage::set_persistent(env, &key, reputation);
+        env.storage().instance().remove(&key);
+    }
+
+    fn remove_reputation(env: &Env, arbitrator: &Address) {
+        let key = ArbitrationKey::ArbitratorReputation(arbitrator.clone());
+        env.storage().persistent().remove(&key);
+        env.storage().instance().remove(&key);
+    }
+
+    fn store_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::ArbitratorCount,
+            ArbitrationKey::ArbitratorShard,
+            list,
+        );
+        env.storage().instance().remove(&ArbitrationKey::ArbitratorList);
+    }
+
+    fn load_senior_arbitrators(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+        )
+        .or_else(|| env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList))
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_senior_arbitrators(env: &Env, list: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &ArbitrationKey::SeniorArbitratorCount,
+            ArbitrationKey::SeniorArbitratorShard,
+            list,
+        );
+        env.storage()
+            .instance()
+            .remove(&ArbitrationKey::SeniorArbitratorList);
+    }
+
+    /// A supported refund token's entry (persistent; legacy instance before
+    /// schema 3).
+    fn load_supported_token(env: &Env, token: &Address) -> Option<SupportedRefundToken> {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_supported_token(env: &Env, token: &Address, entry: &SupportedRefundToken) {
+        let key = TokenKey::SupportedToken(token.clone());
+        storage::set_persistent(env, &key, entry);
+        env.storage().instance().remove(&key);
+    }
+
+    fn load_token_by_index(env: &Env, index: u64) -> Option<Address> {
+        let key = TokenKey::TokenByIndex(index);
+        storage::get_persistent(env, &key).or_else(|| env.storage().instance().get(&key))
+    }
+
+    fn store_token_by_index(env: &Env, index: u64, token: &Address) {
+        let key = TokenKey::TokenByIndex(index);
+        storage::set_persistent(env, &key, token);
+        env.storage().instance().remove(&key);
+    }
+
+    /// v2 -> v3: moves the arbitrator lists and supported-token entries out
+    /// of instance storage. Idempotent.
+    fn migrate_v2_to_v3(env: &Env) {
+        let arbitrators: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::ArbitratorList);
+        if let Some(list) = arbitrators {
+            Self::store_arbitrators(env, &list);
+        }
+        for arbitrator in Self::load_arbitrators(env).iter() {
+            if let Some(reputation) = Self::load_reputation(env, &arbitrator) {
+                Self::store_reputation(env, &arbitrator, &reputation);
+            }
+        }
+        let seniors: Option<Vec<Address>> =
+            env.storage().instance().get(&ArbitrationKey::SeniorArbitratorList);
+        if let Some(list) = seniors {
+            Self::store_senior_arbitrators(env, &list);
+        }
+        let count: u64 = env.storage().instance().get(&TokenKey::TokenCount).unwrap_or(0);
+        for index in 0..count {
+            if let Some(token) = Self::load_token_by_index(env, index) {
+                Self::store_token_by_index(env, index, &token);
+                if let Some(entry) = Self::load_supported_token(env, &token) {
+                    Self::store_supported_token(env, &token, &entry);
+                }
+            }
+        }
     }
 
     fn process_refund_internal(
@@ -7821,9 +8968,18 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
 
+        // Issue #3: Escrow-lock guard.
+        // Block payout if the upstream settlement escrow has not yet been
+        // released.  Admin must call release_escrow_lock(payment_id) once the
+        // tranche unlocks before process_refund can proceed.
+        if refund.escrow_lock_ref.is_some() {
+            return Err(Error::Core(CoreError::EscrowStillLocked));
+        }
+
         // Re-check standing at payout time: a merchant suspended after the
-        // refund was requested/approved must not have it paid out.
-        Self::require_merchant_active(env, &refund.merchant)?;
+        // refund was requested/approved must not have it paid out, and a
+        // restricted one only with the admin's sign-off.
+        Self::require_merchant_settleable(env, &refund.merchant, &processed_by)?;
 
         Self::can_refund_payment(
             env,
@@ -7838,6 +8994,18 @@ impl RefundContract {
         // Arbitration awards additionally carry the protocol maintenance fee.
         let net_refund_amount =
             Self::deduct_arbitration_protocol_fee(env, refund_id, fee.net_amount, &refund.token);
+
+        // Issue #234: the restocking fee stays with the merchant.
+        let restocking_fee =
+            core::cmp::min(Self::restocking_fee(env, &refund), net_refund_amount.max(0));
+        let net_refund_amount = net_refund_amount - restocking_fee;
+        if restocking_fee > 0 {
+            token::Client::new(env, &refund.token).transfer(
+                &env.current_contract_address(),
+                &refund.merchant,
+                &restocking_fee,
+            );
+        }
 
         if net_refund_amount > 0 {
             token::Client::new(env, &refund.token).transfer(
@@ -7857,13 +9025,9 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
-        storage::record_epoch_reason_stats(
-            env,
-            &refund.merchant,
-            storage::reason_epoch(refund.requested_at),
-            &refund.reason_code,
-            Some(refund.amount),
-        );
+        // Issue #4: a successful payout resets the exponential-backoff counter so
+        // the customer is not permanently penalised for past frivolous attempts.
+        Self::reset_customer_denied_attempts(env, &refund.customer);
         // Issue #382: this refund's requested_at may fall within a previously
         // cached analytics window, so drop that cache entry.
         Self::invalidate_analytics_cache_for(env, refund.requested_at);
@@ -7974,21 +9138,27 @@ impl RefundContract {
             .get(&DataKey::RefundCounter)
             .unwrap_or(0);
         for refund_id in 1..=counter {
-            let key = DataKey::Refund(refund_id);
-            // Read as a raw field map: decoding a legacy record directly as
-            // `Refund` traps in the host on the field-count mismatch.
-            let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
-                Some(fields) => fields,
-                None => continue,
-            };
-            if fields.contains_key(Symbol::new(env, "reason_code")) {
-                continue;
-            }
-            let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
-                .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
-            let refund = legacy.into_refund(RefundReasonCode::Other);
-            env.storage().instance().set(&key, &refund);
+            Self::migrate_legacy_refund(env, refund_id)?;
         }
+        Ok(())
+    }
+
+    /// Rewrites one refund stored before `reason_code` existed. Idempotent.
+    fn migrate_legacy_refund(env: &Env, refund_id: u64) -> Result<(), Error> {
+        let key = DataKey::Refund(refund_id);
+        // Read as a raw field map: decoding a legacy record directly as
+        // `Refund` traps in the host on the field-count mismatch.
+        let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
+            Some(fields) => fields,
+            None => return Ok(()),
+        };
+        if fields.contains_key(Symbol::new(env, "reason_code")) {
+            return Ok(());
+        }
+        let legacy = LegacyRefundV1::try_from_val(env, &fields.to_val())
+            .map_err(|_| Error::Ext(ExtError::SchemaMigrationFailed))?;
+        let refund = legacy.into_refund(RefundReasonCode::Other);
+        env.storage().instance().set(&key, &refund);
         Ok(())
     }
 
@@ -8047,6 +9217,24 @@ impl RefundContract {
                     args,
                 ) {
                     Ok(Ok(actual)) => Ok(actual == config.expected),
+                    _ => Ok(false),
+                }
+            }
+            // Issue #2: SLA breach oracle condition.
+            // Calls `oracle_contract.get_sla_metric(metric_key)` which returns
+            // an i128 metric in basis-points.  The condition is met (refund
+            // fires) when the oracle reports a value strictly below the
+            // configured threshold, i.e. the SLA was breached.
+            AutoRefundCondition::SlaBreach(config) => {
+                let args = (config.metric_key.clone(),).into_val(env);
+                let func = Symbol::new(env, "get_sla_metric");
+                match env.try_invoke_contract::<i128, soroban_sdk::InvokeError>(
+                    &config.oracle_contract,
+                    &func,
+                    args,
+                ) {
+                    Ok(Ok(metric_bps)) => Ok(metric_bps < config.sla_threshold_bps),
+                    // If the oracle is unreachable, fail safe: do not trigger.
                     _ => Ok(false),
                 }
             }
@@ -8395,6 +9583,7 @@ impl RefundContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()
@@ -9105,15 +10294,21 @@ impl RefundContract {
         };
 
         let now = env.ledger().timestamp();
+
+        // Issue #4: Exponential backoff.
+        // Effective cooldown = base × multiplier^(consecutive_denied_attempts - 1),
+        // capped at u64::MAX to prevent overflow.
+        let effective_cooldown = Self::compute_effective_cooldown(&config, &record);
+
         let elapsed = now.saturating_sub(record.last_refund_requested_at);
-        if elapsed < record.cooldown_seconds {
+        if elapsed < effective_cooldown {
             let available_at = record
                 .last_refund_requested_at
-                .saturating_add(record.cooldown_seconds);
+                .saturating_add(effective_cooldown);
             RefundCooldownEnforced {
                 customer: customer.clone(),
                 last_refund_at: record.last_refund_requested_at,
-                cooldown_seconds: record.cooldown_seconds,
+                cooldown_seconds: effective_cooldown,
                 available_at,
             }
             .publish(env);
@@ -9121,6 +10316,32 @@ impl RefundContract {
         }
 
         Ok(())
+    }
+
+    /// Issue #4: Compute the effective cooldown window for a customer.
+    ///
+    /// Formula: `base × multiplier^max(0, n-1)` where `n` is the number of
+    /// consecutive denied attempts, capped at `max_attempts` when non-zero.
+    fn compute_effective_cooldown(
+        config: &RefundCooldownConfig,
+        record: &CustomerRefundCooldown,
+    ) -> u64 {
+        let multiplier = config.backoff_multiplier;
+        if multiplier <= 1 || record.consecutive_denied_attempts == 0 {
+            return config.cooldown_seconds;
+        }
+        // Cap the exponent if max_attempts is configured.
+        let exponent = if config.max_attempts > 0 {
+            (record.consecutive_denied_attempts - 1).min(config.max_attempts - 1)
+        } else {
+            record.consecutive_denied_attempts - 1
+        };
+        // Compute base * multiplier^exponent using saturating arithmetic.
+        let mut result: u64 = config.cooldown_seconds;
+        for _ in 0..exponent {
+            result = result.saturating_mul(multiplier as u64);
+        }
+        result
     }
 
     fn update_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
@@ -9135,16 +10356,73 @@ impl RefundContract {
         if !config.enabled {
             return Ok(());
         }
+        // Preserve existing attempt count when updating the timestamp.
+        let existing: Option<CustomerRefundCooldown> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::CustomerRefundCooldown(customer.clone()));
+        let consecutive_denied_attempts = existing
+            .map(|r| r.consecutive_denied_attempts)
+            .unwrap_or(0);
         let record = CustomerRefundCooldown {
             customer: customer.clone(),
             last_refund_requested_at: env.ledger().timestamp(),
             cooldown_seconds: config.cooldown_seconds,
+            consecutive_denied_attempts,
         };
         env.storage().instance().set(
             &SystemKey::CustomerRefundCooldown(customer.clone()),
             &record,
         );
         Ok(())
+    }
+
+    /// Issue #4: Increment the consecutive-denial counter for a customer.
+    ///
+    /// Called when a refund is rejected/denied so the next attempt faces a
+    /// longer backoff window.
+    fn record_customer_denied_attempt(env: &Env, customer: &Address) {
+        let config: RefundCooldownConfig = match env
+            .storage()
+            .instance()
+            .get::<SystemKey, RefundCooldownConfig>(&SystemKey::RefundCooldownConfig)
+        {
+            Some(c) if c.enabled => c,
+            _ => return,
+        };
+        let mut record: CustomerRefundCooldown = env
+            .storage()
+            .instance()
+            .get(&SystemKey::CustomerRefundCooldown(customer.clone()))
+            .unwrap_or(CustomerRefundCooldown {
+                customer: customer.clone(),
+                last_refund_requested_at: env.ledger().timestamp(),
+                cooldown_seconds: config.cooldown_seconds,
+                consecutive_denied_attempts: 0,
+            });
+        record.consecutive_denied_attempts = record.consecutive_denied_attempts.saturating_add(1);
+        env.storage().instance().set(
+            &SystemKey::CustomerRefundCooldown(customer.clone()),
+            &record,
+        );
+    }
+
+    /// Issue #4: Reset the consecutive-denial counter for a customer after a
+    /// successful refund payout so honest customers are not permanently penalised.
+    fn reset_customer_denied_attempts(env: &Env, customer: &Address) {
+        if let Some(mut record) = env
+            .storage()
+            .instance()
+            .get::<SystemKey, CustomerRefundCooldown>(&SystemKey::CustomerRefundCooldown(
+                customer.clone(),
+            ))
+        {
+            record.consecutive_denied_attempts = 0;
+            env.storage().instance().set(
+                &SystemKey::CustomerRefundCooldown(customer.clone()),
+                &record,
+            );
+        }
     }
 
     // Issue #147: Customer refund history functions
@@ -9597,6 +10875,156 @@ impl RefundContract {
         Ok(())
     }
 
+    /// Customers may still request refunds from a `Restricted` merchant;
+    /// `Suspended` and `Sanctioned` merchants are blocked.
+    fn require_merchant_not_suspended(env: &Env, merchant: &Address) -> Result<(), Error> {
+        match Self::get_merchant_status(env.clone(), merchant.clone()) {
+            MerchantStatus::Active | MerchantStatus::Restricted => Ok(()),
+            _ => Err(Error::Ext(ExtError::MerchantNotEligible)),
+        }
+    }
+
+    /// A refund pays out for an `Active` merchant, or for a `Restricted` one
+    /// when the stored admin processes it (manual sign-off).
+    fn require_merchant_settleable(env: &Env, merchant: &Address, processed_by: &Address) -> Result<(), Error> {
+        match Self::get_merchant_status(env.clone(), merchant.clone()) {
+            MerchantStatus::Active => Ok(()),
+            MerchantStatus::Restricted => {
+                let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+                if admin.as_ref() == Some(processed_by) {
+                    Ok(())
+                } else {
+                    Err(Error::Ext(ExtError::MerchantNotEligible))
+                }
+            }
+            _ => Err(Error::Ext(ExtError::MerchantNotEligible)),
+        }
+    }
+
+    // ── Refund-risk auto-throttling ───────────────────────────────────────
+
+    /// Sets the refund-risk thresholds. Admin only. Ratios must satisfy
+    /// `warning <= restricted <= suspended <= 10_000`, and the sample floor
+    /// must be at least 1.
+    pub fn set_merchant_risk_thresholds(
+        env: Env,
+        admin: Address,
+        thresholds: MerchantRiskThresholds,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if thresholds.warning_ratio_bps > thresholds.restricted_ratio_bps
+            || thresholds.restricted_ratio_bps > thresholds.suspended_ratio_bps
+            || thresholds.suspended_ratio_bps > 10_000
+            || thresholds.min_sample_tx_count == 0
+        {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&EligibilityKey::RiskThresholds, &thresholds);
+        Ok(())
+    }
+
+    /// The configured thresholds, if auto-throttling is on.
+    pub fn get_merchant_risk_thresholds(env: Env) -> Option<MerchantRiskThresholds> {
+        env.storage().instance().get(&EligibilityKey::RiskThresholds)
+    }
+
+    /// The merchant's refund-risk counters for the current window.
+    pub fn get_merchant_risk_window(env: Env, merchant: Address) -> MerchantRiskWindow {
+        Self::load_risk_window(&env, &merchant)
+    }
+
+    fn load_risk_window(env: &Env, merchant: &Address) -> MerchantRiskWindow {
+        let now = env.ledger().timestamp();
+        match storage::get_persistent::<_, MerchantRiskWindow>(
+            env,
+            &EligibilityKey::MerchantRisk(merchant.clone()),
+        ) {
+            Some(window) if now < window.window_start.saturating_add(MERCHANT_RISK_WINDOW_SECS) => {
+                window
+            }
+            // No window yet, or it has elapsed: start a fresh one.
+            _ => MerchantRiskWindow {
+                window_start: now,
+                refund_count: 0,
+                high_risk_refund_count: 0,
+                total_refund_volume: 0,
+            },
+        }
+    }
+
+    fn is_high_risk(reason: &RefundReasonCode) -> bool {
+        matches!(
+            reason,
+            RefundReasonCode::Unauthorized
+                | RefundReasonCode::NonDelivery
+                | RefundReasonCode::ProductDefect
+        )
+    }
+
+    /// Counts a substantiated (processed) refund against its merchant and,
+    /// when thresholds are configured and the sample floor is met, escalates
+    /// the merchant's standing: `Active` -> `Restricted` -> `Suspended`.
+    /// It never lowers a standing and never touches `Sanctioned`.
+    fn record_substantiated_refund(env: &Env, refund: &Refund) {
+        let mut window = Self::load_risk_window(env, &refund.merchant);
+        window.refund_count = window.refund_count.saturating_add(1);
+        if Self::is_high_risk(&refund.reason_code) {
+            window.high_risk_refund_count = window.high_risk_refund_count.saturating_add(1);
+        }
+        window.total_refund_volume = window.total_refund_volume.saturating_add(refund.amount);
+        storage::set_persistent(env, &EligibilityKey::MerchantRisk(refund.merchant.clone()), &window);
+
+        let thresholds: MerchantRiskThresholds =
+            match env.storage().instance().get(&EligibilityKey::RiskThresholds) {
+                Some(t) => t,
+                None => return,
+            };
+        if window.refund_count < thresholds.min_sample_tx_count {
+            return;
+        }
+        let ratio_bps =
+            (window.high_risk_refund_count as u64 * 10_000 / window.refund_count as u64) as u32;
+        let from = Self::get_merchant_status(env.clone(), refund.merchant.clone());
+        let to = if ratio_bps >= thresholds.suspended_ratio_bps {
+            MerchantStatus::Suspended
+        } else if ratio_bps >= thresholds.restricted_ratio_bps {
+            MerchantStatus::Restricted
+        } else {
+            from.clone()
+        };
+        let escalates = matches!(
+            (&from, &to),
+            (MerchantStatus::Active, MerchantStatus::Restricted)
+                | (MerchantStatus::Active, MerchantStatus::Suspended)
+                | (MerchantStatus::Restricted, MerchantStatus::Suspended)
+        );
+        if escalates {
+            env.storage()
+                .instance()
+                .set(&EligibilityKey::MerchantStatus(refund.merchant.clone()), &to);
+        } else if ratio_bps < thresholds.warning_ratio_bps || from != MerchantStatus::Active {
+            return;
+        }
+        MerchantAutoThrottled {
+            merchant: refund.merchant.clone(),
+            from: from.clone(),
+            to: if escalates { to } else { from },
+            ratio_bps,
+            sample_size: window.refund_count,
+        }
+        .publish(env);
+    }
+
     // ── Issue #148: Customer eligibility registry ─────────────────────────
 
     /// Set or update the refund eligibility rule for a customer under a specific merchant.
@@ -9610,17 +11038,43 @@ impl RefundContract {
     ) -> Result<(), Error> {
         // Require merchant auth; admin can also call via mock_all_auths in tests
         merchant.require_auth();
+        Self::write_refund_eligibility(&env, merchant, customer, rule, reason_hash);
+        Ok(())
+    }
 
-        let entry = RefundEligibilityEntry {
-            customer: customer.clone(),
-            merchant: merchant.clone(),
-            rule: rule.clone(),
-            reason_hash,
-            set_at: env.ledger().timestamp(),
-        };
-
+    /// Stores an eligibility entry (keeping any category terms) without an
+    /// auth check, so authenticated entry points can share it.
+    fn write_refund_eligibility(
+        env: &Env,
+        merchant: Address,
+        customer: Address,
+        rule: EligibilityRule,
+        reason_hash: BytesN<32>,
+    ) {
         let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
-        let is_new = !env.storage().instance().has(&key);
+        let existing: Option<RefundEligibilityEntry> = env.storage().instance().get(&key);
+        let is_new = existing.is_none();
+        // Issue #234: changing the rule keeps any configured category terms.
+        let entry = match existing {
+            Some(mut entry) => {
+                entry.rule = rule.clone();
+                entry.reason_hash = reason_hash;
+                entry.set_at = env.ledger().timestamp();
+                entry
+            }
+            None => RefundEligibilityEntry {
+                customer: customer.clone(),
+                merchant: merchant.clone(),
+                rule: rule.clone(),
+                reason_hash,
+                set_at: env.ledger().timestamp(),
+                category_bitmask: 0,
+                restocking_fee_bps: 0,
+                max_restocking_fee_cap: 0,
+                allow_partial_consumption: true,
+                exempt_reason_codes: Vec::new(env),
+            },
+        };
         env.storage().instance().set(&key, &entry);
 
         // If this is a new entry, append to the merchant's customer index
@@ -9645,9 +11099,103 @@ impl RefundContract {
             customer,
             rule,
         })
-        .publish(&env);
+        .publish(env);
+    }
 
+    /// Issue #234: configure category-specific refund terms for a (merchant,
+    /// customer) pair. Creates an `Allow` entry if none exists.
+    ///
+    /// # Errors
+    /// Returns `RestockingFeeTooHigh` if `restocking_fee_bps` exceeds
+    /// `MAX_RESTOCKING_FEE_BPS` and `InvalidAmount` for a negative cap.
+    pub fn set_refund_eligibility_terms(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        category_bitmask: u64,
+        restocking_fee_bps: u32,
+        max_restocking_fee_cap: i128,
+        allow_partial_consumption: bool,
+        exempt_reason_codes: Vec<RefundReasonCode>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if restocking_fee_bps > MAX_RESTOCKING_FEE_BPS {
+            return Err(Error::Ext(ExtError::RestockingFeeTooHigh));
+        }
+        if max_restocking_fee_cap < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
+        if !env.storage().instance().has(&key) {
+            Self::write_refund_eligibility(
+                &env,
+                merchant.clone(),
+                customer.clone(),
+                EligibilityRule::Allow,
+                BytesN::from_array(&env, &[0u8; 32]),
+            );
+        }
+        let mut entry: RefundEligibilityEntry = env.storage().instance().get(&key).unwrap();
+        entry.category_bitmask = category_bitmask;
+        entry.restocking_fee_bps = restocking_fee_bps;
+        entry.max_restocking_fee_cap = max_restocking_fee_cap;
+        entry.allow_partial_consumption = allow_partial_consumption;
+        entry.exempt_reason_codes = exempt_reason_codes;
+        entry.set_at = env.ledger().timestamp();
+        env.storage().instance().set(&key, &entry);
         Ok(())
+    }
+
+    /// Issue #234: the eligibility entry whose category terms apply to a
+    /// refund of `payment_id`, if any.
+    fn matching_eligibility_terms(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+        payment_id: u64,
+    ) -> Option<RefundEligibilityEntry> {
+        let entry: RefundEligibilityEntry = env
+            .storage()
+            .instance()
+            .get(&EligibilityKey::Entry(merchant.clone(), customer.clone()))?;
+        if entry.category_bitmask == 0 {
+            return Some(entry);
+        }
+        let category: u32 = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::PaymentCategoryTag(payment_id))?;
+        if category < 64 && entry.category_bitmask & (1u64 << category) != 0 {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Issue #234: restocking fee for a refund. Defect, fraud and duplicate
+    /// claims are statutorily exempt regardless of merchant configuration.
+    fn restocking_fee(env: &Env, refund: &Refund) -> i128 {
+        if matches!(
+            refund.reason_code,
+            RefundReasonCode::Unauthorized
+                | RefundReasonCode::DuplicateCharge
+                | RefundReasonCode::ProductDefect
+        ) {
+            return 0;
+        }
+        match Self::matching_eligibility_terms(
+            env,
+            &refund.merchant,
+            &refund.customer,
+            refund.payment_id,
+        ) {
+            Some(terms) if !terms.exempt_reason_codes.contains(&refund.reason_code) => {
+                let fee = refund.amount.saturating_mul(terms.restocking_fee_bps as i128) / 10_000;
+                core::cmp::min(terms.max_restocking_fee_cap, fee)
+            }
+            _ => 0,
+        }
     }
 
     /// Return the eligibility rule for a (merchant, customer) pair.
@@ -10051,11 +11599,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -10095,11 +11639,7 @@ impl RefundContract {
             .get(&RefundExtKey::AssignmentConfig)
             .ok_or(Error::Core(CoreError::PolicyNotFound))?;
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -10153,11 +11693,7 @@ impl RefundContract {
             None => return Vec::new(&env),
         };
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators: Vec<Address> = Self::load_arbitrators(&env);
 
         let total = arbitrators.len() as u32;
         if total == 0 || count == 0 {
@@ -10639,21 +12175,15 @@ impl RefundContract {
             token: token.clone(),
             active: true,
         };
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token.clone()), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         let already_indexed = (0..count).any(|i| {
-            env.storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            Self::load_token_by_index(&env, i)
                 .map(|t| t == token)
                 .unwrap_or(false)
         });
         if !already_indexed {
-            env.storage()
-                .instance()
-                .set(&TokenKey::TokenByIndex(count), &token);
+            Self::store_token_by_index(&env, count, &token);
             env.storage()
                 .instance()
                 .set(&TokenKey::TokenCount, &(count + 1));
@@ -10684,16 +12214,11 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut entry: SupportedRefundToken = env
-            .storage()
-            .instance()
-            .get(&TokenKey::SupportedToken(token.clone()))
+        let mut entry: SupportedRefundToken = Self::load_supported_token(&env, &token)
             .ok_or(Error::Core(CoreError::RefundNotFound))?;
 
         entry.active = false;
-        env.storage()
-            .instance()
-            .set(&TokenKey::SupportedToken(token), &entry);
+        Self::store_supported_token(&env, &token, &entry);
 
         Ok(())
     }
@@ -10711,15 +12236,9 @@ impl RefundContract {
         let mut results = Vec::new(&env);
         let mut i = 0u64;
         while i < count {
-            if let Some(token) = env
-                .storage()
-                .instance()
-                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            if let Some(token) = Self::load_token_by_index(&env, i)
             {
-                if let Some(entry) = env
-                    .storage()
-                    .instance()
-                    .get::<_, SupportedRefundToken>(&TokenKey::SupportedToken(token))
+                if let Some(entry) = Self::load_supported_token(&env, &token)
                 {
                     results.push_back(entry);
                 }
@@ -10831,6 +12350,15 @@ impl RefundContract {
             &(customer_count + 1),
         );
 
+        // An unredeemed voucher is a funds-backed claim kept in instance
+        // storage: it must not expire in storage before its own expiry.
+        storage::extend_instance_until(
+            &env,
+            storage::StorageTier::CriticalActiveLock,
+            voucher.expires_at,
+            0,
+        );
+
         Ok(voucher_id)
     }
 
@@ -10852,6 +12380,7 @@ impl RefundContract {
         voucher_id: u64,
         _payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         customer.require_auth();
 
         let mut voucher: RefundVoucher = env
@@ -10905,6 +12434,7 @@ impl RefundContract {
         voucher_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Ext(ExtError::ReentrantCallDetected))?;
         customer.require_auth();
 
         if amount <= 0 {
@@ -10958,6 +12488,60 @@ impl RefundContract {
         env.storage()
             .instance()
             .get(&VoucherKey::Voucher(voucher_id))
+    }
+
+    /// Release backing for expired vouchers with an unredeemed balance.
+    /// Anyone may call this bounded sweep; backing is returned to the merchant.
+    pub fn sweep_expired_vouchers(env: Env, start_id: u64, limit: u64) -> u32 {
+        if start_id == 0 || limit == 0 {
+            return 0;
+        }
+
+        let last_id: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::VoucherCounter)
+            .unwrap_or(0);
+        let page_size = Self::clamp_page_size(limit);
+        let end_id = core::cmp::min(last_id, start_id.saturating_add(page_size - 1));
+        let now = env.ledger().timestamp();
+        let mut released = 0u32;
+        let mut voucher_id = start_id;
+
+        while voucher_id <= end_id {
+            if let Some(mut voucher) = env
+                .storage()
+                .instance()
+                .get::<_, RefundVoucher>(&VoucherKey::Voucher(voucher_id))
+            {
+                if !voucher.redeemed && voucher.remaining_balance > 0 && now > voucher.expires_at {
+                    let amount = voucher.remaining_balance;
+                    token::Client::new(&env, &voucher.token).transfer(
+                        &env.current_contract_address(),
+                        &voucher.merchant,
+                        &amount,
+                    );
+                    voucher.remaining_balance = 0;
+                    voucher.redeemed = true;
+                    env.storage()
+                        .instance()
+                        .set(&VoucherKey::Voucher(voucher_id), &voucher);
+                    VoucherBackingReleased {
+                        voucher_id,
+                        merchant: voucher.merchant,
+                        amount,
+                    }
+                    .publish(&env);
+                    released += 1;
+                }
+            }
+            if voucher_id == end_id {
+                break;
+            }
+            voucher_id += 1;
+        }
+
+        released
     }
 
     /// Get a page of refund vouchers issued to a customer.
@@ -11045,16 +12629,10 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let mut list: Vec<Address> = Self::load_senior_arbitrators(&env);
         if !list.contains(&arbitrator) {
             list.push_back(arbitrator);
-            env.storage()
-                .instance()
-                .set(&ArbitrationKey::SeniorArbitratorList, &list);
+            Self::store_senior_arbitrators(&env, &list);
         }
         Ok(())
     }
@@ -11134,11 +12712,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::CaseNotTimedOut));
         }
 
-        let senior_list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::SeniorArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let senior_list: Vec<Address> = Self::load_senior_arbitrators(&env);
 
         if senior_list.len() == 0 {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -11438,6 +13012,18 @@ impl RefundContract {
 
     // Issue #370: Customer tier management
 
+    /// Issue #243: prove that `leaf_hash` (SHA-256 of a finalized refund's XDR)
+    /// is the `index`-th leaf of the archived-record Merkle accumulator.
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
+
     /// Assign a tier level to a customer for tier-based refund cap policies.
     ///
     /// # Arguments
@@ -11466,6 +13052,120 @@ impl RefundContract {
             .instance()
             .set(&DataKey::CustomerTier(customer), &tier_id);
         Ok(())
+    }
+
+    /// Issue #230: set the abuse score at which customers are quarantined from
+    /// automated refunds (`0` disables quarantining).
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin and
+    /// `InvalidAmount` if `threshold_bps` exceeds 10_000.
+    pub fn set_abuse_quarantine_threshold(
+        env: Env,
+        admin: Address,
+        threshold_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if threshold_bps > 10_000 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&CustomerAbuseKey::QuarantineThresholdBps, &threshold_bps);
+        Ok(())
+    }
+
+    /// Issue #230: record a payment the customer completed, decaying their abuse
+    /// score. Callable by the admin or the configured payment contract.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if `caller` is neither.
+    pub fn record_customer_payment(
+        env: Env,
+        caller: Address,
+        customer: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let payment_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress);
+        if admin.as_ref() != Some(&caller) && payment_contract.as_ref() != Some(&caller) {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let mut profile = Self::get_customer_refund_profile(env.clone(), customer.clone());
+        profile.total_lifetime_payments_count += 1;
+        profile.consecutive_clean_payments += 1;
+        Self::save_customer_refund_profile(&env, &customer, profile);
+        Ok(())
+    }
+
+    /// Issue #230: get a customer's refund abuse profile.
+    pub fn get_customer_refund_profile(env: Env, customer: Address) -> CustomerRefundProfile {
+        env.storage()
+            .instance()
+            .get(&CustomerAbuseKey::Profile(customer))
+            .unwrap_or(CustomerRefundProfile {
+                total_lifetime_payments_count: 0,
+                total_refunds_requested: 0,
+                approved_refunds_count: 0,
+                denied_refunds_count: 0,
+                distinct_merchants_refunded: 0,
+                consecutive_clean_payments: 0,
+                abuse_risk_bps: 0,
+                auto_refund_disqualified_until: 0,
+            })
+    }
+
+    /// Recomputes `abuse_risk_bps`, (re)starts the quarantine when it reaches the
+    /// threshold, and persists the profile.
+    fn save_customer_refund_profile(
+        env: &Env,
+        customer: &Address,
+        mut profile: CustomerRefundProfile,
+    ) {
+        let weighted = (profile.denied_refunds_count as u128) * 3
+            + profile.approved_refunds_count as u128;
+        let denominator = core::cmp::max(10, profile.total_lifetime_payments_count) as u128;
+        let raw = core::cmp::min(weighted * 10_000 / denominator, 10_000) as u32;
+        let decay = (profile.consecutive_clean_payments as u128 * CLEAN_PAYMENT_DECAY_BPS as u128)
+            .min(10_000) as u32;
+        profile.abuse_risk_bps = raw.saturating_sub(decay);
+
+        let threshold = Self::abuse_quarantine_threshold(env);
+        if threshold > 0 && profile.abuse_risk_bps >= threshold {
+            profile.auto_refund_disqualified_until = env
+                .ledger()
+                .timestamp()
+                .saturating_add(ABUSE_QUARANTINE_PERIOD_SECS);
+        }
+
+        env.storage()
+            .instance()
+            .set(&CustomerAbuseKey::Profile(customer.clone()), &profile);
+    }
+
+    fn abuse_quarantine_threshold(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&CustomerAbuseKey::QuarantineThresholdBps)
+            .unwrap_or(0)
+    }
+
+    fn is_auto_refund_disqualified(env: &Env, profile: &CustomerRefundProfile) -> bool {
+        let threshold = Self::abuse_quarantine_threshold(env);
+        env.ledger().timestamp() < profile.auto_refund_disqualified_until
+            || (threshold > 0 && profile.abuse_risk_bps >= threshold)
     }
 
     /// Mark whether a given customer tier qualifies for VIP instant refund approval
@@ -11667,4 +13367,4 @@ mod test_admin_rotation;
 mod test_refund_events;
 
 #[cfg(test)]
-mod test_refund_analytics;
+mod test_storage_ttl;

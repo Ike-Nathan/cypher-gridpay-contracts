@@ -156,3 +156,97 @@ fn test_archived_customer_refund_extends_ttl() {
         );
     });
 }
+
+// ── Tiered, deadline-aware TTL ───────────────────────────────────────────────
+
+mod tiered_ttl {
+    use crate::storage::{self, StorageTier, DAY_IN_LEDGERS};
+    use crate::*;
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::{Env, Symbol};
+
+    const DAY_SECS: u64 = 86_400;
+
+    fn env_with_room() -> Env {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        env.ledger().set_max_entry_ttl(3 * 6_312_000);
+        env
+    }
+
+    #[test]
+    fn persistent_entries_follow_their_tier() {
+        let env = env_with_room();
+        let contract_id = env.register(RefundContract, ());
+        env.as_contract(&contract_id, || {
+            for (name, tier) in [
+                ("critical", StorageTier::CriticalActiveLock),
+                ("standard", StorageTier::StandardActive),
+                ("terminal", StorageTier::TerminalAuditRecord),
+                ("ephemeral", StorageTier::EphemeralWindow),
+            ] {
+                let key = Symbol::new(&env, name);
+                env.storage().persistent().set(&key, &1u32);
+                storage::extend_persistent_tiered(&env, &key, tier);
+                assert_eq!(env.storage().persistent().get_ttl(&key), tier.bump_amount());
+            }
+        });
+    }
+
+    #[test]
+    fn critical_entry_outlives_its_deadline_plus_grace() {
+        let env = env_with_room();
+        let contract_id = env.register(RefundContract, ());
+        let deadline = env.ledger().timestamp() + 500 * DAY_SECS;
+        let grace = 14 * DAY_SECS;
+        env.as_contract(&contract_id, || {
+            let key = Symbol::new(&env, "voucher");
+            env.storage().persistent().set(&key, &1u32);
+            let target = storage::extend_persistent_until(
+                &env,
+                &key,
+                StorageTier::CriticalActiveLock,
+                deadline,
+                grace,
+            );
+            let ttl = env.storage().persistent().get_ttl(&key);
+            assert_eq!(ttl, target);
+            // At real 5 s ledgers the entry lasts past deadline + grace.
+            assert!(ttl as u64 >= (deadline + grace - env.ledger().timestamp()) / 5);
+            assert!(ttl > StorageTier::CriticalActiveLock.bump_amount());
+        });
+    }
+
+    #[test]
+    fn short_deadline_still_gets_the_tier_minimum() {
+        let env = env_with_room();
+        let contract_id = env.register(RefundContract, ());
+        env.as_contract(&contract_id, || {
+            let ttl = storage::extend_instance_until(
+                &env,
+                StorageTier::CriticalActiveLock,
+                env.ledger().timestamp() + DAY_SECS,
+                0,
+            );
+            assert_eq!(ttl, StorageTier::CriticalActiveLock.bump_amount());
+            assert_eq!(env.storage().instance().get_ttl(), ttl);
+        });
+    }
+
+    #[test]
+    fn deadline_beyond_network_maximum_is_capped() {
+        let env = env_with_room();
+        let contract_id = env.register(RefundContract, ());
+        env.as_contract(&contract_id, || {
+            let ttl = storage::extend_instance_until(
+                &env,
+                StorageTier::CriticalActiveLock,
+                env.ledger().timestamp() + 50 * 365 * DAY_SECS,
+                0,
+            );
+            assert_eq!(ttl, env.storage().max_ttl());
+        });
+        assert!(DAY_IN_LEDGERS > 0);
+    }
+}

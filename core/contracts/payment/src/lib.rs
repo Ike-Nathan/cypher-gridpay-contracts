@@ -10,12 +10,16 @@ use soroban_sdk::{
     Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
+pub mod reentrancy;
 pub mod storage;
+use storage::StorageTier;
 #[path = "../../escrow/src/fixed_math.rs"]
 pub mod fixed_math;
 mod archival;
+pub mod channels;
 mod finality;
 mod reconciliation;
+pub use channels::DomainSeparator;
 pub use archival::{ArchivalConfig, CompactArchivedPayment};
 pub use finality::{FinalityFlag, FinalityRiskConfig};
 
@@ -56,8 +60,10 @@ pub enum ConfigKey {
     PauseStateKey,
     MinSplitAmount,
     SchemaVersion,
+    /// Legacy (schema < 3): the whole whitelist as one instance `Vec`.
     AllowedTokens,
     MaxForwardDepth,
+    RelayerStipendBps,
 }
 
 #[derive(Clone)]
@@ -79,6 +85,9 @@ pub enum PaymentKey {
     LargePaymentCounter,
     Discount(u64),
     TotalPendingSettlement(Address), // Track total pending settlement amount per token
+    PrivatePaymentCommitment(u64),
+    PaymentFee(u64),
+    UsedPrivatePaymentCommitment(BytesN<32>),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -113,6 +122,9 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    RelayerStipend(Address, Address),
+    StreamingPaymentChannel(u64),
+    StreamingPaymentChannelCounter,
 }
 
 #[derive(Clone)]
@@ -189,9 +201,9 @@ pub enum BasicError {
     // Issue #88: a data migration step failed, so the schema version must
     // not be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 127,
-    /// A merchant's aggregate volume for the day would exceed its verification
-    /// tier limit (#23).
-    DailyTierLimitExceeded = 128,
+    // Issue #3: a string field contains raw PII (email, phone, or tax ID)
+    // that must not be stored on the immutable public ledger.
+    PiiDetected = 128,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -304,6 +316,16 @@ pub enum SubscriptionError {
     MerchantPaused = 317,
     /// Metered subscription units consumed exceed period usage cap. Resolution: reset billing period or increase unit cap.
     UsageCapExceeded = 318,
+    /// The required trial conversion notice has not been emitted.
+    TrialNoticeMissing = 319,
+    /// The current time is outside the trial conversion notice window.
+    InvalidTrialNoticeWindow = 320,
+    /// The proposed conversion amount exceeds customer-authorized consent.
+    TrialPriceConsentRequired = 321,
+    /// Usage can no longer be reported for the trial conversion grace period.
+    TrialUsageWindowClosed = 322,
+    /// A trial conversion notice has already been emitted.
+    TrialNoticeAlreadyEmitted = 323,
 }
 
 /// Errors relating to multi-sig administrative proposals and voting.
@@ -417,6 +439,9 @@ pub enum FeatureError {
     /// Balance sum mismatch. The settlement amounts do not sum to the deposit.
     BalanceSumMismatch = 541,
     InsufficientBalanceForSweep = 542,
+    /// Structuring / smurfing detected: cumulative payment volume within the rolling window
+    /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
+    StructuringDetected = 543,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -462,7 +487,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 542 {
+            if code >= 500 && code <= 543 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
             if code >= 400 && code <= 406 {
@@ -623,6 +648,14 @@ pub struct SubscriptionTrialData {
     pub period_seconds: u64,
     pub ends_at: u64,
     pub converted: bool,
+    pub locked_conversion_amount: i128,
+    pub notice_emitted_at: Option<u64>,
+    pub min_notice_lead_secs: u64,
+    pub post_trial_cancel_grace_secs: u64,
+    pub conversion_charge_amount: Option<i128>,
+    pub conversion_charged_at: Option<u64>,
+    pub post_conversion_usage_units: u64,
+    pub conversion_charge_reversed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1041,6 +1074,21 @@ pub struct PaymentChannel {
     pub customer_pk: BytesN<32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StreamingPaymentChannel {
+    pub channel_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub deposited: i128,
+    pub claimed: i128,
+    pub flow_rate_per_sec: i128,
+    pub start_ts: u64,
+    pub stop_ts: u64,
+    pub open: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct MeteredSubscription {
@@ -1169,6 +1217,31 @@ pub struct TrialStarted {
 pub struct TrialConverted {
     pub subscription_id: u64,
     pub converted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionNoticeEmitted {
+    pub subscription_id: u64,
+    pub conversion_amount: i128,
+    pub notice_emitted_at: u64,
+    pub trial_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionChargeReversed {
+    pub subscription_id: u64,
+    pub amount: i128,
+    pub reversed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionUsageReported {
+    pub subscription_id: u64,
+    pub units: u64,
+    pub accumulated_units: u64,
 }
 
 #[contractevent]
@@ -1320,6 +1393,12 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EphemeralInvoiceRoute {
+    pub ephemeral_invoice_commitment: BytesN<32>,
 }
 
 /// Issue #70: primitive-only cross-contract verification result consumed by the
@@ -1873,6 +1952,21 @@ pub struct PaymentAnalytics {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct NetPosition {
+    pub party_a: Address,
+    pub party_b: Address,
+    /// Net amount: positive = party_a owes party_b, negative = party_b owes party_a.
+    pub net_amount: i128,
+    /// Token used for settlement.
+    pub token: Address,
+    /// Timestamp of last position update.
+    pub last_updated: u64,
+    /// Timestamp of the current netting window start.
+    pub window_start: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct MerchantAnalytics {
     pub total_payments: u64,
     pub total_volume: i128,
@@ -2007,6 +2101,25 @@ pub struct PaymentInvoice {
     pub issued_at: u64,
 }
 
+/// Progress of a batched schema migration (`migrate_schema_step`). Records
+/// `next_record_id ..= target_max_id` are still to be migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub next_record_id: u64,
+    pub target_max_id: u64,
+    pub records_migrated: u64,
+    pub completed: bool,
+}
+
+/// Highest schema version this code migrates to.
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Most records `migrate_schema_step` migrates per call, keeping a step well
+/// inside Soroban's CPU-instruction and write-entry limits.
+pub const MAX_MIGRATION_BATCH: u32 = 25;
+
 #[contract]
 pub struct PaymentContract;
 
@@ -2016,6 +2129,9 @@ const MAX_NOTES_SIZE: u32 = 1024;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
 const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
+const MAX_TRIAL_NOTICE_LEAD_SECS: u64 = 30 * SECONDS_PER_DAY;
+const DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS: u64 = SECONDS_PER_DAY;
+const POST_TRIAL_CANCEL_GRACE_SECS: u64 = SECONDS_PER_DAY;
 
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
@@ -2087,6 +2203,62 @@ impl PaymentContract {
         (AdminAdded { admin }).publish(&env);
     }
 
+    /// Keeper maintenance (the issue's `batch_bump_critical_escrows_and_payments`;
+    /// Soroban caps contract function names at 32 characters): extends storage
+    /// for every payment in `ids` that still holds funds (`Pending`) so it
+    /// outlives the payment's expiry plus the dispute grace period. Unknown and
+    /// finished payments are skipped. Anyone may call it; it only extends TTLs.
+    ///
+    /// Returns how many payments were critical and bumped.
+    ///
+    /// # Errors
+    /// `InvalidBatchSize` for more than [`MAX_TTL_BUMP_BATCH`] ids.
+    pub fn batch_bump_critical(env: Env, ids: Vec<u64>) -> Result<u32, Error> {
+        if ids.len() > MAX_TTL_BUMP_BATCH {
+            return Err(Error::Basic(BasicError::InvalidBatchSize));
+        }
+        let mut bumped = 0u32;
+        for payment_id in ids.iter() {
+            if Self::keep_payment_alive(&env, payment_id) > 0 {
+                bumped += 1;
+            }
+        }
+        Ok(bumped)
+    }
+
+    /// Storage tier of a payment: `Pending` holds funds
+    /// (`CriticalActiveLock`), a partial refund is still live
+    /// (`StandardActive`), the rest are finished (`TerminalAuditRecord`).
+    fn payment_storage_tier(status: &PaymentStatus) -> StorageTier {
+        match status {
+            PaymentStatus::Pending => StorageTier::CriticalActiveLock,
+            PaymentStatus::PartialRefunded => StorageTier::StandardActive,
+            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::Cancelled => {
+                StorageTier::TerminalAuditRecord
+            }
+        }
+    }
+
+    /// Payments are kept in instance storage, which shares one TTL. For a
+    /// payment that still holds funds, extend that TTL so it outlives the
+    /// payment's expiry plus [`PAYMENT_DISPUTE_GRACE_SECS`]. Returns the TTL
+    /// target, or 0 when the payment is unknown or not critical.
+    fn keep_payment_alive(env: &Env, payment_id: u64) -> u32 {
+        let payment: Payment = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+        {
+            Some(payment) => payment,
+            None => return 0,
+        };
+        let tier = Self::payment_storage_tier(&payment.status);
+        if tier != StorageTier::CriticalActiveLock {
+            return 0;
+        }
+        storage::extend_instance_until(env, tier, payment.expires_at, PAYMENT_DISPUTE_GRACE_SECS)
+    }
+
     /// Returns the current schema version of the contract storage.
     ///
     /// # Returns
@@ -2126,6 +2298,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        Self::require_no_migration_in_progress(&env)?;
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
@@ -2161,6 +2334,11 @@ impl PaymentContract {
             if next_version == 2 {
                 Self::migrate_v1_to_v2(env)?;
             }
+            // v3: the token whitelist moves from one instance `Vec` to
+            // sharded persistent entries.
+            if next_version == 3 {
+                Self::migrate_v2_to_v3(env);
+            }
             version = next_version;
         }
         Ok(())
@@ -2172,6 +2350,18 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` when every payment in `1..=PaymentKey::Counter` could be read
     /// and indexed, otherwise `SchemaMigrationFailed`.
+    /// v2 -> v3: moves the legacy instance whitelist into sharded persistent
+    /// storage. Idempotent; a contract that never had a whitelist is a no-op.
+    fn migrate_v2_to_v3(env: &Env) {
+        let legacy: Option<Vec<Address>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens));
+        if let Some(tokens) = legacy {
+            Self::store_allowed_tokens(env, &tokens);
+        }
+    }
+
     fn migrate_v1_to_v2(env: &Env) -> Result<(), Error> {
         let counter: u64 = env
             .storage()
@@ -2180,21 +2370,28 @@ impl PaymentContract {
             .unwrap_or(0);
 
         for payment_id in 1..=counter {
-            let payment: Payment = env
-                .storage()
-                .instance()
-                .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
-                .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
-
-            // Corrupted record: the id and the indexed party must agree.
-            if payment.id != payment_id {
-                return Err(Error::Basic(BasicError::SchemaMigrationFailed));
-            }
-
-            Self::index_payment_for_customer(env, &payment.customer, payment_id);
-            Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
+            Self::migrate_payment_v1_to_v2(env, payment_id)?;
         }
 
+        Ok(())
+    }
+
+    /// v1 -> v2 for one payment: index it for its customer and merchant.
+    /// Idempotent (the index helpers skip ids already present).
+    fn migrate_payment_v1_to_v2(env: &Env, payment_id: u64) -> Result<(), Error> {
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Basic(BasicError::SchemaMigrationFailed))?;
+
+        // Corrupted record: the id and the indexed party must agree.
+        if payment.id != payment_id {
+            return Err(Error::Basic(BasicError::SchemaMigrationFailed));
+        }
+
+        Self::index_payment_for_customer(env, &payment.customer, payment_id);
+        Self::index_payment_for_merchant(env, &payment.merchant, payment_id);
         Ok(())
     }
 
@@ -2322,6 +2519,114 @@ impl PaymentContract {
             }
         }
         false
+    }
+
+    /// Migrates the schema to [`LATEST_SCHEMA_VERSION`] a batch of records at
+    /// a time, so contracts with many records stay within Soroban's
+    /// per-transaction CPU and write-entry limits.
+    ///
+    /// The first call creates a persistent [`MigrationCursor`] over payment
+    /// ids `1..=payment counter` and blocks state-changing entry points with
+    /// `MigrationInProgress`. Each call migrates at most `batch_size` records
+    /// (capped at [`MAX_MIGRATION_BATCH`]) and advances the cursor. When the
+    /// cursor passes the last record, the non-record steps run, the schema
+    /// version is written and the guard is lifted. Every per-record step is
+    /// idempotent, so retrying a batch is safe. Read-only queries keep working
+    /// throughout.
+    ///
+    /// # Errors
+    /// `NotAnAdmin`, `SchemaAlreadyAtTarget` (nothing to migrate),
+    /// `InvalidMigrationBatch` for a batch size of 0, `SchemaMigrationFailed`
+    /// for a corrupted record.
+    pub fn migrate_schema_step(
+        env: Env,
+        admin: Address,
+        batch_size: u32,
+    ) -> Result<MigrationCursor, Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if batch_size == 0 {
+            return Err(Error::Basic(BasicError::InvalidMigrationBatch));
+        }
+
+        let mut cursor = match Self::get_migration_cursor(env.clone()).filter(|c| !c.completed) {
+            Some(cursor) => cursor,
+            None => {
+                let from_version = Self::get_schema_version(env.clone());
+                if from_version >= LATEST_SCHEMA_VERSION {
+                    return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+                }
+                let target_max_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Payment(PaymentKey::Counter))
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(ConfigKey::MigrationInProgress), &true);
+                MigrationCursor {
+                    from_version,
+                    to_version: LATEST_SCHEMA_VERSION,
+                    next_record_id: 1,
+                    target_max_id,
+                    records_migrated: 0,
+                    completed: false,
+                }
+            }
+        };
+
+        let batch = batch_size.min(MAX_MIGRATION_BATCH) as u64;
+        let end = cursor
+            .next_record_id
+            .saturating_add(batch)
+            .min(cursor.target_max_id.saturating_add(1));
+        for payment_id in cursor.next_record_id..end {
+            if cursor.from_version < 2 {
+                Self::migrate_payment_v1_to_v2(&env, payment_id)?;
+            }
+            cursor.records_migrated += 1;
+        }
+        cursor.next_record_id = end;
+
+        if cursor.next_record_id > cursor.target_max_id {
+            // Steps that are not per record.
+            if cursor.from_version < 3 {
+                Self::migrate_v2_to_v3(&env);
+            }
+            cursor.completed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::SchemaVersion), &cursor.to_version);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Config(ConfigKey::MigrationInProgress));
+        }
+        storage::set_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor), &cursor);
+        Ok(cursor)
+    }
+
+    /// Progress of the current (or last) batched migration, if any.
+    pub fn get_migration_cursor(env: Env) -> Option<MigrationCursor> {
+        storage::get_persistent(&env, &DataKey::Config(ConfigKey::MigrationCursor))
+    }
+
+    fn require_no_migration_in_progress(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Config(ConfigKey::MigrationInProgress))
+            .unwrap_or(false)
+        {
+            return Err(Error::Basic(BasicError::MigrationInProgress));
+        }
+        Ok(())
     }
 
     /// Simulates a schema migration and returns an impact report without
@@ -2873,6 +3178,94 @@ impl PaymentContract {
         )
     }
 
+    /// Creates a payment without publishing the merchant vault at invoice creation.
+    /// The commitment is SHA-256 of the vault address XDR followed by a 32-byte secret XDR.
+    pub fn create_private_payment(
+        env: Env,
+        customer: Address,
+        ephemeral_invoice_commitment: BytesN<32>,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_private_payment")?;
+        customer.require_auth();
+        let commitment_key = DataKey::Payment(PaymentKey::UsedPrivatePaymentCommitment(
+            ephemeral_invoice_commitment.clone(),
+        ));
+        if env.storage().instance().has(&commitment_key) {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer,
+            env.current_contract_address(),
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata,
+        )?;
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::PrivatePaymentCommitment(payment_id)),
+            &EphemeralInvoiceRoute {
+                ephemeral_invoice_commitment,
+            },
+        );
+        env.storage().instance().set(&commitment_key, &true);
+        Ok(payment_id)
+    }
+
+    /// Reveals and settles a private payment for its committed merchant vault.
+    pub fn complete_private_payment(
+        env: Env,
+        vault: Address,
+        secret: BytesN<32>,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "complete_private_payment")?;
+        vault.require_auth();
+        Self::require_merchant_not_paused(&env, &vault)?;
+
+        let route: EphemeralInvoiceRoute = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        let mut reveal = vault.to_xdr(&env);
+        reveal.append(&secret.to_xdr(&env));
+        if env.crypto().sha256(&reveal) != route.ephemeral_invoice_commitment {
+            return Err(Error::Payment(PaymentError::HashMismatch));
+        }
+
+        let payment_key = DataKey::Payment(PaymentKey::Data(payment_id));
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&payment_key)
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        payment.merchant = vault.clone();
+        env.storage().instance().set(&payment_key, &payment);
+        env.storage()
+            .instance()
+            .remove(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )));
+
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        if threshold > 0 && payment.amount > threshold {
+            return PaymentContract::propose_large_payment(env, vault, payment_id);
+        }
+
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &vault, payment_id)?;
+        Ok(())
+    }
+
     /// Schedules a future payment by escrowing tokens until the scheduled time.
     ///
     /// # Arguments
@@ -2893,6 +3286,7 @@ impl PaymentContract {
         amount: i128,
         scheduled_at: u64,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "schedule_payment")?;
         customer.require_auth();
         if amount <= 0 {
@@ -2939,6 +3333,9 @@ impl PaymentContract {
             amount,
         })
         .publish(&env);
+
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
 
         Ok(payment_id)
     }
@@ -3000,6 +3397,7 @@ impl PaymentContract {
         caller: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "cancel_scheduled_payment")?;
         caller.require_auth();
         let mut scheduled: ScheduledPayment = env
@@ -3141,6 +3539,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payout schedule is not found, the payout
     /// period has not elapsed, or there is nothing to settle.
     pub fn trigger_scheduled_payout(env: Env, merchant: Address) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         merchant.require_auth();
         let mut schedule: PayoutSchedule = env
             .storage()
@@ -3197,6 +3596,73 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Detect structuring / smurfing: accumulate the payer's payment volume within
+    /// a rolling window and flag when the total would have triggered `LargePaymentProposal`
+    /// if it had been sent as a single payment.
+    ///
+    /// Window size defaults to 3600 seconds (1 hour); configurable via the same
+    /// `large_payment_threshold` that governs single-payment timelocks.
+    fn check_velocity_structuring(
+        env: &Env,
+        customer: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        // If no threshold is configured, structuring detection is disabled.
+        if threshold <= 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        // Rolling window: 1 hour (3600 seconds).
+        const VELOCITY_WINDOW_SECONDS: u64 = 3600;
+
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::VelocityWindowStart(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let window_volume: i128 = if now.saturating_sub(window_start) < VELOCITY_WINDOW_SECONDS {
+            // Still within the rolling window — accumulate.
+            env.storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::VelocityWindowVolume(
+                    customer.clone(),
+                )))
+                .unwrap_or(0)
+        } else {
+            // Window has expired — start fresh.
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+            0
+        };
+
+        let new_volume = window_volume.saturating_add(amount);
+
+        if new_volume > threshold {
+            return Err(Error::Feature(FeatureError::StructuringDetected));
+        }
+
+        // Persist updated window state.
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::VelocityWindowVolume(customer.clone())),
+            &new_volume,
+        );
+        if window_start == 0 || now.saturating_sub(window_start) >= VELOCITY_WINDOW_SECONDS {
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+        }
+
+        Ok(())
+    }
+
     fn do_create_payment(
         env: &Env,
         customer: Address,
@@ -3240,6 +3706,9 @@ impl PaymentContract {
 
         // Check customer spend limit (#217)
         PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
+
+        // Issue #2: detect structuring / smurfing (split payments below threshold).
+        PaymentContract::check_velocity_structuring(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -3533,6 +4002,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -3668,6 +4140,7 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
@@ -3712,6 +4185,9 @@ impl PaymentContract {
             escrow_contract,
         })
         .publish(&env);
+
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
 
         Ok((payment_id, escrow_id))
     }
@@ -3761,14 +4237,18 @@ impl PaymentContract {
         // bridge and allow an immediate release. See
         // EscrowContract::add_trusted_bridge / is_trusted_bridge.
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
-        if escrow_client
-            .try_release_escrow(
-                &env.current_contract_address(),
-                &bridge.escrow_id,
-                &bridge.auto_release_on_complete,
-            )
-            .is_err()
-        {
+        // Only the registered escrow sibling may call back while it runs.
+        reentrancy::expect_callback(
+            &env,
+            reentrancy::CallContextState::AwaitingEscrowCallback(bridge.escrow_contract.clone()),
+        );
+        let released = escrow_client.try_release_escrow(
+            &env.current_contract_address(),
+            &bridge.escrow_id,
+            &bridge.auto_release_on_complete,
+        );
+        reentrancy::end_callback(&env);
+        if released.is_err() {
             return Err(Error::Feature(FeatureError::EscrowBridgeFailed));
         }
 
@@ -4206,6 +4686,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not found, is not in Pending
     /// status, has no expiration set, or has not yet expired.
     pub fn expire_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         // Retrieve payment from storage
         if !env
             .storage()
@@ -4289,6 +4770,7 @@ impl PaymentContract {
     /// found, is not in Pending status, is expired, or the multisig threshold is not met.
     /// Returns `ProposalError::RequiresMultiSig` if a multisig proposal was auto-created.
     pub fn complete_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "complete_payment")?;
         admin.require_auth();
 
@@ -4300,6 +4782,16 @@ impl PaymentContract {
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
         }
 
         // Check if payment requires multi-sig approval
@@ -4351,10 +4843,22 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+        Self::accrue_relayer_stipend(&env, &admin, payment_id)?;
+        Ok(())
     }
 
     fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::PrivatePaymentCommitment(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
         // Check if payment exists
         if !env
             .storage()
@@ -4438,7 +4942,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::PendingSettlement(payment_id)),
                     &settlement,
                 );
-                
+
                 // Track total pending settlement amount per token for sweep validation
                 let total_pending: i128 = env
                     .storage()
@@ -4451,7 +4955,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::TotalPendingSettlement(payment.token.clone())),
                     &(total_pending + net_amount),
                 );
-                
+
                 let idx: u64 = env
                     .storage()
                     .instance()
@@ -5001,6 +5505,7 @@ impl PaymentContract {
         payment_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "pay_installment")?;
         customer.require_auth();
 
@@ -5509,6 +6014,7 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not found, is not in Pending
     /// status, or the caller is not the customer or merchant.
     pub fn cancel_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "cancel_payment")?;
         caller.require_auth();
         PaymentContract::do_cancel_payment(&env, caller, payment_id)
@@ -5788,16 +6294,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let mut tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let mut tokens = Self::load_allowed_tokens(&env);
         if !tokens.contains(&token) {
             tokens.push_back(token);
-            env.storage()
-                .instance()
-                .set(&DataKey::Config(ConfigKey::AllowedTokens), &tokens);
+            Self::store_allowed_tokens(&env, &tokens);
         }
 
         Ok(())
@@ -5823,20 +6323,14 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env));
+        let tokens = Self::load_allowed_tokens(&env);
         let mut updated = Vec::new(&env);
         for entry in tokens.iter() {
             if entry != token {
                 updated.push_back(entry);
             }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::AllowedTokens), &updated);
+        Self::store_allowed_tokens(&env, &updated);
 
         Ok(())
     }
@@ -5852,10 +6346,39 @@ impl PaymentContract {
     /// # Returns
     /// A `Vec<Address>` of allowed token addresses. Returns an empty vector if none are configured.
     pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        Self::load_allowed_tokens(&env)
+    }
+
+    /// The token whitelist. It lives in persistent shards
+    /// (`TokenWhitelistShard`) with only its length in instance storage, so
+    /// a long whitelist does not inflate every invocation. A contract not yet
+    /// migrated to schema 3 still has it under the legacy instance key.
+    fn load_allowed_tokens(env: &Env) -> Vec<Address> {
+        storage::read_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+        )
+        .or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::Config(ConfigKey::AllowedTokens))
+        })
+        .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Writes the token whitelist in sharded form and drops the legacy
+    /// instance copy.
+    fn store_allowed_tokens(env: &Env, tokens: &Vec<Address>) {
+        storage::write_sharded(
+            env,
+            &DataKey::Config(ConfigKey::TokenWhitelistCount),
+            |shard| DataKey::Config(ConfigKey::TokenWhitelistShard(shard)),
+            tokens,
+        );
         env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(&env))
+            .remove(&DataKey::Config(ConfigKey::AllowedTokens));
     }
 
     // Mirrors the refund contract's token-registry bypass (Issue #191): an
@@ -5863,11 +6386,7 @@ impl PaymentContract {
     // tokens are permitted until an admin opts in by calling
     // `add_allowed_token`.
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
-        let tokens: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::AllowedTokens))
-            .unwrap_or_else(|| Vec::new(env));
+        let tokens = Self::load_allowed_tokens(env);
         tokens.is_empty() || tokens.contains(token)
     }
 
@@ -6262,6 +6781,24 @@ impl PaymentContract {
                 period_seconds: trial_period_seconds,
                 ends_at: trial_ends_at,
                 converted: false,
+                locked_conversion_amount: amount,
+                notice_emitted_at: None,
+                min_notice_lead_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    (trial_period_seconds / 2)
+                        .max(1)
+                        .min(DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS)
+                },
+                post_trial_cancel_grace_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    POST_TRIAL_CANCEL_GRACE_SECS
+                },
+                conversion_charge_amount: None,
+                conversion_charged_at: None,
+                post_conversion_usage_units: 0,
+                conversion_charge_reversed: false,
             },
             pause_data: SubscriptionPauseData {
                 last_paused_at: 0,
@@ -6387,6 +6924,7 @@ impl PaymentContract {
                 SubscriptionError::MaxTrialDurationExceeded,
             ))?;
         sub.trial_data.period_seconds = new_total;
+        sub.trial_data.notice_emitted_at = None;
 
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -6396,10 +6934,179 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Emit the required on-chain notice before a trial converts to a paid subscription.
+    /// Only the subscription merchant may publish the notice.
+    pub fn emit_trial_conversion_notice(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        sub.merchant.require_auth();
+
+        if sub.trial_data.ends_at == 0 || sub.trial_data.converted {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+        if sub.trial_data.notice_emitted_at.is_some() {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialNoticeAlreadyEmitted,
+            ));
+        }
+
+        let now = env.ledger().timestamp();
+        let earliest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(MAX_TRIAL_NOTICE_LEAD_SECS);
+        let latest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(sub.trial_data.min_notice_lead_secs);
+        if now <= sub.created_at || now < earliest_notice_at || now > latest_notice_at {
+            return Err(Error::Subscription(
+                SubscriptionError::InvalidTrialNoticeWindow,
+            ));
+        }
+
+        sub.trial_data.notice_emitted_at = Some(now);
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (TrialConversionNoticeEmitted {
+            subscription_id,
+            conversion_amount: sub.trial_data.locked_conversion_amount,
+            notice_emitted_at: now,
+            trial_ends_at: sub.trial_data.ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Record customer consent for a new trial conversion amount.
+    /// Any previous conversion notice is invalidated and must be emitted again.
+    pub fn authorize_trial_conversion_amount(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.trial_data.ends_at == 0
+            || sub.trial_data.converted
+            || env.ledger().timestamp() >= sub.trial_data.ends_at
+        {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+
+        sub.amount = amount;
+        sub.trial_data.locked_conversion_amount = amount;
+        sub.trial_data.notice_emitted_at = None;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        Ok(())
+    }
+
+    /// Report usage during the post-conversion grace period.
+    /// A customer cancellation is refundable only while no usage has been reported.
+    pub fn report_trial_conversion_usage(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        units: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if units == 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let now = env.ledger().timestamp();
+        let charged_at = sub
+            .trial_data
+            .conversion_charged_at
+            .ok_or(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ))?;
+        if !sub.trial_data.converted
+            || sub.status != SubscriptionStatus::Active
+            || now > charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+        {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ));
+        }
+        sub.trial_data.post_conversion_usage_units = sub
+            .trial_data
+            .post_conversion_usage_units
+            .checked_add(units)
+            .ok_or(Error::Basic(BasicError::BillingOverflow))?;
+        let accumulated_units = sub.trial_data.post_conversion_usage_units;
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        (TrialConversionUsageReported {
+            subscription_id,
+            units,
+            accumulated_units,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    fn validate_trial_conversion(sub: &Subscription) -> Result<bool, Error> {
+        let is_trial_conversion = sub.trial_data.ends_at > 0 && !sub.trial_data.converted;
+        if is_trial_conversion {
+            if sub.trial_data.notice_emitted_at.is_none() {
+                return Err(Error::Subscription(SubscriptionError::TrialNoticeMissing));
+            }
+            if sub.amount > sub.trial_data.locked_conversion_amount {
+                return Err(Error::Subscription(
+                    SubscriptionError::TrialPriceConsentRequired,
+                ));
+            }
+        }
+        Ok(is_trial_conversion)
+    }
+
     /// Execute the next recurring payment for a subscription.
     /// Anyone (typically an off-chain keeper / cron) may call this once the
     /// payment is due. It handles retry logic internally.
     pub fn execute_recurring_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if !env
             .storage()
             .instance()
@@ -6422,6 +7129,7 @@ impl PaymentContract {
 
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
+            let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
             let mut dunning: DunningState = env
                 .storage()
                 .instance()
@@ -6468,6 +7176,18 @@ impl PaymentContract {
                 .is_ok();
 
             if transfer_ok {
+                if is_trial_conversion {
+                    sub.trial_data.converted = true;
+                    sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                    sub.trial_data.conversion_charged_at = Some(now);
+                    sub.trial_data.post_conversion_usage_units = 0;
+                    sub.trial_data.conversion_charge_reversed = false;
+                    (TrialConverted {
+                        subscription_id,
+                        converted_at: now,
+                    })
+                    .publish(&env);
+                }
                 sub.payment_count += 1;
                 sub.retry_count = 0;
                 sub.next_payment_at = sub.next_payment_at + sub.interval;
@@ -6583,6 +7303,8 @@ impl PaymentContract {
             return Ok(());
         }
 
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
+
         // Check customer spend limit (#282)
         let charge_amount =
             PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
@@ -6607,8 +7329,12 @@ impl PaymentContract {
 
         if transfer_ok {
             // Mark converted on first post-trial charge
-            if sub.trial_data.ends_at > 0 && !sub.trial_data.converted {
+            if is_trial_conversion {
                 sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
                 (TrialConverted {
                     subscription_id,
                     converted_at: now,
@@ -6862,6 +7588,7 @@ impl PaymentContract {
     /// - `MeteredNotFound` if the subscription does not exist.
     /// - `BillingOverflow` if the multiplication of units × price overflows.
     pub fn execute_metered_billing(env: Env, subscription_id: u64) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         let mut sub: MeteredSubscription = env
             .storage()
             .instance()
@@ -6965,6 +7692,40 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
 
+        let now = env.ledger().timestamp();
+        if caller == sub.customer
+            && sub.trial_data.converted
+            && sub.payment_count == 1
+            && !sub.trial_data.conversion_charge_reversed
+            && sub.trial_data.post_conversion_usage_units == 0
+            && sub
+                .trial_data
+                .conversion_charged_at
+                .map_or(false, |charged_at| {
+                    now <= charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+                })
+        {
+            let amount = sub
+                .trial_data
+                .conversion_charge_amount
+                .ok_or(Error::Payment(PaymentError::TransferFailed))?;
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            if token_client
+                .try_transfer_from(&contract_address, &sub.merchant, &sub.customer, &amount)
+                .is_err()
+            {
+                return Err(Error::Payment(PaymentError::TransferFailed));
+            }
+            sub.trial_data.conversion_charge_reversed = true;
+            (TrialConversionChargeReversed {
+                subscription_id,
+                amount,
+                reversed_at: now,
+            })
+            .publish(&env);
+        }
+
         sub.status = SubscriptionStatus::Cancelled;
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -6974,7 +7735,6 @@ impl PaymentContract {
         Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
 
         // Emit TrialCancelled if cancelled during trial
-        let now = env.ledger().timestamp();
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             (TrialCancelled {
                 subscription_id,
@@ -7044,6 +7804,7 @@ impl PaymentContract {
         customer: Address,
         subscription_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
 
         if !env
@@ -7293,6 +8054,7 @@ impl PaymentContract {
     /// Retry a failed payment for a subscription in dunning.
     /// Validates that the retry is due before attempting.
     pub fn retry_failed_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if !env
             .storage()
             .instance()
@@ -7322,6 +8084,7 @@ impl PaymentContract {
             .ok_or(Error::Subscription(SubscriptionError::DunningNotFound))?;
 
         let now = env.ledger().timestamp();
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
 
         // Enforce backoff window
         if now < dunning.next_retry_at {
@@ -7344,6 +8107,18 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
+            if is_trial_conversion {
+                sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
+                (TrialConverted {
+                    subscription_id,
+                    converted_at: now,
+                })
+                .publish(&env);
+            }
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
@@ -7425,6 +8200,7 @@ impl PaymentContract {
 
     /// Admin resolves dunning for a subscription, returning it to active state.
     pub fn resolve_dunning(env: Env, admin: Address, subscription_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
 
         let config: MultiSigConfig = env
@@ -8532,8 +9308,102 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Sets the share of collected protocol fees reserved for completion relayers.
+    pub fn set_relayer_stipend_bps(
+        env: Env,
+        admin: Address,
+        relayer_stipend_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if relayer_stipend_bps > 10_000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::RelayerStipendBps),
+            &relayer_stipend_bps,
+        );
+        Ok(())
+    }
+
+    /// Returns a relayer's accrued stipend for a token.
+    pub fn get_relayer_stipend(env: Env, relayer: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::RelayerStipend(
+                relayer, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    /// Claims a relayer's accrued stipend in the token it was earned in.
+    pub fn claim_relayer_stipend(
+        env: Env,
+        relayer: Address,
+        token: Address,
+    ) -> Result<i128, Error> {
+        relayer.require_auth();
+        let key = DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), token.clone()));
+        let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return Err(Error::Feature(FeatureError::NothingToSweep));
+        }
+        env.storage().instance().set(&key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &relayer,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    fn accrue_relayer_stipend(env: &Env, relayer: &Address, payment_id: u64) -> Result<(), Error> {
+        let bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::RelayerStipendBps))
+            .unwrap_or(0);
+        if bps == 0 {
+            return Ok(());
+        }
+        let payment = PaymentContract::get_payment(env, payment_id);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PaymentFee(payment_id)))
+            .unwrap_or(0);
+        let stipend = fee.saturating_mul(bps as i128) / 10_000;
+        if stipend <= 0 {
+            return Ok(());
+        }
+        let balance_key =
+            DataKey::Feature(FeatureKey::RelayerStipend(relayer.clone(), payment.token));
+        let accrued: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&balance_key, &accrued.saturating_add(stipend));
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::AccumulatedFees),
+            &accumulated.saturating_sub(stipend),
+        );
+        Ok(())
+    }
+
     /// Admin withdraws accumulated fees to the treasury address.
     pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         let multisig: MultiSigConfig = env
             .storage()
@@ -9302,6 +10172,7 @@ impl PaymentContract {
     /// - `RebateThresholdNotMet` if no accrual data exists for the merchant.
     /// - `RebateAlreadyClaimed` if the accrued rebate is zero (already claimed).
     pub fn claim_fee_rebate(env: Env, merchant: Address) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         merchant.require_auth();
 
         let config: FeeRebateConfig = env
@@ -9621,6 +10492,7 @@ impl PaymentContract {
         admin: Address,
         entries: Vec<BatchPaymentEntry>,
     ) -> Result<Vec<BatchResult>, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "create_payment_batch_optimized")?;
         admin.require_auth();
 
@@ -10013,6 +10885,9 @@ impl PaymentContract {
             condition_type: condition_type_str,
         })
         .publish(&env);
+
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
 
         Ok(payment_id)
     }
@@ -11235,6 +12110,7 @@ impl PaymentContract {
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        Self::require_no_migration_in_progress(env)?;
         if let Some(state) = env
             .storage()
             .instance()
@@ -12060,6 +12936,7 @@ impl PaymentContract {
         expires_at: u64,
         customer_pk: BytesN<32>,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
@@ -12140,6 +13017,7 @@ impl PaymentContract {
         channel_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "top_up_channel")?;
         customer.require_auth();
         if amount <= 0 {
@@ -12203,6 +13081,26 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the channel is not found, closed, expired, nonce is stale,
     /// amount exceeds deposit, or signature verification fails.
+    /// The signing domain of this contract on the current network
+    /// (see `channels.rs`). Read-only.
+    pub fn get_domain_separator(env: Env) -> DomainSeparator {
+        DomainSeparator::current(&env)
+    }
+
+    /// The 32-byte digest a customer signs to authorize
+    /// `settle_channel(channel_id, merchant_amount, nonce)` on this contract
+    /// and network. Read-only; lets integrators check their own encoding.
+    pub fn channel_settle_digest(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+    ) -> BytesN<32> {
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::signing_digest(&env, channels::ACTION_CHANNEL_SETTLE, &struct_hash)
+    }
+
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -12210,6 +13108,7 @@ impl PaymentContract {
         nonce: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "settle_channel")?;
 
         let mut channel: PaymentChannel = env
@@ -12237,16 +13136,20 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
-        // Issue #113: Verify signature over (channel_id, merchant_amount, nonce, contract_address)
-        // Including the contract address prevents cross-channel replay attacks.
-        let mut msg = Bytes::new(&env);
-        msg.append(&channel_id.to_xdr(&env));
-        msg.append(&merchant_amount.to_xdr(&env));
-        msg.append(&nonce.to_xdr(&env));
-        msg.append(&env.current_contract_address().to_xdr(&env));
-
-        env.crypto()
-            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+        // The customer signs the domain-separated digest of (channel_id,
+        // merchant_amount, nonce): bound to this network, this contract and
+        // the settle_channel action, so it can't be replayed on another
+        // network, another deployment or another entry point (see
+        // channels.rs and SECURITY.md for the byte layout).
+        let struct_hash =
+            channels::channel_settle_struct_hash(&env, channel_id, merchant_amount, nonce);
+        channels::verify_domain_signature(
+            &env,
+            &channel.customer_pk,
+            channels::ACTION_CHANNEL_SETTLE,
+            &struct_hash,
+            &signature,
+        );
 
         let customer_refund = channel.deposited - merchant_amount;
 
@@ -12305,6 +13208,7 @@ impl PaymentContract {
     /// Returns an error if the caller is not a channel participant, the channel
     /// is not found, already closed, or not yet expired.
     pub fn close_channel_expired(env: Env, caller: Address, channel_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "close_channel_expired")?;
         caller.require_auth();
 
@@ -12366,6 +13270,180 @@ impl PaymentContract {
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
     }
 
+    /// Opens a time-streaming channel funded by the customer.
+    pub fn open_streaming_channel(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        deposit: i128,
+        flow_rate_per_sec: i128,
+        start_ts: u64,
+        stop_ts: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "open_streaming_channel")?;
+        customer.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let now = env.ledger().timestamp();
+        if deposit <= 0 || flow_rate_per_sec <= 0 || start_ts < now || stop_ts <= start_ts {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if Self::is_zero_address(&env, &merchant) {
+            return Err(Error::Feature(FeatureError::InvalidCounterparty));
+        }
+        token::Client::new(&env, &token).transfer(
+            &customer,
+            &env.current_contract_address(),
+            &deposit,
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(
+                FeatureKey::StreamingPaymentChannelCounter,
+            ))
+            .unwrap_or(0);
+        let channel_id = counter + 1;
+        let channel = StreamingPaymentChannel {
+            channel_id,
+            customer,
+            merchant,
+            token,
+            deposited: deposit,
+            claimed: 0,
+            flow_rate_per_sec,
+            start_ts,
+            stop_ts,
+            open: true,
+        };
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannelCounter),
+            &channel_id,
+        );
+        Ok(channel_id)
+    }
+
+    /// Returns the unclaimed balance accrued by a streaming channel at the current ledger time.
+    pub fn get_streaming_claimable(env: Env, channel_id: u64) -> Result<i128, Error> {
+        let channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        Ok(Self::streaming_earned(&env, &channel).saturating_sub(channel.claimed))
+    }
+
+    /// Retrieves a streaming channel by its ID.
+    pub fn get_streaming_channel(
+        env: Env,
+        channel_id: u64,
+    ) -> Result<StreamingPaymentChannel, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))
+    }
+
+    /// Claims the currently accrued streaming balance for the merchant.
+    pub fn claim_streaming_channel(
+        env: Env,
+        merchant: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "claim_streaming_channel")?;
+        merchant.require_auth();
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if merchant != channel.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let amount = earned.saturating_sub(channel.claimed);
+        if amount <= 0 {
+            return Err(Error::Payment(PaymentError::NothingToSettle));
+        }
+        channel.claimed = earned;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        token::Client::new(&env, &channel.token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        Ok(amount)
+    }
+
+    /// Stops a stream and returns its unearned deposit to the customer.
+    pub fn close_streaming_channel(
+        env: Env,
+        customer: Address,
+        channel_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "close_streaming_channel")?;
+        customer.require_auth();
+        let mut channel: StreamingPaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::StreamingPaymentChannel(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+        if customer != channel.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+        let earned = Self::streaming_earned(&env, &channel);
+        let newly_earned = earned.saturating_sub(channel.claimed);
+        let refund = channel.deposited.saturating_sub(earned);
+        channel.claimed = earned;
+        channel.open = false;
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::StreamingPaymentChannel(channel_id)),
+            &channel,
+        );
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+        if newly_earned > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &newly_earned);
+        }
+        if refund > 0 {
+            token_client.transfer(&contract_address, &customer, &refund);
+        }
+        Ok(refund)
+    }
+
+    /// Returns the cumulative amount vested by the channel's linear time schedule.
+    fn streaming_earned(env: &Env, channel: &StreamingPaymentChannel) -> i128 {
+        let now = env.ledger().timestamp().min(channel.stop_ts);
+        let elapsed = now.saturating_sub(channel.start_ts) as i128;
+        channel
+            .flow_rate_per_sec
+            .saturating_mul(elapsed)
+            .min(channel.deposited)
+    }
+
     fn extract_public_key(env: &Env, address: &Address) -> BytesN<32> {
         let xdr = address.to_xdr(env);
         // ScVal XDR layout: [0,0,0,18](ScvAddress) [0,0,0,0](Account) [0,0,0,0](Ed25519) [32 bytes PK]
@@ -12420,6 +13498,7 @@ impl PaymentContract {
         token: Address,
         recipients: Vec<SplitRecipient>,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
 
@@ -12694,6 +13773,9 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Funds are now held: storage must outlive the payment's deadline.
+        Self::keep_payment_alive(&env, payment_id);
+
         Ok(payment_id)
     }
 
@@ -12717,6 +13799,7 @@ impl PaymentContract {
         admin: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
 
         let mut config: PaymentSplitConfig = env
@@ -12880,6 +13963,7 @@ impl PaymentContract {
     /// is not set, accumulated fees are empty, `sweep_amount` exceeds accumulated fees,
     /// or multisig approval is required for amounts above threshold.
     pub fn sweep_fees(env: Env, admin: Address, sweep_amount: i128) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -12921,7 +14005,7 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
-        
+
         // Security check: Ensure sweep won't encroach on merchant pending settlements
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
@@ -13405,6 +14489,18 @@ impl PaymentContract {
         archival::verify_archived_payment_blob(&env, payment_id, full_payment)
     }
 
+    /// Proves that `leaf_hash` (SHA-256 of an archived payment's XDR) is the
+    /// `index`-th leaf of the archived-record Merkle accumulator (#243).
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
+
     /// Configures risk-tier finality scaling (#196). Admin only.
     pub fn configure_finality_risk(
         env: Env,
@@ -13470,6 +14566,7 @@ impl PaymentContract {
     /// Returns an error if the settlement is already finalized, not found,
     /// or the release time has not yet passed.
     pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         if finality::is_flagged(&env, payment_id) {
             return Err(Error::Payment(PaymentError::PaymentFlagged));
         }
@@ -13497,7 +14594,7 @@ impl PaymentContract {
             &settlement.merchant,
             &settlement.amount,
         );
-        
+
         // Decrement total pending settlement amount for this token
         let total_pending: i128 = env
             .storage()
@@ -13510,7 +14607,7 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::TotalPendingSettlement(settlement.token.clone())),
             &(total_pending.saturating_sub(settlement.amount)),
         );
-        
+
         env.storage().instance().set(
             &DataKey::State(StateDataKey::SettlementFinalized(payment_id)),
             &true,
@@ -13699,6 +14796,7 @@ impl PaymentContract {
         route: RouteOption,
         payment_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
 
         // Validate route is still valid at execution time
@@ -13998,6 +15096,68 @@ impl PaymentContract {
         }
     }
 
+    /// Scan a string field for patterns that look like PII (emails, phone numbers,
+    /// tax IDs / SSNs) and reject them to enforce GDPR/CCPA data-minimization on
+    /// the immutable public ledger.
+    ///
+    /// Detection rules (byte-level, no regex engine available in no_std Soroban):
+    /// - Email: contains '@' preceded and followed by at least one non-'@' byte.
+    /// - Phone: 10+ consecutive digit bytes (possibly separated by spaces, dashes,
+    ///   or dots), e.g. `+14155552671` or `415-555-2671`.
+    /// - SSN/Tax ID: pattern `DDD-DD-DDDD` or `DD.DDD.DDD-DD` (9+ digit cluster).
+    fn check_pii_free(env: &Env, text: &String) -> Result<(), Error> {
+        // Convert to raw bytes for scanning.
+        let bytes = text.to_xdr(env);
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // --- Email detection: look for '@' with at least one char before and after ---
+        let mut at_pos: Option<u32> = None;
+        let mut i: u32 = 0;
+        while i < len {
+            if bytes.get(i).unwrap_or(0) == 64u8 { // '@'
+                at_pos = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(pos) = at_pos {
+            if pos > 0 && pos + 1 < len {
+                return Err(Error::Basic(BasicError::PiiDetected));
+            }
+        }
+
+        // --- Phone / Tax-ID detection: count consecutive digit-or-separator runs ---
+        // A run of >=9 digits (with optional spaces, dashes, dots, parens, '+') is flagged.
+        let mut digit_run: u32 = 0;
+        let mut k: u32 = 0;
+        while k < len {
+            let b = bytes.get(k).unwrap_or(0);
+            if b >= 48u8 && b <= 57u8 { // '0'..'9'
+                digit_run += 1;
+                if digit_run >= 9 {
+                    return Err(Error::Basic(BasicError::PiiDetected));
+                }
+            } else if b == 32u8  // space
+                || b == 45u8     // '-'
+                || b == 46u8     // '.'
+                || b == 40u8     // '('
+                || b == 41u8     // ')'
+                || b == 43u8     // '+'
+            {
+                // Separator — keep the digit run going if we already have digits.
+                // (Allows separators within phone numbers)
+            } else {
+                digit_run = 0;
+            }
+            k += 1;
+        }
+
+        Ok(())
+    }
+
     fn validate_bps(bps: u32) -> Result<(), Error> {
         if bps < 1 || bps > 10000 {
             return Err(Error::Basic(BasicError::InvalidBps));
@@ -14023,6 +15183,17 @@ mod test_metadata;
 
 #[cfg(test)]
 mod test_payment_channel;
+#[cfg(test)]
+mod test_replay_prevention;
+
+#[cfg(test)]
+mod test_private_payment;
+
+#[cfg(test)]
+mod test_relayer_stipend;
+
+#[cfg(test)]
+mod test_streaming_channel;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
@@ -14069,6 +15240,12 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_storage_keys;
+
+#[cfg(test)]
+mod test_storage_ttl;
 
 #[cfg(test)]
 mod test_completion_fee_parity;
