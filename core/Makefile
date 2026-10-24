@@ -40,4 +40,9 @@ doc:
 clean:
 	cargo clean
 
-.PHONY: default all test build check-size fmt clippy check doc clean
+# CPU/memory budget regression gate (issue #252): prints a markdown table and
+# fails if any benchmarked entry point exceeds its ceiling.
+budget-bench:
+	cargo test -p payments budget_bench -- --nocapture --test-threads=1
+
+.PHONY: default all test build check-size fmt clippy check doc clean budget-bench
