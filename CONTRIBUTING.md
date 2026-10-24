@@ -165,6 +165,22 @@ cargo fmt --all
 ### 5. Run All Checks
 
 Before committing, ensure:
+
+To run the configured checks automatically before each commit, install
+[`pre-commit`](https://pre-commit.com/) (for example, with `pipx install pre-commit`)
+and enable the repository hook:
+
+```bash
+pre-commit install
+```
+
+The hook checks formatting, runs Clippy, and checks both the `core` and
+`orchestrator` workspaces. To run it manually across all files:
+
+```bash
+pre-commit run --all-files
+```
+
 ```bash
 # Format check
 cargo fmt --all -- --check
