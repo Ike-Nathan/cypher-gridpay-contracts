@@ -12,5 +12,16 @@ build:
 fmt:
 	cargo fmt --all
 
+clippy:
+	cargo clippy --all-targets -- -D warnings
+
+check:
+	cargo check
+
+doc:
+	cargo doc --no-deps
+
 clean:
 	cargo clean
+
+.PHONY: default all test build fmt clippy check doc clean

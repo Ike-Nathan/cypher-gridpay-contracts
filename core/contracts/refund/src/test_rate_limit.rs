@@ -331,3 +331,158 @@ fn test_update_rate_limit_rejects_invalid_params() {
         Err(Ok(Error::Core(CoreError::InvalidAmount)))
     );
 }
+
+fn request(
+    client: &RefundContractClient,
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    payment_id: u64,
+) -> Result<u64, Error> {
+    match client.try_request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &100,
+        &1_000,
+        token,
+        &String::from_str(env, "duplicate"),
+        &RefundReasonCode::Other,
+        &0,
+    ) {
+        Ok(Ok(id)) => Ok(id),
+        Err(Ok(e)) => Err(e),
+        other => panic!("unexpected result: {:?}", other),
+    }
+}
+
+#[test]
+fn test_duplicate_refund_for_same_payment_is_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+
+    // Same customer, same payment: rejected while the first is unresolved.
+    assert_eq!(
+        request(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Ext(ExtError::ActiveRefundExists))
+    );
+
+    // Other payments are unaffected.
+    request(&client, &env, &merchant, &customer, &token, 8).unwrap();
+}
+
+#[test]
+fn test_sybil_customer_addresses_cannot_bypass_payment_limit() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    // Even with a generous per-customer allowance...
+    client.set_global_refund_rate_limit(&admin, &100, &86_400);
+
+    request(
+        &client,
+        &env,
+        &merchant,
+        &Address::generate(&env),
+        &token,
+        7,
+    )
+    .unwrap();
+
+    // ...freshly generated throwaway customer addresses can't open more
+    // refunds against the same payment.
+    for _ in 0..3 {
+        assert_eq!(
+            request(
+                &client,
+                &env,
+                &merchant,
+                &Address::generate(&env),
+                &token,
+                7
+            ),
+            Err(Error::Ext(ExtError::ActiveRefundExists))
+        );
+    }
+}
+
+#[test]
+fn test_new_refund_allowed_once_previous_is_resolved() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1_000_000);
+    client.initialize(&admin);
+
+    // Approved-but-unpaid still counts as active.
+    let first = request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+    client.approve_refund(&admin, &first);
+    assert_eq!(
+        request(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Ext(ExtError::ActiveRefundExists))
+    );
+
+    // Once paid out, a further partial refund can be requested.
+    client.process_refund(&admin, &first);
+    let second = request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+
+    // A denial pending appeal is still active; a finalized denial is not.
+    client.reject_refund(&admin, &second, &String::from_str(&env, "no"));
+    assert_eq!(
+        request(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Ext(ExtError::ActiveRefundExists))
+    );
+    let deadline = client.get_refund(&second).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&second);
+    // The denial starts the payment's rejection cooldown (24h by default)...
+    assert_eq!(
+        request(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Core(CoreError::RefundCooldownActive))
+    );
+    // ...after which the payment can be refunded again.
+    env.ledger()
+        .set_timestamp(deadline + DEFAULT_PAYMENT_REJECTION_COOLDOWN_SECS);
+    request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+}
+
+#[test]
+fn test_expired_request_does_not_block_new_refund() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    client.set_refund_ttl_config(&admin, &3_600);
+
+    request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+    // An expired request can no longer be approved, so it isn't "active".
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
+    request(&client, &env, &merchant, &customer, &token, 7).unwrap();
+}

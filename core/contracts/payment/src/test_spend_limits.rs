@@ -106,3 +106,192 @@ fn test_period_auto_reset() {
     // After period reset, full limit is available again
     assert!(client.check_spend_allowance(&customer, &1000));
 }
+
+#[test]
+fn test_set_and_get_large_payment_threshold() {
+    let (env, client, admin) = setup();
+    // Default threshold is zero (circuit breaker disabled)
+    assert_eq!(client.get_large_payment_threshold(), 0);
+    client.set_large_payment_threshold(&admin, &5_000);
+    assert_eq!(client.get_large_payment_threshold(), 5_000);
+}
+
+#[test]
+fn test_large_payment_below_threshold_not_flagged() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &1_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    // Below threshold: not flagged, no timelock required
+    assert!(!client.is_payment_flagged(&payment_id));
+    assert_eq!(client.get_payment_release_time(&payment_id), 0);
+}
+
+#[test]
+fn test_large_payment_at_threshold_is_flagged() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &5_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    // At threshold: circuit breaker activates
+    assert!(client.is_payment_flagged(&payment_id));
+    // 24-hour settlement delay enforced
+    assert_eq!(client.get_payment_release_time(&payment_id), 86_400);
+}
+
+#[test]
+fn test_large_payment_above_threshold_is_flagged() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &9_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    assert!(client.is_payment_flagged(&payment_id));
+    assert_eq!(client.get_payment_release_time(&payment_id), 86_400);
+}
+
+#[test]
+fn test_flagged_payment_release_rejected_before_timelock() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &9_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    // Attempting to release before the 24h delay elapses must fail
+    let result = client.try_release_payment(&admin, &payment_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::TimelockNotElapsed)))
+    );
+}
+
+#[test]
+fn test_flagged_payment_release_after_timelock() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &9_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    // Advance past the 24h settlement delay
+    env.ledger().with_mut(|l| l.timestamp = 86_401);
+
+    client.release_payment(&admin, &payment_id);
+    assert!(client.is_payment_released(&payment_id));
+}
+
+#[test]
+fn test_flagged_payment_multi_admin_approval_releases_early() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &10_000);
+
+    client.set_large_payment_threshold(&admin, &5_000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &9_000,
+        &token_addr,
+        &Currency::USDC,
+        &0,
+        &soroban_sdk::String::from_str(&env, ""),
+    );
+
+    // Multi-admin approval bypasses the timelock
+    client.approve_flagged_payment(&admin, &payment_id);
+    client.release_payment(&admin, &payment_id);
+    assert!(client.is_payment_released(&payment_id));
+}

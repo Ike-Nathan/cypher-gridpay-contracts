@@ -1,0 +1,19 @@
+[package]
+name = "e2e-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+soroban-sdk = { version = "23", features = ["testutils"] }
+payment = { package = "payments", path = "../../core/contracts/payment" }
+escrow = { path = "../../core/contracts/escrow" }
+refund = { path = "../../core/contracts/refund" }
+proptest = "1.4.0"
+proptest-state-machine = "0.3.0"
+
+[features]
+testutils = ["soroban-sdk/testutils"]

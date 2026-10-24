@@ -262,3 +262,101 @@ fn test_cross_contract_verify_unrelated_address_is_not_participant() {
     let unrelated = Address::generate(&env);
     assert!(!escrow_client.verify_escrow_participant(&escrow_id, &unrelated));
 }
+
+// ── Cross-contract failure: atomic rollback ──────────────────────────────────
+
+// When the external escrow contract cannot be reached (here: the address is
+// not a registered contract), `create_escrowed_payment` must fail with
+// `EscrowCreationFailed` and must NOT persist any payment state. This proves
+// the internal storage write happens only after the cross-contract escrow
+// creation succeeds.
+#[test]
+fn test_create_escrowed_payment_rolls_back_on_escrow_failure() {
+    let (env, payment_client, _escrow_client, customer, merchant, _admin, token) = setup_env();
+
+    // A fresh, unregistered address is not a valid escrow contract, so the
+    // cross-contract invocation will fail.
+    let bogus_escrow = Address::generate(&env);
+
+    let result = payment_client.try_create_escrowed_payment(
+        &customer,
+        &merchant,
+        &500_i128,
+        &token,
+        &Currency::USDC,
+        &bogus_escrow,
+        &5000_u64,
+        &0_u64,
+        &String::from_str(&env, "rollback-test"),
+        &true,
+    );
+
+    // The call must surface the descriptive cross-contract error.
+    assert_eq!(result, Err(Ok(PaymentError::EscrowCreationFailed)));
+
+    // No payment state may have been written: the next payment id is still 1.
+    assert_eq!(payment_client.get_next_payment_id(), 1);
+}
+
+// ── Reconciliation: sync_escrowed_payment_state (#198) ────────────────────────
+
+#[test]
+fn test_sync_noop_while_escrow_locked() {
+    let (env, payment_client, escrow_client, customer, merchant, _admin, token) = setup_env();
+    let (payment_id, _escrow_id) = create_escrowed_payment_ids(
+        &env, &payment_client, &escrow_client, &customer, &merchant, &token, 500_i128,
+    );
+    assert_eq!(
+        payment_client.sync_escrowed_payment_state(&payment_id),
+        PaymentStatus::Pending
+    );
+    assert!(!payment_client.is_escrow_reconciled(&payment_id));
+}
+
+#[test]
+fn test_sync_out_of_band_release_completes_payment_once() {
+    let (env, payment_client, escrow_client, customer, merchant, admin, token) = setup_env();
+    let (payment_id, escrow_id) = create_escrowed_payment_ids(
+        &env, &payment_client, &escrow_client, &customer, &merchant, &token, 500_i128,
+    );
+
+    // Release directly on the escrow contract, bypassing the payment contract.
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    escrow_client.release_escrow(&admin, &escrow_id, &false);
+    assert_eq!(payment_client.get_payment(&payment_id).status, PaymentStatus::Pending);
+
+    assert_eq!(
+        payment_client.sync_escrowed_payment_state(&payment_id),
+        PaymentStatus::Completed
+    );
+    assert!(payment_client.is_escrow_reconciled(&payment_id));
+    let after_first = payment_client.get_merchant_analytics(&merchant);
+    assert_eq!(after_first.total_completed, 1);
+
+    // Idempotent re-sync: no second analytics increment.
+    assert_eq!(
+        payment_client.sync_escrowed_payment_state(&payment_id),
+        PaymentStatus::Completed
+    );
+    let after_second = payment_client.get_merchant_analytics(&merchant);
+    assert_eq!(after_second.total_completed, 1);
+}
+
+#[test]
+fn test_sync_out_of_band_refund_cancels_payment() {
+    let (env, payment_client, escrow_client, customer, merchant, _admin, token) = setup_env();
+    let (payment_id, escrow_id) = create_escrowed_payment_ids(
+        &env, &payment_client, &escrow_client, &customer, &merchant, &token, 500_i128,
+    );
+    escrow_client.refund_escrow(&customer, &escrow_id);
+
+    let status = payment_client.sync_escrowed_payment_state(&payment_id);
+    assert!(status == PaymentStatus::Cancelled || status == PaymentStatus::Refunded);
+    assert_eq!(payment_client.get_payment(&payment_id).status, status);
+}
+
+#[test]
+fn test_sync_unknown_payment_errors() {
+    let (_env, payment_client, _e, _c, _m, _a, _t) = setup_env();
+    assert!(payment_client.try_sync_escrowed_payment_state(&9_999).is_err());
+}
