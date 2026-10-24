@@ -11,6 +11,8 @@ use soroban_sdk::{
 };
 
 pub mod storage;
+#[path = "../../escrow/src/fixed_math.rs"]
+pub mod fixed_math;
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -182,6 +184,9 @@ pub enum BasicError {
     // Issue #88: a data migration step failed, so the schema version must
     // not be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 127,
+    // Issue #3: a string field contains raw PII (email, phone, or tax ID)
+    // that must not be stored on the immutable public ledger.
+    PiiDetected = 128,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -239,6 +244,16 @@ pub enum PaymentError {
     InvalidScheduleTime = 223,
     /// Token not allowed. Use an allowed token.
     TokenNotAllowed = 224,
+    /// Payment is flagged during its finality window (#196). Clear or resolve the flag first.
+    PaymentFlagged = 225,
+    /// Payment is not flagged (#196).
+    NotFlagged = 226,
+    /// Caller is not the payer, risk oracle or emergency pauser (#196).
+    NotAuthorizedChallenger = 227,
+    /// The finality window for this settlement has already closed (#196).
+    FinalityWindowClosed = 228,
+    /// Invalid finality risk configuration (#196).
+    InvalidFinalityRiskConfig = 229,
 }
 
 /// Errors relating to recurring subscription plans, dunning cycles, and billing.
@@ -397,6 +412,9 @@ pub enum FeatureError {
     /// Balance sum mismatch. The settlement amounts do not sum to the deposit.
     BalanceSumMismatch = 541,
     InsufficientBalanceForSweep = 542,
+    /// Structuring / smurfing detected: cumulative payment volume within the rolling window
+    /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
+    StructuringDetected = 543,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -442,7 +460,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 542 {
+            if code >= 500 && code <= 543 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
             if code >= 400 && code <= 406 {
@@ -451,10 +469,10 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 318 {
                 return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 224 {
+            if code >= 200 && code <= 229 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 127 {
+            if code >= 100 && code <= 128 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -497,6 +515,8 @@ pub enum CustomerDataKey {
     MerchantCount(Address),
     MonthlyVolume(Address, u64),
     HourCount(Address, u32),
+    /// Waived-transaction counter per promotional campaign and customer address.
+    FeeWaiverUses(u64, Address),
 }
 
 // Merchant-specific data keys
@@ -1525,6 +1545,17 @@ pub struct MerchantFeeRecord {
 pub struct FeeWaiver {
     pub merchant: Address,
     pub waiver_bps: u32, // reduction in basis points
+    /// Identifier of the promotional campaign this waiver belongs to.
+    pub campaign_id: u64,
+    /// Aggregate ceiling on fees the campaign may waive.
+    pub max_total_waived_fee: i128,
+    /// Fees waived so far under this campaign.
+    pub accumulated_waived_fee: i128,
+    /// Maximum number of waived transactions per customer address.
+    pub max_uses_per_address: u32,
+    /// Timestamp from which the waiver becomes active.
+    pub valid_from: u64,
+    /// Timestamp at which the waiver expires.
     pub valid_until: u64,
     pub reason: String,
     pub granted_by: Address,
@@ -1631,6 +1662,15 @@ pub struct FeeWaiverRevoked {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeWaiverExpired {
     pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWaiverApplied {
+    pub payment_id: u64,
+    pub campaign_id: u64,
+    pub waived_amount: i128,
+    pub remaining_budget: i128,
 }
 
 #[contractevent]
@@ -1827,6 +1867,21 @@ pub struct PaymentAnalytics {
     pub total_refunded_volume: i128,
     pub unique_customers: u64,
     pub unique_merchants: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct NetPosition {
+    pub party_a: Address,
+    pub party_b: Address,
+    /// Net amount: positive = party_a owes party_b, negative = party_b owes party_a.
+    pub net_amount: i128,
+    /// Token used for settlement.
+    pub token: Address,
+    /// Timestamp of last position update.
+    pub last_updated: u64,
+    /// Timestamp of the current netting window start.
+    pub window_start: u64,
 }
 
 #[derive(Clone)]
@@ -2972,6 +3027,73 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Detect structuring / smurfing: accumulate the payer's payment volume within
+    /// a rolling window and flag when the total would have triggered `LargePaymentProposal`
+    /// if it had been sent as a single payment.
+    ///
+    /// Window size defaults to 3600 seconds (1 hour); configurable via the same
+    /// `large_payment_threshold` that governs single-payment timelocks.
+    fn check_velocity_structuring(
+        env: &Env,
+        customer: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        // If no threshold is configured, structuring detection is disabled.
+        if threshold <= 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        // Rolling window: 1 hour (3600 seconds).
+        const VELOCITY_WINDOW_SECONDS: u64 = 3600;
+
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::VelocityWindowStart(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let window_volume: i128 = if now.saturating_sub(window_start) < VELOCITY_WINDOW_SECONDS {
+            // Still within the rolling window — accumulate.
+            env.storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::VelocityWindowVolume(
+                    customer.clone(),
+                )))
+                .unwrap_or(0)
+        } else {
+            // Window has expired — start fresh.
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+            0
+        };
+
+        let new_volume = window_volume.saturating_add(amount);
+
+        if new_volume > threshold {
+            return Err(Error::Feature(FeatureError::StructuringDetected));
+        }
+
+        // Persist updated window state.
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::VelocityWindowVolume(customer.clone())),
+            &new_volume,
+        );
+        if window_start == 0 || now.saturating_sub(window_start) >= VELOCITY_WINDOW_SECONDS {
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::VelocityWindowStart(customer.clone())),
+                &now,
+            );
+        }
+
+        Ok(())
+    }
+
     fn do_create_payment(
         env: &Env,
         customer: Address,
@@ -3015,6 +3137,9 @@ impl PaymentContract {
 
         // Check customer spend limit (#217)
         PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
+
+        // Issue #2: detect structuring / smurfing (split payments below threshold).
+        PaymentContract::check_velocity_structuring(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -3839,6 +3964,19 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Permissionless: reconciles a payment with its escrow's terminal state (#198).
+    /// Applies `Released -> Completed`, `ExpiredRefunded -> Refunded`,
+    /// `Cancelled -> Cancelled` once; `Disputed` mirrors an unresolved dispute.
+    /// Returns the payment's status after reconciliation.
+    pub fn sync_escrowed_payment_state(env: Env, payment_id: u64) -> Result<PaymentStatus, Error> {
+        reconciliation::sync_escrowed_payment_state(&env, payment_id)
+    }
+
+    /// Returns true once a payment's escrow outcome has been reconciled by sync (#198).
+    pub fn is_escrow_reconciled(env: Env, payment_id: u64) -> bool {
+        reconciliation::is_reconciled(&env, payment_id)
+    }
+
     /// Retrieves the escrowed payment bridge record for a given payment.
     ///
     /// # Arguments
@@ -4187,7 +4325,8 @@ impl PaymentContract {
         if let Some(ref fc) = finality {
             if fc.active && payment.amount >= fc.min_amount_threshold {
                 // Hold funds — create PendingSettlement instead of transferring
-                let release_at = env.ledger().timestamp() + fc.delay_seconds;
+                let release_at = env.ledger().timestamp()
+                    + finality::compute_required_finality_delay(env, &payment, fc.delay_seconds);
                 let settlement = PendingSettlement {
                     payment_id,
                     merchant: payment.merchant.clone(),
@@ -4326,7 +4465,7 @@ impl PaymentContract {
                 if forward_config.active {
                     // Calculate the forward amount based on forward_bps
                     let forward_amount =
-                        (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
+                        fixed_math::mul_div_floor_or_panic(env, merchant_amount, forward_config.forward_bps as i128, 10000);
 
                     // Transfer the forward amount from merchant to forward_to address
                     if forward_amount > 0 {
@@ -8188,22 +8327,31 @@ impl PaymentContract {
             Some(c) => c,
         };
 
-        // Get effective fee BPS including tier discounts and waivers
-        let effective_fee_bps =
-            PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
-
-        // Risk-based surcharge applied at completion time by `deduct_fee`.
+        // Mirror `deduct_fee` exactly: tier discount and risk surcharge are applied
+        // first, then the promotional fee waiver (budget-capped) is subtracted so the
+        // preview matches what completion actually deducts.
+        let record = PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
         let risk_surcharge_bps =
             PaymentContract::risk_surcharge_bps(&env, &customer, amount, &currency);
-
-        PaymentContract::compute_fee_amount(
+        let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
+        let fee = PaymentContract::compute_fee_amount(
             amount,
-            effective_fee_bps,
-            &FeeTier::Standard, // Tier already applied in get_effective_fee_bps
+            effective_bps,
+            &record.fee_tier,
             config.min_fee,
             config.max_fee,
-            risk_surcharge_bps,
-        )
+            0, // risk surcharge already folded into `effective_bps`
+        );
+        if fee <= 0 {
+            return 0;
+        }
+
+        let waived =
+            match PaymentContract::fee_waiver_eligibility(&env, &merchant, &customer, fee) {
+                Some((_, waived)) => waived,
+                None => 0,
+            };
+        fee - waived
     }
 
     /// Returns the fee record for a given merchant.
@@ -8364,10 +8512,23 @@ impl PaymentContract {
             &record.fee_tier,
             config.min_fee,
             config.max_fee,
-            risk_surcharge_bps,
+            0, // risk surcharge already folded into `effective_bps`
         );
 
         if fee <= 0 {
+            return (amount, 0);
+        }
+
+        // Apply the merchant's promotional fee waiver (campaign budget cap,
+        // per-address usage cap, validity window). The waiver state is persisted
+        // here — before any external token transfer — so the counters cannot be
+        // re-entered or double-spent by a token hook.
+        let waived =
+            PaymentContract::apply_fee_waiver(env, payment_id, &merchant, customer, fee);
+        let fee = fee - waived;
+
+        if fee <= 0 {
+            // Fully waived: nothing to collect from the customer.
             return (amount, 0);
         }
 
@@ -8421,7 +8582,7 @@ impl PaymentContract {
     ) -> i128 {
         let discount = PaymentContract::get_tier_discount_bps(tier);
         let effective_bps = fee_bps - (fee_bps * discount) / 10000 + risk_surcharge_bps;
-        let raw_fee = (amount * (effective_bps as i128)) / 10000;
+        let raw_fee = fixed_math::mul_div_ceil_or_panic(env, amount, effective_bps as i128, 10000);
 
         let fee = if min_fee > 0 && raw_fee < min_fee {
             min_fee
@@ -8633,22 +8794,35 @@ impl PaymentContract {
 
     /// Grants a fee waiver to a merchant, reducing their platform fee by the specified BPS.
     ///
-    /// The waiver applies to all future payments until it expires or is revoked.
+    /// The waiver applies to all future payments until it expires or is revoked, and is
+    /// additionally bounded by the promotional campaign's aggregate budget
+    /// (`max_total_waived_fee`), a per-address usage cap (`max_uses_per_address`) and a
+    /// `valid_from`–`valid_until` time window.
     ///
     /// # Arguments
     /// * `admin` - The admin authorizing this operation (must be a multisig admin).
     /// * `merchant` - The merchant to grant the waiver to.
     /// * `waiver_bps` - The fee reduction in basis points (0–10000, where 10000 = 100% waiver).
+    /// * `campaign_id` - Identifier of the promotional campaign this waiver belongs to.
+    /// * `max_total_waived_fee` - Aggregate ceiling of fees the campaign may waive.
+    /// * `max_uses_per_address` - Maximum number of waived payments per customer address.
+    /// * `valid_from` - The ledger timestamp from which the waiver is active.
     /// * `valid_until` - The ledger timestamp at which the waiver expires.
     /// * `reason` - A human-readable reason for granting the waiver.
     ///
     /// # Returns
-    /// `Ok(())` on success, or an error if unauthorized or the BPS value is invalid.
+    /// `Ok(())` on success, or an error if unauthorized, the BPS value is invalid, or one
+    /// of the campaign bounds is invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_fee_waiver(
         env: Env,
         admin: Address,
         merchant: Address,
         waiver_bps: u32,
+        campaign_id: u64,
+        max_total_waived_fee: i128,
+        max_uses_per_address: u32,
+        valid_from: u64,
         valid_until: u64,
         reason: String,
     ) -> Result<(), Error> {
@@ -8669,9 +8843,20 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidTierThresholds));
         }
 
+        // Campaign bounds: a non-empty budget, at least one permitted use per
+        // address, and a well-formed validity window.
+        if max_total_waived_fee <= 0 || max_uses_per_address == 0 || valid_from > valid_until {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
         let waiver = FeeWaiver {
             merchant: merchant.clone(),
             waiver_bps,
+            campaign_id,
+            max_total_waived_fee,
+            accumulated_waived_fee: 0,
+            max_uses_per_address,
+            valid_from,
             valid_until,
             reason,
             granted_by: admin.clone(),
@@ -8742,7 +8927,8 @@ impl PaymentContract {
 
     /// Returns the active fee waiver for a merchant, if any.
     ///
-    /// Automatically removes and returns `None` if the waiver has expired.
+    /// Automatically removes and returns `None` if the waiver has expired, and returns
+    /// `None` while the campaign's `valid_from` boundary has not been reached.
     ///
     /// # Arguments
     /// * `merchant` - The merchant to query.
@@ -8768,6 +8954,9 @@ impl PaymentContract {
                     )));
 
                 (FeeWaiverExpired { merchant }).publish(&env);
+                None
+            } else if env.ledger().timestamp() < w.valid_from {
+                // Not yet active: keep the record but report no waiver.
                 None
             } else {
                 Some(w)
@@ -8803,15 +8992,150 @@ impl PaymentContract {
         let tier_discount = PaymentContract::get_tier_discount_bps(&record.fee_tier);
         let tier_adjusted_bps = config.fee_bps - (config.fee_bps * tier_discount) / 10000;
 
-        // Get waiver discount
+        // Get waiver discount (only while the campaign still has budget left)
         let waiver = PaymentContract::get_fee_waiver(env.clone(), merchant);
         if let Some(w) = waiver {
-            let waiver_adjusted_bps =
-                tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
-            waiver_adjusted_bps
+            if w.max_total_waived_fee.saturating_sub(w.accumulated_waived_fee) > 0 {
+                let waiver_adjusted_bps =
+                    tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
+                waiver_adjusted_bps
+            } else {
+                tier_adjusted_bps
+            }
         } else {
             tier_adjusted_bps
         }
+    }
+
+    /// Read-only fee-waiver eligibility check shared by the preview path
+    /// (`calculate_fee`) and the deduction path (`deduct_fee`).
+    ///
+    /// Returns the eligible waiver together with the amount it may waive for
+    /// `fee`, honouring:
+    /// * the `valid_from`/`valid_until` time window,
+    /// * the remaining campaign budget (`max_total_waived_fee - accumulated_waived_fee`),
+    ///   capping the waiver so a partially exhausted campaign waives only what remains,
+    /// * the per-address usage cap (`max_uses_per_address`).
+    ///
+    /// Returns `None` when no waiver applies.
+    fn fee_waiver_eligibility(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+        fee: i128,
+    ) -> Option<(FeeWaiver, i128)> {
+        if fee <= 0 {
+            return None;
+        }
+
+        let waiver: FeeWaiver = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::FeeWaiver(
+                merchant.clone(),
+            )))?;
+
+        let now = env.ledger().timestamp();
+        if now < waiver.valid_from || now > waiver.valid_until {
+            return None;
+        }
+
+        let remaining_budget = waiver
+            .max_total_waived_fee
+            .saturating_sub(waiver.accumulated_waived_fee);
+        if remaining_budget <= 0 {
+            return None;
+        }
+
+        let uses: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::FeeWaiverUses(
+                waiver.campaign_id,
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        if uses >= waiver.max_uses_per_address {
+            return None;
+        }
+
+        let waived = core::cmp::min(
+            fee.saturating_mul(waiver.waiver_bps as i128) / 10_000,
+            remaining_budget,
+        );
+        if waived <= 0 {
+            return None;
+        }
+
+        Some((waiver, waived))
+    }
+
+    /// Applies the merchant's active fee waiver for `payment_id`.
+    ///
+    /// The campaign's `accumulated_waived_fee` and the per-address usage counter are
+    /// incremented atomically **before** any external token transfer, the campaign is
+    /// automatically deactivated once the budget is exactly consumed, and a
+    /// `FeeWaiverApplied` event carrying the remaining budget is emitted.
+    ///
+    /// Returns the amount waived (0 when no waiver applies).
+    fn apply_fee_waiver(
+        env: &Env,
+        payment_id: u64,
+        merchant: &Address,
+        customer: &Address,
+        fee: i128,
+    ) -> i128 {
+        let waiver_key = DataKey::Customer(CustomerDataKey::FeeWaiver(merchant.clone()));
+
+        let (waiver, waived) =
+            match PaymentContract::fee_waiver_eligibility(env, merchant, customer, fee) {
+                Some(v) => v,
+                None => {
+                    // Deactivate a campaign whose budget is already fully consumed.
+                    if let Some(w) = env.storage().instance().get::<DataKey, FeeWaiver>(&waiver_key)
+                    {
+                        if w.max_total_waived_fee.saturating_sub(w.accumulated_waived_fee) <= 0 {
+                            env.storage().instance().remove(&waiver_key);
+                        }
+                    }
+                    return 0;
+                }
+            };
+
+        let uses_key = DataKey::Customer(CustomerDataKey::FeeWaiverUses(
+            waiver.campaign_id,
+            customer.clone(),
+        ));
+        let uses: u32 = env.storage().instance().get(&uses_key).unwrap_or(0);
+
+        // Effects first: budget and per-address counters are persisted before the
+        // caller performs any external token transfer (checks-effects-interactions).
+        let mut updated = waiver.clone();
+        updated.accumulated_waived_fee = updated
+            .accumulated_waived_fee
+            .saturating_add(waived);
+        env.storage().instance().set(&waiver_key, &updated);
+        env.storage()
+            .instance()
+            .set(&uses_key, &(uses.saturating_add(1)));
+
+        let remaining_budget = updated
+            .max_total_waived_fee
+            .saturating_sub(updated.accumulated_waived_fee);
+        if remaining_budget == 0 {
+            // Budget fully consumed → campaign deactivated automatically.
+            env.storage().instance().remove(&waiver_key);
+        }
+
+        (FeeWaiverApplied {
+            payment_id,
+            campaign_id: updated.campaign_id,
+            waived_amount: waived,
+            remaining_budget,
+        })
+        .publish(env);
+
+        waived
     }
 
     // ── FEE REBATE FUNCTIONS ──────────────────────────────────────────────────
@@ -10701,7 +11025,7 @@ impl PaymentContract {
             return 0;
         }
 
-        (payment.amount * (rule.escrow_bps as i128)) / 10000i128
+        fixed_math::mul_div_floor_or_panic(env, payment.amount, rule.escrow_bps as i128, 10000)
     }
 
     pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
@@ -12950,6 +13274,81 @@ impl PaymentContract {
             .get(&DataKey::Config(ConfigKey::FinalityConfig))
     }
 
+    /// Sets the archival retention and refund windows (#197). Admin only.
+    pub fn configure_archival(
+        env: Env,
+        admin: Address,
+        config: ArchivalConfig,
+    ) -> Result<(), Error> {
+        archival::configure(&env, &admin, &config)
+    }
+
+    /// Compacts aged terminal payments into `CompactArchivedPayment` records (#197).
+    /// Returns the number compacted; ineligible ids are skipped. See `archival.rs`.
+    pub fn compact_settled_payments(env: Env, payment_ids: Vec<u64>) -> Result<u32, Error> {
+        archival::compact_settled_payments(&env, payment_ids)
+    }
+
+    /// Returns the compact archive record for a payment, if compacted.
+    pub fn get_archived_payment(env: Env, payment_id: u64) -> Option<CompactArchivedPayment> {
+        archival::get_archived(&env, payment_id)
+    }
+
+    /// Proves a full historical `Payment` against its on-chain `state_hash` (#197).
+    pub fn verify_archived_payment_blob(env: Env, payment_id: u64, full_payment: Payment) -> bool {
+        archival::verify_archived_payment_blob(&env, payment_id, full_payment)
+    }
+
+    /// Configures risk-tier finality scaling (#196). Admin only.
+    pub fn configure_finality_risk(
+        env: Env,
+        admin: Address,
+        config: FinalityRiskConfig,
+    ) -> Result<(), Error> {
+        finality::configure(&env, &admin, &config)
+    }
+
+    /// Returns the risk-tier finality configuration, if set.
+    pub fn get_finality_risk_config(env: Env) -> Option<FinalityRiskConfig> {
+        finality::get_risk_config(&env)
+    }
+
+    /// Returns the finality delay (seconds) that would apply to `payment_id`.
+    pub fn get_required_finality_delay(env: Env, payment_id: u64) -> u64 {
+        let payment = Self::get_payment(&env, payment_id);
+        let legacy = Self::get_finality_config(env.clone())
+            .map(|c| c.delay_seconds)
+            .unwrap_or(0);
+        finality::compute_required_finality_delay(&env, &payment, legacy)
+    }
+
+    /// Freezes a pending settlement during its finality window (#196). The
+    /// payer, the configured risk oracle or the emergency pauser may call it.
+    pub fn flag_payment_during_finality(
+        env: Env,
+        payment_id: u64,
+        challenger: Address,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        finality::flag(&env, payment_id, &challenger, reason)
+    }
+
+    /// Returns the finality flag recorded for a payment, if any.
+    pub fn get_finality_flag(env: Env, payment_id: u64) -> Option<FinalityFlag> {
+        finality::get_flag(&env, payment_id)
+    }
+
+    /// Admin resolution of a flagged settlement: `refund = true` returns the
+    /// held funds to the payer and cancels the settlement; `false` clears the flag.
+    pub fn resolve_finality_flag(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+        refund: bool,
+    ) -> Result<(), Error> {
+        finality::resolve(&env, &admin, payment_id, refund)
+    }
+
     /// Finalizes a pending settlement by transferring funds to the merchant.
     ///
     /// The settlement's release time must have passed. After finalization,
@@ -12965,6 +13364,9 @@ impl PaymentContract {
     /// Returns an error if the settlement is already finalized, not found,
     /// or the release time has not yet passed.
     pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        if finality::is_flagged(&env, payment_id) {
+            return Err(Error::Payment(PaymentError::PaymentFlagged));
+        }
         if env
             .storage()
             .instance()
@@ -13490,6 +13892,68 @@ impl PaymentContract {
         }
     }
 
+    /// Scan a string field for patterns that look like PII (emails, phone numbers,
+    /// tax IDs / SSNs) and reject them to enforce GDPR/CCPA data-minimization on
+    /// the immutable public ledger.
+    ///
+    /// Detection rules (byte-level, no regex engine available in no_std Soroban):
+    /// - Email: contains '@' preceded and followed by at least one non-'@' byte.
+    /// - Phone: 10+ consecutive digit bytes (possibly separated by spaces, dashes,
+    ///   or dots), e.g. `+14155552671` or `415-555-2671`.
+    /// - SSN/Tax ID: pattern `DDD-DD-DDDD` or `DD.DDD.DDD-DD` (9+ digit cluster).
+    fn check_pii_free(env: &Env, text: &String) -> Result<(), Error> {
+        // Convert to raw bytes for scanning.
+        let bytes = text.to_xdr(env);
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // --- Email detection: look for '@' with at least one char before and after ---
+        let mut at_pos: Option<u32> = None;
+        let mut i: u32 = 0;
+        while i < len {
+            if bytes.get(i).unwrap_or(0) == 64u8 { // '@'
+                at_pos = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(pos) = at_pos {
+            if pos > 0 && pos + 1 < len {
+                return Err(Error::Basic(BasicError::PiiDetected));
+            }
+        }
+
+        // --- Phone / Tax-ID detection: count consecutive digit-or-separator runs ---
+        // A run of >=9 digits (with optional spaces, dashes, dots, parens, '+') is flagged.
+        let mut digit_run: u32 = 0;
+        let mut k: u32 = 0;
+        while k < len {
+            let b = bytes.get(k).unwrap_or(0);
+            if b >= 48u8 && b <= 57u8 { // '0'..'9'
+                digit_run += 1;
+                if digit_run >= 9 {
+                    return Err(Error::Basic(BasicError::PiiDetected));
+                }
+            } else if b == 32u8  // space
+                || b == 45u8     // '-'
+                || b == 46u8     // '.'
+                || b == 40u8     // '('
+                || b == 41u8     // ')'
+                || b == 43u8     // '+'
+            {
+                // Separator — keep the digit run going if we already have digits.
+                // (Allows separators within phone numbers)
+            } else {
+                digit_run = 0;
+            }
+            k += 1;
+        }
+
+        Ok(())
+    }
+
     fn validate_bps(bps: u32) -> Result<(), Error> {
         if bps < 1 || bps > 10000 {
             return Err(Error::Basic(BasicError::InvalidBps));
@@ -13539,6 +14003,12 @@ mod test_subscription_groups;
 mod test_finality_delay;
 
 #[cfg(test)]
+mod test_fixed_math_prop;
+
+#[cfg(test)]
+mod budget_bench;
+
+#[cfg(test)]
 mod test_fee_rebate;
 
 #[cfg(test)]
@@ -13555,3 +14025,6 @@ mod test_schema_migration;
 
 #[cfg(test)]
 mod test_paginated_queries;
+
+#[cfg(test)]
+mod test_completion_fee_parity;
