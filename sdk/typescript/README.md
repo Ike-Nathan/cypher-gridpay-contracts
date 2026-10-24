@@ -89,6 +89,36 @@ try {
 }
 ```
 
+For errors returned by Soroban RPC, decode the contract domain and numeric
+contract error code directly. Unknown codes remain available on the returned
+error's `code` field.
+
+```ts
+import { decodeSorobanContractError } from "@cypher-gridpay/contracts-sdk";
+
+try {
+  await client.completePayment(paymentId);
+} catch (error) {
+  const contractError = decodeSorobanContractError(error, "payment");
+  if (contractError) {
+    console.error(contractError.code, contractError.errorName, contractError.resolution);
+  }
+  throw error;
+}
+```
+
+## Events and transactions
+
+`parseContractEvent` converts Soroban XDR topics and values into a named,
+typed event. `pollContractEvents` reads one RPC page at a time and only saves
+the cursor after every event callback succeeds, so applications can resume
+without acknowledging unprocessed events.
+
+`executeSorobanTransaction` provides the common simulate, restore, assemble,
+submit, and exponential-backoff polling flow. Supply callbacks for signing,
+transaction assembly, `RestoreFootprintOp` submission, and optional fee-bump
+construction so the application retains control of keys and fee sources.
+
 ## Why generated bindings
 
 The CLI emits `.d.ts` declarations derived from the contract's actual interface,
@@ -99,3 +129,40 @@ application is the cheapest possible contract-migration test.
 ## License
 
 MIT
+
+## Strongly-Typed ContractError Decoder & Diagnostics
+
+The SDK provides automated decoders to parse raw Soroban simulation reverts (`ScErrorType::Contract`) and on-chain transaction errors into structured, user-friendly diagnostic objects with remediation guidance:
+
+```typescript
+import {
+  decodeGridPayError,
+  isContractError,
+  isRetryableError,
+  formatDiagnosticError,
+} from "@cypher-gridpay/contracts-sdk";
+
+try {
+  await client.submitPayment(params);
+} catch (rawError) {
+  const decoded = decodeGridPayError(rawError, "payment");
+  if (decoded) {
+    console.error(`[${decoded.contract.toUpperCase()}::${decoded.name} (#${decoded.code})]`);
+    console.error(`Category: ${decoded.category}`);
+    console.error(`Message: ${decoded.message}`);
+    console.error(`Remediation: ${decoded.resolution}`);
+
+    if (decoded.retryable) {
+      console.log("Transient failure detected — eligible for retry after backoff.");
+    }
+  } else {
+    console.error(formatDiagnosticError(rawError));
+  }
+}
+```
+
+### Supported Contract Catalogs:
+- **PaymentContract**: `BasicError` (100–126), `PaymentError` (200–224), `SubscriptionError` (300–318), `ProposalError` (400–406), `FeatureError` (500–541)
+- **EscrowContract**: `BasicError` (100–114), `EscrowError` (200–230), `ActionError` (300–316)
+- **RefundContract**: `CoreError` (1–33), `ExtError` (34–51)
+- **AdminContract**: `AdminError` (1–5)
