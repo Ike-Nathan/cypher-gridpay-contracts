@@ -149,7 +149,10 @@ fn test_partial_redemption_tracks_remaining_balance() {
     client.redeem_voucher(&customer, &voucher_id, &400i128);
     let voucher = client.get_voucher(&voucher_id).unwrap();
     assert_eq!(voucher.remaining_balance, 600);
-    assert!(!voucher.redeemed, "voucher with remaining balance must not be fully redeemed");
+    assert!(
+        !voucher.redeemed,
+        "voucher with remaining balance must not be fully redeemed"
+    );
 
     // Redeem remaining 600; voucher should now be fully redeemed.
     client.redeem_voucher(&customer, &voucher_id, &600i128);
@@ -159,7 +162,10 @@ fn test_partial_redemption_tracks_remaining_balance() {
 
     // Further redemption attempts must fail.
     let result = client.try_redeem_voucher(&customer, &voucher_id, &1i128);
-    assert!(result.is_err(), "fully redeemed voucher cannot be redeemed further");
+    assert!(
+        result.is_err(),
+        "fully redeemed voucher cannot be redeemed further"
+    );
 }
 
 /// Issue #60: An expired voucher must reject partial redemption attempts.
@@ -195,4 +201,32 @@ fn test_partial_redemption_rejects_amount_exceeding_balance() {
         result.is_err(),
         "redeeming more than the remaining balance should fail"
     );
+}
+
+#[test]
+fn test_expired_voucher_sweep_releases_only_unredeemed_backing_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, contract_id) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 500);
+    let voucher = client.get_voucher(&voucher_id).unwrap();
+    let customer = voucher.customer.clone();
+    let token_client = token::Client::new(&env, &voucher.token);
+    let merchant_balance_before = token_client.balance(&voucher.merchant);
+
+    client.redeem_voucher(&customer, &voucher_id, &400);
+    env.ledger().set_timestamp(1501);
+
+    assert_eq!(client.sweep_expired_vouchers(&voucher_id, &10), 1);
+    assert_eq!(client.sweep_expired_vouchers(&voucher_id, &10), 0);
+    assert_eq!(
+        token_client.balance(&voucher.merchant) - merchant_balance_before,
+        600
+    );
+
+    let settled = client.get_voucher(&voucher_id).unwrap();
+    assert_eq!(settled.remaining_balance, 0);
+    assert!(settled.redeemed);
 }
