@@ -8,11 +8,12 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
-payment = { path = "../../contracts/payment" }
-escrow = { path = "../../contracts/escrow" }
-dispute = { path = "../../contracts/dispute" }
-refund = { path = "../../contracts/refund" }
+soroban-sdk = { version = "23", features = ["testutils"] }
+payment = { package = "payments", path = "../../core/contracts/payment" }
+escrow = { path = "../../core/contracts/escrow" }
+refund = { path = "../../core/contracts/refund" }
+proptest = "1.4.0"
+proptest-state-machine = "0.3.0"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
