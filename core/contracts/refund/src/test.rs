@@ -750,7 +750,7 @@ fn test_approve_correct_refund_among_multiple() {
     );
     let refund_id2 = client.request_refund(
         &merchant,
-        &payment_id,
+        &(payment_id + 1),
         &customer,
         &amount,
         &amount,
@@ -761,7 +761,7 @@ fn test_approve_correct_refund_among_multiple() {
     );
     let refund_id3 = client.request_refund(
         &merchant,
-        &payment_id,
+        &(payment_id + 2),
         &customer,
         &amount,
         &amount,
@@ -1156,7 +1156,7 @@ fn test_pagination_for_status_queries() {
     );
     let r2 = client.request_refund(
         &merchant,
-        &payment_id,
+        &(payment_id + 1),
         &customer,
         &amount,
         &amount,
@@ -1167,7 +1167,7 @@ fn test_pagination_for_status_queries() {
     );
     let r3 = client.request_refund(
         &merchant,
-        &payment_id,
+        &(payment_id + 2),
         &customer,
         &amount,
         &amount,
@@ -1178,7 +1178,7 @@ fn test_pagination_for_status_queries() {
     );
     let r4 = client.request_refund(
         &merchant,
-        &payment_id,
+        &(payment_id + 3),
         &customer,
         &amount,
         &amount,
@@ -2212,10 +2212,86 @@ fn test_resolve_appeal_rejected_keeps_refund_rejected() {
     let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "challenge"));
     client.resolve_appeal(&admin, &appeal_id, &false);
 
+    // Issue #64: an appeal that upholds the merchant's denial moves the
+    // refund to the distinct terminal `PermanentlyDenied` state, not the
+    // pre-appeal `Rejected` state.
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.status, RefundStatus::PermanentlyDenied);
 
     let resolved = client.get_appeal(&appeal_id);
     assert_eq!(resolved.resolved, true);
     assert_eq!(resolved.outcome, Some(false));
+}
+
+fn denied_refund(env: &Env, client: &RefundContractClient, admin: &Address) -> (u64, Address) {
+    let merchant = Address::generate(env);
+    let customer = Address::generate(env);
+    let token = Address::generate(env);
+    let refund_id = client.request_refund(
+        &merchant,
+        &3u64,
+        &customer,
+        &500i128,
+        &500i128,
+        &token,
+        &String::from_str(env, "request"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(admin, &refund_id, &String::from_str(env, "denied"));
+    (refund_id, customer)
+}
+
+#[test]
+fn test_denied_at_recorded_and_appeal_allowed_within_window() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let (refund_id, customer) = denied_refund(&env, &client, &admin);
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.rejected_at, Some(1_000)); // denied_at
+    assert_eq!(refund.appeal_deadline, Some(1_000 + 604_800));
+
+    // Filing exactly at denied_at + APPEAL_WINDOW is still allowed.
+    env.ledger().set_timestamp(1_000 + 604_800);
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "on time"));
+}
+
+#[test]
+fn test_appeal_rejected_after_window_even_once_denial_finalized() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let (refund_id, customer) = denied_refund(&env, &client, &admin);
+
+    // Denial is finalized once the window closes...
+    env.ledger().set_timestamp(1_000 + 604_800);
+    client.finalize_denial(&refund_id);
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.rejected_at, Some(1_000)); // original denial time kept
+
+    // ...and finalizing must not reopen the window: an appeal after
+    // denied_at + APPEAL_WINDOW is rejected (previously it was accepted for
+    // another 7 days after finalize_denial).
+    env.ledger().set_timestamp(1_000 + 604_800 + 1);
+    assert_eq!(
+        client.try_file_appeal(&customer, &refund_id, &String::from_str(&env, "late")),
+        Err(Ok(Error::Core(CoreError::AppealWindowExpired)))
+    );
+    env.ledger().set_timestamp(1_000 + 2 * 604_800);
+    assert_eq!(
+        client.try_file_appeal(&customer, &refund_id, &String::from_str(&env, "late")),
+        Err(Ok(Error::Core(CoreError::AppealWindowExpired)))
+    );
 }

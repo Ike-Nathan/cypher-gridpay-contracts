@@ -553,3 +553,111 @@ fn test_update_existing_entry_does_not_duplicate_in_list() {
     assert_eq!(list.len(), 1);
     assert_eq!(list.get(0).unwrap().rule, EligibilityRule::Allow);
 }
+
+// ── merchant standing (MerchantStatus) ───────────────────────────────────────
+
+fn try_request_refund(
+    client: &RefundContractClient<'_>,
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    payment_id: u64,
+) -> Result<u64, Error> {
+    let token = Address::generate(env);
+    client
+        .try_request_refund(
+            merchant,
+            &payment_id,
+            customer,
+            &100i128,
+            &100i128,
+            &token,
+            &String::from_str(env, "test"),
+            &RefundReasonCode::Other,
+            &0_u64,
+        )
+        .map(|r| r.unwrap())
+        .map_err(|e| e.unwrap())
+}
+
+#[test]
+fn test_merchant_status_defaults_to_active() {
+    let (env, _admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    assert_eq!(
+        client.get_merchant_status(&merchant),
+        MerchantStatus::Active
+    );
+}
+
+#[test]
+fn test_suspended_merchant_cannot_request_refund() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    client.set_merchant_status(&admin, &merchant, &MerchantStatus::Suspended);
+    assert_eq!(
+        client.get_merchant_status(&merchant),
+        MerchantStatus::Suspended
+    );
+
+    let result = try_request_refund(&client, &env, &merchant, &customer, 1);
+    assert_eq!(result, Err(Error::Ext(ExtError::MerchantNotEligible)));
+}
+
+#[test]
+fn test_sanctioned_merchant_cannot_request_refund() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    client.set_merchant_status(&admin, &merchant, &MerchantStatus::Sanctioned);
+
+    let result = try_request_refund(&client, &env, &merchant, &customer, 1);
+    assert_eq!(result, Err(Error::Ext(ExtError::MerchantNotEligible)));
+}
+
+#[test]
+fn test_reactivated_merchant_can_request_refund() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    client.set_merchant_status(&admin, &merchant, &MerchantStatus::Suspended);
+    client.set_merchant_status(&admin, &merchant, &MerchantStatus::Active);
+
+    assert!(try_request_refund(&client, &env, &merchant, &customer, 1).is_ok());
+}
+
+#[test]
+fn test_suspended_merchant_refund_not_processed() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    let refund_id = request_refund(&client, &env, &merchant, &customer, 1);
+    client.approve_refund(&admin, &refund_id);
+
+    // Merchant is suspended after approval but before payout.
+    client.set_merchant_status(&admin, &merchant, &MerchantStatus::Suspended);
+
+    let result = client.try_process_refund(&admin, &refund_id);
+    assert_eq!(result, Err(Ok(Error::Ext(ExtError::MerchantNotEligible))));
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+}
+
+#[test]
+fn test_non_admin_cannot_set_merchant_status() {
+    let (env, _admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    let result = client.try_set_merchant_status(&impostor, &merchant, &MerchantStatus::Suspended);
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::Unauthorized))));
+    assert_eq!(
+        client.get_merchant_status(&merchant),
+        MerchantStatus::Active
+    );
+}

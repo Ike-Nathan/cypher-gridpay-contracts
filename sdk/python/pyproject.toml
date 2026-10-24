@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cypher-gridpay-sdk"
+version = "0.2.0"
+description = "Async typed Python SDK for Cypher GridPay Soroban contracts"
+requires-python = ">=3.10"
+dependencies = [
+    "stellar-sdk>=13,<14",
+    "pydantic>=2,<3",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5,<7"]

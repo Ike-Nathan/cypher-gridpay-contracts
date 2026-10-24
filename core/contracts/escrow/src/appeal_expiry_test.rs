@@ -116,3 +116,74 @@ fn expire_nonexistent_appeal_fails() {
     let result = client.try_expire_appeal(&999);
     assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::NotFound))));
 }
+
+/// The appeal window is half-open: filing is accepted strictly before
+/// `dispute_started_at + 72h` and rejected at the deadline itself, so the final
+/// block of the window cannot flip between accept/reject.
+#[test]
+fn file_appeal_at_exact_deadline_is_rejected() {
+    let env = Env::default();
+    let (client, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &1_000_i128,
+        &token,
+        &0_u64,
+        &0_u64,
+        &0_u64,
+        &false,
+    );
+    client.dispute_escrow(&customer, &escrow_id);
+
+    // Exactly at the deadline (`dispute_started_at + APPEAL_WINDOW_SECONDS`).
+    env.ledger()
+        .set_timestamp(1_000 + 259_200);
+    let reason: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_file_dispute_appeal(&customer, &escrow_id, &reason);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::InvalidStatus))),
+        "filing at the exact appeal deadline must be rejected"
+    );
+    assert_eq!(
+        client.get_dispute_round(&escrow_id),
+        DisputeRound::Initial,
+        "a rejected filing must not advance the dispute round"
+    );
+}
+
+/// One second before the deadline is still inside the window.
+#[test]
+fn file_appeal_one_second_before_deadline_succeeds() {
+    let env = Env::default();
+    let (client, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &1_000_i128,
+        &token,
+        &0_u64,
+        &0_u64,
+        &0_u64,
+        &false,
+    );
+    client.dispute_escrow(&customer, &escrow_id);
+
+    env.ledger()
+        .set_timestamp(1_000 + 259_200 - 1);
+    let reason: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+    let appeal_id = client.file_dispute_appeal(&customer, &escrow_id, &reason);
+
+    assert_eq!(
+        client.get_dispute_round(&escrow_id),
+        DisputeRound::Appeal,
+        "filing one second before the deadline must succeed"
+    );
+    assert!(!client.get_appeal(&appeal_id).unwrap().resolved);
+}

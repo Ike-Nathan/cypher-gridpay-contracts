@@ -1,0 +1,53 @@
+# Pre-commit hooks for Cypher GridPay smart contracts
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: Cargo Format Check
+        entry: bash -c 'cd core && cargo fmt --all -- --check && cd ../orchestrator && cargo fmt --all -- --check'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-clippy-core
+        name: Clippy Lints (core)
+        entry: bash -c 'cd core && cargo clippy --workspace -- -D warnings'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-clippy-orchestrator
+        name: Clippy Lints (orchestrator)
+        entry: bash -c 'cd orchestrator && cargo clippy --workspace -- -D warnings'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-check-core
+        name: Cargo Check (core)
+        entry: bash -c 'cd core && cargo check --workspace'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-check-orchestrator
+        name: Cargo Check (orchestrator)
+        entry: bash -c 'cd orchestrator && cargo check --workspace'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: trailing-whitespace
+        name: Trim Trailing Whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
+
+      - id: end-of-file-fixer
+        name: Fix End of File
+        entry: end-of-file-fixer
+        language: system
+        types: [text]

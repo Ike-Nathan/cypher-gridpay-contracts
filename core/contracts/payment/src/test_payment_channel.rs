@@ -107,6 +107,7 @@ fn test_payment_channel_full_lifecycle() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&merchant_amount.to_xdr(&env));
     msg.append(&nonce.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
 
     // Collect message bytes and sign
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
@@ -172,6 +173,7 @@ fn test_settle_channel_invalid_nonce() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&merchant_amount.to_xdr(&env));
     msg.append(&bad_nonce.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
 
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let signature = signing_key.sign(&msg_vec);
@@ -229,6 +231,7 @@ fn test_settle_channel_rejects_negative_merchant_amount() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&merchant_amount.to_xdr(&env));
     msg.append(&nonce.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
 
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let signature = signing_key.sign(&msg_vec);
@@ -295,6 +298,7 @@ fn test_stale_nonce_replay_rejected() {
         msg.append(&channel_id.to_xdr(&env));
         msg.append(&amount.to_xdr(&env));
         msg.append(&nonce.to_xdr(&env));
+        msg.append(&contract_id.to_xdr(&env));
         let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
         let sig = signing_key.sign(&msg_vec);
         BytesN::<64>::from_array(&env, &sig.to_bytes())
@@ -359,6 +363,7 @@ fn test_equal_nonce_replay_rejected() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&500i128.to_xdr(&env));
     msg.append(&0u64.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -490,6 +495,7 @@ fn counterparty_can_close_immediately_on_agreement() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&merchant_amount.to_xdr(&env));
     msg.append(&nonce.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -544,6 +550,7 @@ fn close_transfers_correct_balances_to_each_party() {
     msg.append(&channel_id.to_xdr(&env));
     msg.append(&merchant_amount.to_xdr(&env));
     msg.append(&nonce.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
     let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
     let sig = signing_key.sign(&msg_vec);
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
@@ -559,5 +566,128 @@ fn close_transfers_correct_balances_to_each_party() {
         token_client.balance(&customer),
         700i128,
         "Customer gets remainder"
+    );
+}
+
+#[test]
+fn test_cross_contract_signature_replay_rejected() {
+    // Verifies that a valid signature for contract_a cannot be replayed on contract_b.
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &2000i128);
+
+    let contract_a = env.register(PaymentContract, ());
+    let client_a = PaymentContractClient::new(&env, &contract_a);
+    client_a.initialize(&admin);
+
+    let contract_b = env.register(PaymentContract, ());
+    let client_b = PaymentContractClient::new(&env, &contract_b);
+    client_b.initialize(&admin);
+
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let pk_bytes = signing_key.verifying_key().to_bytes();
+    let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
+
+    let channel_id_a = client_a.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
+
+    let channel_id_b = client_b.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
+
+    // Sign message bound to contract_a
+    let merchant_amount: i128 = 400;
+    let nonce: u64 = 1;
+    let mut msg_a = Bytes::new(&env);
+    msg_a.append(&channel_id_a.to_xdr(&env));
+    msg_a.append(&merchant_amount.to_xdr(&env));
+    msg_a.append(&nonce.to_xdr(&env));
+    msg_a.append(&contract_a.to_xdr(&env));
+    let msg_vec: alloc::vec::Vec<u8> = msg_a.iter().collect();
+    let sig_a = signing_key.sign(&msg_vec);
+    let sig_bn_a = BytesN::<64>::from_array(&env, &sig_a.to_bytes());
+
+    // Attempt to settle contract_b with the signature created for contract_a — must fail
+    let replay_result = client_b.try_settle_channel(&channel_id_b, &merchant_amount, &nonce, &sig_bn_a);
+    assert!(replay_result.is_err(), "Cross-contract signature replay must be rejected");
+}
+
+#[test]
+fn test_sequence_number_replay_rejected() {
+    // Verifies that replaying a sequence number (nonce <= current_sequence) is rejected.
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &1000i128);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let pk_bytes = signing_key.verifying_key().to_bytes();
+    let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
+
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
+
+    // Initial sequence_number (nonce) = 0. Attempting to submit nonce = 0 must fail.
+    let merchant_amount: i128 = 200;
+    let stale_sequence: u64 = 0;
+    let mut msg = Bytes::new(&env);
+    msg.append(&channel_id.to_xdr(&env));
+    msg.append(&merchant_amount.to_xdr(&env));
+    msg.append(&stale_sequence.to_xdr(&env));
+    msg.append(&contract_id.to_xdr(&env));
+    let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
+    let sig = signing_key.sign(&msg_vec);
+    let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
+
+    let result = client.try_settle_channel(&channel_id, &merchant_amount, &stale_sequence, &sig_bn);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::InvalidNonce)))
     );
 }

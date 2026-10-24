@@ -27,12 +27,17 @@ fn escrow_refundable_after_hold_period_elapsed() {
     let (client, _admin, customer, merchant, token) = setup(&env);
 
     // Create escrow at t=1000 with hold period of 500s
+    // hold_period_until will be 1000 + 500 = 1500
     env.ledger().set_timestamp(1000);
     let escrow_id = client.create_escrow(
         &customer, &merchant, &500_i128, &token, &0_u64, &500_u64, &0_u64, &false,
     );
 
-    // Advance past hold period: 1000 + 500 = 1500
+    // Verify hold_period_until is set correctly
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.hold_period_until, 1500, "hold_period_until should be 1500");
+
+    // Advance past hold period: 1500 + 1 second = 1501
     env.ledger().set_timestamp(1501);
     let result = client.try_refund_escrow(&customer, &escrow_id);
     assert!(
@@ -51,18 +56,33 @@ fn escrow_not_refundable_before_hold_period_elapsed() {
     let (client, _admin, customer, merchant, token) = setup(&env);
 
     // Create escrow at t=1000 with hold period of 500s
+    // hold_period_until will be 1000 + 500 = 1500
     env.ledger().set_timestamp(1000);
     let escrow_id = client.create_escrow(
         &customer, &merchant, &500_i128, &token, &0_u64, &500_u64, &0_u64, &false,
     );
 
-    // Attempt refund before hold period expires (at exactly t=1000, hold period = 500s)
+    // Verify hold_period_until is set correctly
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.hold_period_until, 1500, "hold_period_until should be 1500");
+
+    // Attempt refund before hold period expires (at t=1400, which is before hold_period_until=1500)
     env.ledger().set_timestamp(1400);
     let result = client.try_refund_escrow(&customer, &escrow_id);
     assert!(
         result.is_err(),
         "refund should fail before hold period has elapsed"
     );
+    // Verify that HoldPeriodActive error is returned
+    if let Err(e) = result {
+        match e {
+            Ok(err) => {
+                assert_eq!(err, Error::Escrow(EscrowError::HoldPeriodActive),
+                    "expected HoldPeriodActive error");
+            }
+            _ => panic!("Expected contract error"),
+        }
+    }
 }
 
 #[test]
@@ -75,14 +95,19 @@ fn refund_after_hold_period_transfers_correct_amount() {
     let amount = 750_i128;
 
     // Create escrow at t=2000 with hold period of 300s
+    // hold_period_until will be 2000 + 300 = 2300
     env.ledger().set_timestamp(2000);
     let escrow_id = client.create_escrow(
         &customer, &merchant, &amount, &token, &0_u64, &300_u64, &0_u64, &false,
     );
 
+    // Verify hold_period_until is set correctly
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.hold_period_until, 2300, "hold_period_until should be 2300");
+
     let balance_before = token_client.balance(&customer);
 
-    // Advance past hold period: 2000 + 300 = 2300
+    // Advance past hold period: hold_period_until = 2300 + 1 second = 2301
     env.ledger().set_timestamp(2301);
     client.refund_escrow(&customer, &escrow_id);
 
