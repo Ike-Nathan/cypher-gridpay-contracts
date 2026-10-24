@@ -997,7 +997,22 @@ pub struct RefundEligibilityEntry {
     pub rule: EligibilityRule,
     pub reason_hash: BytesN<32>,
     pub set_at: u64,
+    /// Issue #234: payment categories (bit = `PaymentCategory::to_index`) the
+    /// terms below apply to; `0` applies them to every payment.
+    pub category_bitmask: u64,
+    /// Issue #234: restocking fee retained for the merchant, in bps of the
+    /// refund amount (at most `MAX_RESTOCKING_FEE_BPS`).
+    pub restocking_fee_bps: u32,
+    /// Issue #234: upper bound on a single restocking fee.
+    pub max_restocking_fee_cap: i128,
+    /// Issue #234: whether a partial refund (partially consumed payment) is allowed.
+    pub allow_partial_consumption: bool,
+    /// Issue #234: reason codes that never incur the restocking fee.
+    pub exempt_reason_codes: Vec<RefundReasonCode>,
 }
+
+/// Issue #234: maximum merchant restocking fee (25%).
+pub const MAX_RESTOCKING_FEE_BPS: u32 = 2_500;
 
 /// Storage key for eligibility entries: keyed by (merchant, customer).
 #[derive(Clone, Debug, PartialEq)]
@@ -7420,6 +7435,21 @@ impl RefundContract {
     }
 
     fn add_to_status_index(env: &Env, status: RefundStatus, refund_id: u64) {
+        // Issue #243: every finalized refund is committed to the archived-record
+        // Merkle accumulator as the SHA-256 of its XDR.
+        if matches!(
+            status,
+            RefundStatus::Processed | RefundStatus::Rejected | RefundStatus::PermanentlyDenied
+        ) {
+            if let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+            {
+                storage::append_archived_leaf(env, storage::archived_record_leaf(env, &refund));
+            }
+        }
+
         let count = Self::get_refund_count_by_status(env, status.clone());
         env.storage()
             .instance()
@@ -7933,6 +7963,17 @@ impl RefundContract {
         if eligibility_rule == EligibilityRule::Block {
             return Err(Error::Ext(ExtError::CustomerBlockedFromRefund));
         }
+        // Issue #234: categories such as consumed digital credits only allow
+        // refunding the full payment.
+        if amount < original_payment_amount {
+            if let Some(terms) =
+                Self::matching_eligibility_terms(&env, &merchant, &customer, payment_id)
+            {
+                if !terms.allow_partial_consumption {
+                    return Err(Error::Ext(ExtError::PartialRefundNotAllowed));
+                }
+            }
+        }
 
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
@@ -8233,6 +8274,18 @@ impl RefundContract {
         // Arbitration awards additionally carry the protocol maintenance fee.
         let net_refund_amount =
             Self::deduct_arbitration_protocol_fee(env, refund_id, fee.net_amount, &refund.token);
+
+        // Issue #234: the restocking fee stays with the merchant.
+        let restocking_fee =
+            core::cmp::min(Self::restocking_fee(env, &refund), net_refund_amount.max(0));
+        let net_refund_amount = net_refund_amount - restocking_fee;
+        if restocking_fee > 0 {
+            token::Client::new(env, &refund.token).transfer(
+                &env.current_contract_address(),
+                &refund.merchant,
+                &restocking_fee,
+            );
+        }
 
         if net_refund_amount > 0 {
             token::Client::new(env, &refund.token).transfer(
@@ -10108,17 +10161,43 @@ impl RefundContract {
     ) -> Result<(), Error> {
         // Require merchant auth; admin can also call via mock_all_auths in tests
         merchant.require_auth();
+        Self::write_refund_eligibility(&env, merchant, customer, rule, reason_hash);
+        Ok(())
+    }
 
-        let entry = RefundEligibilityEntry {
-            customer: customer.clone(),
-            merchant: merchant.clone(),
-            rule: rule.clone(),
-            reason_hash,
-            set_at: env.ledger().timestamp(),
-        };
-
+    /// Stores an eligibility entry (keeping any category terms) without an
+    /// auth check, so authenticated entry points can share it.
+    fn write_refund_eligibility(
+        env: &Env,
+        merchant: Address,
+        customer: Address,
+        rule: EligibilityRule,
+        reason_hash: BytesN<32>,
+    ) {
         let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
-        let is_new = !env.storage().instance().has(&key);
+        let existing: Option<RefundEligibilityEntry> = env.storage().instance().get(&key);
+        let is_new = existing.is_none();
+        // Issue #234: changing the rule keeps any configured category terms.
+        let entry = match existing {
+            Some(mut entry) => {
+                entry.rule = rule.clone();
+                entry.reason_hash = reason_hash;
+                entry.set_at = env.ledger().timestamp();
+                entry
+            }
+            None => RefundEligibilityEntry {
+                customer: customer.clone(),
+                merchant: merchant.clone(),
+                rule: rule.clone(),
+                reason_hash,
+                set_at: env.ledger().timestamp(),
+                category_bitmask: 0,
+                restocking_fee_bps: 0,
+                max_restocking_fee_cap: 0,
+                allow_partial_consumption: true,
+                exempt_reason_codes: Vec::new(env),
+            },
+        };
         env.storage().instance().set(&key, &entry);
 
         // If this is a new entry, append to the merchant's customer index
@@ -10143,9 +10222,103 @@ impl RefundContract {
             customer,
             rule,
         })
-        .publish(&env);
+        .publish(env);
+    }
 
+    /// Issue #234: configure category-specific refund terms for a (merchant,
+    /// customer) pair. Creates an `Allow` entry if none exists.
+    ///
+    /// # Errors
+    /// Returns `RestockingFeeTooHigh` if `restocking_fee_bps` exceeds
+    /// `MAX_RESTOCKING_FEE_BPS` and `InvalidAmount` for a negative cap.
+    pub fn set_refund_eligibility_terms(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        category_bitmask: u64,
+        restocking_fee_bps: u32,
+        max_restocking_fee_cap: i128,
+        allow_partial_consumption: bool,
+        exempt_reason_codes: Vec<RefundReasonCode>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if restocking_fee_bps > MAX_RESTOCKING_FEE_BPS {
+            return Err(Error::Ext(ExtError::RestockingFeeTooHigh));
+        }
+        if max_restocking_fee_cap < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
+        if !env.storage().instance().has(&key) {
+            Self::write_refund_eligibility(
+                &env,
+                merchant.clone(),
+                customer.clone(),
+                EligibilityRule::Allow,
+                BytesN::from_array(&env, &[0u8; 32]),
+            );
+        }
+        let mut entry: RefundEligibilityEntry = env.storage().instance().get(&key).unwrap();
+        entry.category_bitmask = category_bitmask;
+        entry.restocking_fee_bps = restocking_fee_bps;
+        entry.max_restocking_fee_cap = max_restocking_fee_cap;
+        entry.allow_partial_consumption = allow_partial_consumption;
+        entry.exempt_reason_codes = exempt_reason_codes;
+        entry.set_at = env.ledger().timestamp();
+        env.storage().instance().set(&key, &entry);
         Ok(())
+    }
+
+    /// Issue #234: the eligibility entry whose category terms apply to a
+    /// refund of `payment_id`, if any.
+    fn matching_eligibility_terms(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+        payment_id: u64,
+    ) -> Option<RefundEligibilityEntry> {
+        let entry: RefundEligibilityEntry = env
+            .storage()
+            .instance()
+            .get(&EligibilityKey::Entry(merchant.clone(), customer.clone()))?;
+        if entry.category_bitmask == 0 {
+            return Some(entry);
+        }
+        let category: u32 = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::PaymentCategoryTag(payment_id))?;
+        if category < 64 && entry.category_bitmask & (1u64 << category) != 0 {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Issue #234: restocking fee for a refund. Defect, fraud and duplicate
+    /// claims are statutorily exempt regardless of merchant configuration.
+    fn restocking_fee(env: &Env, refund: &Refund) -> i128 {
+        if matches!(
+            refund.reason_code,
+            RefundReasonCode::Unauthorized
+                | RefundReasonCode::DuplicateCharge
+                | RefundReasonCode::ProductDefect
+        ) {
+            return 0;
+        }
+        match Self::matching_eligibility_terms(
+            env,
+            &refund.merchant,
+            &refund.customer,
+            refund.payment_id,
+        ) {
+            Some(terms) if !terms.exempt_reason_codes.contains(&refund.reason_code) => {
+                let fee = refund.amount.saturating_mul(terms.restocking_fee_bps as i128) / 10_000;
+                core::cmp::min(terms.max_restocking_fee_cap, fee)
+            }
+            _ => 0,
+        }
     }
 
     /// Return the eligibility rule for a (merchant, customer) pair.
@@ -11834,6 +12007,18 @@ impl RefundContract {
     }
 
     // Issue #370: Customer tier management
+
+    /// Issue #243: prove that `leaf_hash` (SHA-256 of a finalized refund's XDR)
+    /// is the `index`-th leaf of the archived-record Merkle accumulator.
+    /// Returns `false` for `index >= leaf_count` or a malformed proof.
+    pub fn verify_archived_record_inclusion(
+        env: Env,
+        leaf_hash: BytesN<32>,
+        index: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        storage::verify_archived_record_inclusion(&env, leaf_hash, index, proof)
+    }
 
     /// Assign a tier level to a customer for tier-based refund cap policies.
     ///
