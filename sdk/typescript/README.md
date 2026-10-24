@@ -89,6 +89,36 @@ try {
 }
 ```
 
+For errors returned by Soroban RPC, decode the contract domain and numeric
+contract error code directly. Unknown codes remain available on the returned
+error's `code` field.
+
+```ts
+import { decodeSorobanContractError } from "@cypher-gridpay/contracts-sdk";
+
+try {
+  await client.completePayment(paymentId);
+} catch (error) {
+  const contractError = decodeSorobanContractError(error, "payment");
+  if (contractError) {
+    console.error(contractError.code, contractError.errorName, contractError.resolution);
+  }
+  throw error;
+}
+```
+
+## Events and transactions
+
+`parseContractEvent` converts Soroban XDR topics and values into a named,
+typed event. `pollContractEvents` reads one RPC page at a time and only saves
+the cursor after every event callback succeeds, so applications can resume
+without acknowledging unprocessed events.
+
+`executeSorobanTransaction` provides the common simulate, restore, assemble,
+submit, and exponential-backoff polling flow. Supply callbacks for signing,
+transaction assembly, `RestoreFootprintOp` submission, and optional fee-bump
+construction so the application retains control of keys and fee sources.
+
 ## Why generated bindings
 
 The CLI emits `.d.ts` declarations derived from the contract's actual interface,
