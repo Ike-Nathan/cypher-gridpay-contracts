@@ -141,6 +141,9 @@ fn test_first_post_trial_payment_sets_converted() {
         &trial_secs,
     );
 
+    env.ledger().set_timestamp(now + 1);
+    client.emit_trial_conversion_notice(&sub_id);
+
     // Advance past trial and past next_payment_at
     env.ledger().set_timestamp(now + trial_secs + interval + 1);
 
@@ -189,6 +192,9 @@ fn test_trial_conversion_fails_without_allowance() {
         &trial_secs,
     );
 
+    env.ledger().set_timestamp(now + 1);
+    client.emit_trial_conversion_notice(&sub_id);
+
     // Advance past trial and past next_payment_at so conversion is attempted.
     env.ledger().set_timestamp(now + trial_secs + interval + 1);
 
@@ -203,6 +209,117 @@ fn test_trial_conversion_fails_without_allowance() {
     let sub = client.get_subscription(&sub_id);
     assert!(!sub.trial_data.converted);
     assert_eq!(sub.payment_count, 0);
+}
+
+#[test]
+fn test_trial_conversion_rejects_missing_notice_and_creation_time_notice() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let now = env.ledger().timestamp();
+    let sub_id = make_sub(&client, &env, 3600);
+
+    let at_creation = client.try_emit_trial_conversion_notice(&sub_id);
+    assert_eq!(
+        at_creation,
+        Err(Ok(Error::Subscription(
+            SubscriptionError::InvalidTrialNoticeWindow
+        )))
+    );
+
+    env.ledger().set_timestamp(now + 3600 + 3600);
+    let conversion = client.try_execute_recurring_payment(&sub_id);
+    assert_eq!(
+        conversion,
+        Err(Ok(Error::Subscription(
+            SubscriptionError::TrialNoticeMissing
+        )))
+    );
+}
+
+#[test]
+fn test_trial_conversion_rejects_price_above_locked_consent() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let now = env.ledger().timestamp();
+    let sub_id = make_sub(&client, &env, 3600);
+
+    env.ledger().set_timestamp(now + 1);
+    client.emit_trial_conversion_notice(&sub_id);
+
+    let key = DataKey::Subscription(SubscriptionKey::Data(sub_id));
+    let mut sub: Subscription = env.storage().instance().get(&key).unwrap();
+    sub.amount += 1;
+    env.storage().instance().set(&key, &sub);
+
+    env.ledger().set_timestamp(now + 3600 + 3600);
+    let conversion = client.try_execute_recurring_payment(&sub_id);
+    assert_eq!(
+        conversion,
+        Err(Ok(Error::Subscription(
+            SubscriptionError::TrialPriceConsentRequired
+        )))
+    );
+}
+
+#[test]
+fn test_customer_cancelling_during_grace_reverses_conversion_charge() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let token_address = token_contract.address();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+    asset_client.mint(&customer, &100_000i128);
+    soroban_sdk::token::Client::new(&env, &token_address).approve(
+        &customer,
+        &contract_id,
+        &100_000i128,
+        &10_000,
+    );
+
+    let now = env.ledger().timestamp();
+    let trial_secs = 3600u64;
+    let interval = 1800u64;
+    let sub_id = client.create_subscription(
+        &customer,
+        &merchant,
+        &500i128,
+        &token_address,
+        &Currency::USDC,
+        &interval,
+        &0u64,
+        &3u64,
+        &String::from_str(&env, ""),
+        &trial_secs,
+    );
+
+    env.ledger().set_timestamp(now + 1);
+    client.emit_trial_conversion_notice(&sub_id);
+    env.ledger().set_timestamp(now + trial_secs + interval + 1);
+    client.execute_recurring_payment(&sub_id);
+
+    soroban_sdk::token::Client::new(&env, &token_address).approve(
+        &merchant,
+        &contract_id,
+        &500i128,
+        &10_000,
+    );
+    client.cancel_subscription(&customer, &sub_id);
+
+    assert_eq!(
+        soroban_sdk::token::Client::new(&env, &token_address).balance(&customer),
+        100_000i128
+    );
+    let sub = client.get_subscription(&sub_id);
+    assert!(sub.trial_data.conversion_charge_reversed);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
 }
 
 // Cancellation during trial emits TrialCancelled
