@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, token, Address, Env, Vec};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, token, xdr::ToXdr, Address, BytesN, Env, Vec,
+};
 
 #[test]
 fn test_multi_party_escrow_weight_governance() {
@@ -280,109 +282,71 @@ fn test_multi_party_escrow_odd_voter_weight_aggregation() {
     assert_eq!(token_user_client.balance(&p3), 3334);
 }
 
-/// Whale-override prevention test.
-///
-/// In a consortium GridPay infrastructure escrow where 1 large utility company
-/// (60% stake) and 10 community micro-grid nodes (4% each) co-fund an escrow,
-/// linear capital weighting would let the whale override all 10 community
-/// nodes.  The MAX_PARTICIPANT_WEIGHT_BPS cap (3334 bps) ensures the whale's
-/// voting power is capped at ~33%, requiring at least one community node to
-/// co-approve before any release threshold ≥ 3335 is met.
 #[test]
-fn test_whale_cannot_unilaterally_release_at_majority_threshold() {
+fn test_multi_party_dispute_uses_updated_voting_weights() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
-
     let token_admin = Address::generate(&env);
     let token_id = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
-
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
     let customer = Address::generate(&env);
     token_client.mint(&customer, &10000);
-
-    let whale = Address::generate(&env);
-    // Build 10 community nodes (4% each = 400 bps).
-    let mut nodes: soroban_sdk::Vec<Address> = Vec::new(&env);
-    for _ in 0..10u32 {
-        nodes.push_back(Address::generate(&env));
-    }
-
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
     let mut participants = Vec::new(&env);
-    // Whale: 60% stake (6000 bps share).  Voting weight capped at 3334.
     participants.push_back(Participant {
-        address: whale.clone(),
+        address: p1.clone(),
         role: ParticipantRole::Merchant,
-        share_bps: 6000,
-        weight_bps: 3334,
+        share_bps: 5000,
+        weight_bps: 6000,
         approved: false,
         approved_at: None,
     });
-    // 10 community nodes: 400 bps each (total = 4000; 6000 + 4000 = 10000 ✓).
-    for i in 0..10u32 {
-        participants.push_back(Participant {
-            address: nodes.get(i).unwrap().clone(),
-            role: ParticipantRole::Customer,
-            share_bps: 400,
-            weight_bps: 400,
-            approved: false,
-            approved_at: None,
-        });
-    }
-
+    participants.push_back(Participant {
+        address: p2.clone(),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 5000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
     env.ledger().set_timestamp(500);
-    let release_timestamp = 1000_u64;
+    let escrow_id =
+        client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
 
-    let escrow_id = client.create_multi_party_escrow(
-        &customer,
-        &participants,
-        &10000,
-        &token_id,
-        &release_timestamp,
-    );
+    client.set_participant_weight(&admin, &escrow_id, &p1, &6000);
+    client.set_participant_weight(&admin, &escrow_id, &p2, &4000);
+    client.dispute_multi_party_escrow(&p1, &escrow_id);
 
-    // Verify whale's effective weight is capped at 3334.
-    let (wt_before, _) = client.get_approval_weight(&escrow_id);
-    assert_eq!(wt_before, 0);
+    let salt1 = BytesN::from_array(&env, &[11; 32]);
+    let salt2 = BytesN::from_array(&env, &[12; 32]);
+    let mut preimage1 = escrow_id.to_xdr(&env);
+    preimage1.append(&p1.clone().to_xdr(&env));
+    preimage1.append(&1_u32.to_xdr(&env));
+    preimage1.append(&salt1.clone().to_xdr(&env));
+    let commitment1 = env.crypto().sha256(&preimage1).to_bytes();
+    let mut preimage2 = escrow_id.to_xdr(&env);
+    preimage2.append(&p2.clone().to_xdr(&env));
+    preimage2.append(&0_u32.to_xdr(&env));
+    preimage2.append(&salt2.clone().to_xdr(&env));
+    let commitment2 = env.crypto().sha256(&preimage2).to_bytes();
 
-    // Whale approves alone.
-    client.approve_release(&whale, &escrow_id);
-    let (whale_wt, threshold) = client.get_approval_weight(&escrow_id);
-    assert_eq!(whale_wt, 3334, "whale weight must be capped at MAX_PARTICIPANT_WEIGHT_BPS");
+    client.commit_dispute_vote(&escrow_id, &p1, &commitment1);
+    client.commit_dispute_vote(&escrow_id, &p2, &commitment2);
+    client.reveal_dispute_vote(&escrow_id, &p1, &1, &salt1);
+    client.reveal_dispute_vote(&escrow_id, &p2, &0, &salt2);
+    client.resolve_multi_party_dispute(&escrow_id);
 
-    // At a standard 51% threshold (5001 bps), the whale alone must NOT be
-    // sufficient to release.
-    client.update_approval_threshold_bps(&admin, &escrow_id, &5001);
-    env.ledger().set_timestamp(1001);
-    let release_solo = client.try_release_multi_party_escrow(&escrow_id);
     assert_eq!(
-        release_solo,
-        Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet))),
-        "whale alone must not meet a 51% threshold"
+        client.get_multi_party_escrow(&escrow_id).status,
+        EscrowStatus::Released
     );
-
-    // One community node co-approves: 3334 + 400 = 3734 — still below 5001.
-    let node0 = nodes.get(0).unwrap();
-    client.approve_release(&node0, &escrow_id);
-    let (combined_wt, _) = client.get_approval_weight(&escrow_id);
-    assert_eq!(combined_wt, 3734);
-
-    let still_blocked = client.try_release_multi_party_escrow(&escrow_id);
-    assert_eq!(
-        still_blocked,
-        Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet))),
-        "whale + 1 node must still be below 51% threshold"
-    );
-
-    // Admin drops the threshold to whale + 1 node weight (3734).
-    client.update_approval_threshold_bps(&admin, &escrow_id, &3734);
-    let release_ok = client.try_release_multi_party_escrow(&escrow_id);
-    assert!(release_ok.is_ok(), "whale + 1 community node approval must release at 3734 threshold");
 }

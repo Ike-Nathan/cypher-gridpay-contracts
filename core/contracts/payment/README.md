@@ -616,7 +616,7 @@ completion — integrators do not need to do anything special when calling `comp
 | `set_tier_thresholds(admin, thresholds)`            | Set the volume thresholds for fee tier promotions.                                 |
 | `get_accumulated_fees()`                            | Return the total platform fees accumulated in the contract.                        |
 | `withdraw_fees(admin, amount)`                      | Withdraw accumulated platform fees.                                                |
-| `grant_fee_waiver(admin, merchant, config)`         | Grant a merchant a temporary or permanent fee waiver.                              |
+| `grant_fee_waiver(admin, merchant, waiver_bps, campaign_id, max_total_waived_fee, max_uses_per_address, valid_from, valid_until, reason)` | Grant a merchant a budget-capped, time-windowed fee waiver for a promotional campaign. |
 | `revoke_fee_waiver(admin, merchant)`                | Revoke a merchant's fee waiver.                                                    |
 | `get_fee_waiver(merchant)`                          | Return a merchant's `FeeWaiver` record if one exists.                              |
 | `get_effective_fee_bps(merchant)`                   | Return the effective fee in basis points for a merchant after applying any waiver. |
@@ -988,6 +988,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `FeeWaiverGranted`     | `FeeWaiverGranted`     | `merchant`, `waiver_bps`, `valid_until`                             | `grant_fee_waiver()` creates waiver record                    |
 | `FeeWaiverRevoked`     | `FeeWaiverRevoked`     | `merchant`, `revoked_by`                                            | `revoke_fee_waiver()` removes waiver                          |
 | `FeeWaiverExpired`     | `FeeWaiverExpired`     | `merchant`                                                          | Fee waiver validity period expires                            |
+| `FeeWaiverApplied`     | `FeeWaiverApplied`     | `payment_id`, `campaign_id`, `waived_amount`, `remaining_budget`    | `complete_payment()` applies a campaign fee waiver            |
 | `FeeConfigUpdated`     | `FeeConfigUpdated`     | `fee_bps`, `treasury`                                               | `set_fee_config()` updates fee structure                      |
 | `RiskFeeApplied`       | `RiskFeeApplied`       | `payment_id`, `base_fee_bps`, `risk_surcharge_bps`, `total_fee_bps` | `create_payment()` applies dynamic risk surcharge             |
 
