@@ -1202,6 +1202,36 @@ pub enum AppealStatus {
     Rejected,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct DisputeState {
+    pub escrow_id: u64,
+    pub buyer_response_latency_secs: u64,
+    pub seller_response_latency_secs: u64,
+    pub missed_mediation_deadlines: u32,
+    pub uncooperative_fee_penalty_bps: u32,
+    pub buyer_missed_deadlines: u32,
+    pub seller_missed_deadlines: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeStateUpdated {
+    pub escrow_id: u64,
+    pub buyer_latency: u64,
+    pub seller_latency: u64,
+    pub missed_deadlines: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrationFeeReallocated {
+    pub escrow_id: u64,
+    pub uncooperative_party: Address,
+    pub penalty_bps: u32,
+    pub fee_penalty_amount: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationUpdated {
