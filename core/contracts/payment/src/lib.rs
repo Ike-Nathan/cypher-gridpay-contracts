@@ -299,6 +299,16 @@ pub enum SubscriptionError {
     MerchantPaused = 317,
     /// Metered subscription units consumed exceed period usage cap. Resolution: reset billing period or increase unit cap.
     UsageCapExceeded = 318,
+    /// The required trial conversion notice has not been emitted.
+    TrialNoticeMissing = 319,
+    /// The current time is outside the trial conversion notice window.
+    InvalidTrialNoticeWindow = 320,
+    /// The proposed conversion amount exceeds customer-authorized consent.
+    TrialPriceConsentRequired = 321,
+    /// Usage can no longer be reported for the trial conversion grace period.
+    TrialUsageWindowClosed = 322,
+    /// A trial conversion notice has already been emitted.
+    TrialNoticeAlreadyEmitted = 323,
 }
 
 /// Errors relating to multi-sig administrative proposals and voting.
@@ -621,6 +631,14 @@ pub struct SubscriptionTrialData {
     pub period_seconds: u64,
     pub ends_at: u64,
     pub converted: bool,
+    pub locked_conversion_amount: i128,
+    pub notice_emitted_at: Option<u64>,
+    pub min_notice_lead_secs: u64,
+    pub post_trial_cancel_grace_secs: u64,
+    pub conversion_charge_amount: Option<i128>,
+    pub conversion_charged_at: Option<u64>,
+    pub post_conversion_usage_units: u64,
+    pub conversion_charge_reversed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1167,6 +1185,31 @@ pub struct TrialStarted {
 pub struct TrialConverted {
     pub subscription_id: u64,
     pub converted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionNoticeEmitted {
+    pub subscription_id: u64,
+    pub conversion_amount: i128,
+    pub notice_emitted_at: u64,
+    pub trial_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionChargeReversed {
+    pub subscription_id: u64,
+    pub amount: i128,
+    pub reversed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConversionUsageReported {
+    pub subscription_id: u64,
+    pub units: u64,
+    pub accumulated_units: u64,
 }
 
 #[contractevent]
@@ -2029,6 +2072,9 @@ const MAX_NOTES_SIZE: u32 = 1024;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
 const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
+const MAX_TRIAL_NOTICE_LEAD_SECS: u64 = 30 * SECONDS_PER_DAY;
+const DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS: u64 = SECONDS_PER_DAY;
+const POST_TRIAL_CANCEL_GRACE_SECS: u64 = SECONDS_PER_DAY;
 
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
@@ -4338,7 +4384,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::PendingSettlement(payment_id)),
                     &settlement,
                 );
-                
+
                 // Track total pending settlement amount per token for sweep validation
                 let total_pending: i128 = env
                     .storage()
@@ -4351,7 +4397,7 @@ impl PaymentContract {
                     &DataKey::Payment(PaymentKey::TotalPendingSettlement(payment.token.clone())),
                     &(total_pending + net_amount),
                 );
-                
+
                 let idx: u64 = env
                     .storage()
                     .instance()
@@ -6162,6 +6208,24 @@ impl PaymentContract {
                 period_seconds: trial_period_seconds,
                 ends_at: trial_ends_at,
                 converted: false,
+                locked_conversion_amount: amount,
+                notice_emitted_at: None,
+                min_notice_lead_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    (trial_period_seconds / 2)
+                        .max(1)
+                        .min(DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS)
+                },
+                post_trial_cancel_grace_secs: if trial_period_seconds == 0 {
+                    0
+                } else {
+                    POST_TRIAL_CANCEL_GRACE_SECS
+                },
+                conversion_charge_amount: None,
+                conversion_charged_at: None,
+                post_conversion_usage_units: 0,
+                conversion_charge_reversed: false,
             },
             pause_data: SubscriptionPauseData {
                 last_paused_at: 0,
@@ -6287,6 +6351,7 @@ impl PaymentContract {
                 SubscriptionError::MaxTrialDurationExceeded,
             ))?;
         sub.trial_data.period_seconds = new_total;
+        sub.trial_data.notice_emitted_at = None;
 
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -6294,6 +6359,174 @@ impl PaymentContract {
         );
 
         Ok(())
+    }
+
+    /// Emit the required on-chain notice before a trial converts to a paid subscription.
+    /// Only the subscription merchant may publish the notice.
+    pub fn emit_trial_conversion_notice(env: Env, subscription_id: u64) -> Result<(), Error> {
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        sub.merchant.require_auth();
+
+        if sub.trial_data.ends_at == 0 || sub.trial_data.converted {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+        if sub.trial_data.notice_emitted_at.is_some() {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialNoticeAlreadyEmitted,
+            ));
+        }
+
+        let now = env.ledger().timestamp();
+        let earliest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(MAX_TRIAL_NOTICE_LEAD_SECS);
+        let latest_notice_at = sub
+            .trial_data
+            .ends_at
+            .saturating_sub(sub.trial_data.min_notice_lead_secs);
+        if now <= sub.created_at || now < earliest_notice_at || now > latest_notice_at {
+            return Err(Error::Subscription(
+                SubscriptionError::InvalidTrialNoticeWindow,
+            ));
+        }
+
+        sub.trial_data.notice_emitted_at = Some(now);
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (TrialConversionNoticeEmitted {
+            subscription_id,
+            conversion_amount: sub.trial_data.locked_conversion_amount,
+            notice_emitted_at: now,
+            trial_ends_at: sub.trial_data.ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Record customer consent for a new trial conversion amount.
+    /// Any previous conversion notice is invalidated and must be emitted again.
+    pub fn authorize_trial_conversion_amount(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.trial_data.ends_at == 0
+            || sub.trial_data.converted
+            || env.ledger().timestamp() >= sub.trial_data.ends_at
+        {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+
+        sub.amount = amount;
+        sub.trial_data.locked_conversion_amount = amount;
+        sub.trial_data.notice_emitted_at = None;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        Ok(())
+    }
+
+    /// Report usage during the post-conversion grace period.
+    /// A customer cancellation is refundable only while no usage has been reported.
+    pub fn report_trial_conversion_usage(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        units: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if units == 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let now = env.ledger().timestamp();
+        let charged_at = sub
+            .trial_data
+            .conversion_charged_at
+            .ok_or(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ))?;
+        if !sub.trial_data.converted
+            || sub.status != SubscriptionStatus::Active
+            || now > charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+        {
+            return Err(Error::Subscription(
+                SubscriptionError::TrialUsageWindowClosed,
+            ));
+        }
+        sub.trial_data.post_conversion_usage_units = sub
+            .trial_data
+            .post_conversion_usage_units
+            .checked_add(units)
+            .ok_or(Error::Basic(BasicError::BillingOverflow))?;
+        let accumulated_units = sub.trial_data.post_conversion_usage_units;
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        (TrialConversionUsageReported {
+            subscription_id,
+            units,
+            accumulated_units,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    fn validate_trial_conversion(sub: &Subscription) -> Result<bool, Error> {
+        let is_trial_conversion = sub.trial_data.ends_at > 0 && !sub.trial_data.converted;
+        if is_trial_conversion {
+            if sub.trial_data.notice_emitted_at.is_none() {
+                return Err(Error::Subscription(SubscriptionError::TrialNoticeMissing));
+            }
+            if sub.amount > sub.trial_data.locked_conversion_amount {
+                return Err(Error::Subscription(
+                    SubscriptionError::TrialPriceConsentRequired,
+                ));
+            }
+        }
+        Ok(is_trial_conversion)
     }
 
     /// Execute the next recurring payment for a subscription.
@@ -6322,6 +6555,7 @@ impl PaymentContract {
 
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
+            let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
             let mut dunning: DunningState = env
                 .storage()
                 .instance()
@@ -6368,6 +6602,18 @@ impl PaymentContract {
                 .is_ok();
 
             if transfer_ok {
+                if is_trial_conversion {
+                    sub.trial_data.converted = true;
+                    sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                    sub.trial_data.conversion_charged_at = Some(now);
+                    sub.trial_data.post_conversion_usage_units = 0;
+                    sub.trial_data.conversion_charge_reversed = false;
+                    (TrialConverted {
+                        subscription_id,
+                        converted_at: now,
+                    })
+                    .publish(&env);
+                }
                 sub.payment_count += 1;
                 sub.retry_count = 0;
                 sub.next_payment_at = sub.next_payment_at + sub.interval;
@@ -6483,6 +6729,8 @@ impl PaymentContract {
             return Ok(());
         }
 
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
+
         // Check customer spend limit (#282)
         let charge_amount =
             PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
@@ -6507,8 +6755,12 @@ impl PaymentContract {
 
         if transfer_ok {
             // Mark converted on first post-trial charge
-            if sub.trial_data.ends_at > 0 && !sub.trial_data.converted {
+            if is_trial_conversion {
                 sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
                 (TrialConverted {
                     subscription_id,
                     converted_at: now,
@@ -6865,6 +7117,40 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
 
+        let now = env.ledger().timestamp();
+        if caller == sub.customer
+            && sub.trial_data.converted
+            && sub.payment_count == 1
+            && !sub.trial_data.conversion_charge_reversed
+            && sub.trial_data.post_conversion_usage_units == 0
+            && sub
+                .trial_data
+                .conversion_charged_at
+                .map_or(false, |charged_at| {
+                    now <= charged_at.saturating_add(sub.trial_data.post_trial_cancel_grace_secs)
+                })
+        {
+            let amount = sub
+                .trial_data
+                .conversion_charge_amount
+                .ok_or(Error::Payment(PaymentError::TransferFailed))?;
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            if token_client
+                .try_transfer_from(&contract_address, &sub.merchant, &sub.customer, &amount)
+                .is_err()
+            {
+                return Err(Error::Payment(PaymentError::TransferFailed));
+            }
+            sub.trial_data.conversion_charge_reversed = true;
+            (TrialConversionChargeReversed {
+                subscription_id,
+                amount,
+                reversed_at: now,
+            })
+            .publish(&env);
+        }
+
         sub.status = SubscriptionStatus::Cancelled;
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -6874,7 +7160,6 @@ impl PaymentContract {
         Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
 
         // Emit TrialCancelled if cancelled during trial
-        let now = env.ledger().timestamp();
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             (TrialCancelled {
                 subscription_id,
@@ -7222,6 +7507,7 @@ impl PaymentContract {
             .ok_or(Error::Subscription(SubscriptionError::DunningNotFound))?;
 
         let now = env.ledger().timestamp();
+        let is_trial_conversion = Self::validate_trial_conversion(&sub)?;
 
         // Enforce backoff window
         if now < dunning.next_retry_at {
@@ -7244,6 +7530,18 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
+            if is_trial_conversion {
+                sub.trial_data.converted = true;
+                sub.trial_data.conversion_charge_amount = Some(charge_amount);
+                sub.trial_data.conversion_charged_at = Some(now);
+                sub.trial_data.post_conversion_usage_units = 0;
+                sub.trial_data.conversion_charge_reversed = false;
+                (TrialConverted {
+                    subscription_id,
+                    converted_at: now,
+                })
+                .publish(&env);
+            }
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
@@ -12816,7 +13114,7 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
-        
+
         // Security check: Ensure sweep won't encroach on merchant pending settlements
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
@@ -13391,7 +13689,7 @@ impl PaymentContract {
             &settlement.merchant,
             &settlement.amount,
         );
-        
+
         // Decrement total pending settlement amount for this token
         let total_pending: i128 = env
             .storage()
@@ -13404,7 +13702,7 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::TotalPendingSettlement(settlement.token.clone())),
             &(total_pending.saturating_sub(settlement.amount)),
         );
-        
+
         env.storage().instance().set(
             &DataKey::State(StateDataKey::SettlementFinalized(payment_id)),
             &true,
