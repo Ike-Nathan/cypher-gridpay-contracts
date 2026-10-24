@@ -332,6 +332,47 @@ fn test_get_top_arbitrators_sorted_by_score() {
 }
 
 #[test]
+fn test_top_arbitrators_ranking_accounts_for_sample_confidence() {
+    let (env, admin, _, _, low_sample, veteran, _, _) = setup_test_env();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.register_arbitrator(&admin, &low_sample);
+    client.register_arbitrator(&admin, &veteran);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitratorReputation(low_sample.clone()),
+            &ArbitratorReputation {
+                arbitrator: low_sample.clone(),
+                total_cases: 1,
+                majority_votes: 1,
+                minority_votes: 0,
+                avg_resolution_time: 10,
+                score: 110,
+                last_active: env.ledger().timestamp(),
+            },
+        );
+        env.storage().instance().set(
+            &ArbitrationKey::ArbitratorReputation(veteran.clone()),
+            &ArbitratorReputation {
+                arbitrator: veteran.clone(),
+                total_cases: 100,
+                majority_votes: 98,
+                minority_votes: 2,
+                avg_resolution_time: 10,
+                score: 1_080,
+                last_active: env.ledger().timestamp(),
+            },
+        );
+    });
+
+    let top = client.get_top_arbitrators(&2);
+    assert_eq!(top.get(0).unwrap().arbitrator, veteran);
+    assert_eq!(top.get(1).unwrap().arbitrator, low_sample);
+}
+
+#[test]
 fn test_get_top_arbitrators_with_limit() {
     let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
         setup_test_env();

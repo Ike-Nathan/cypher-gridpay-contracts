@@ -106,6 +106,7 @@ pub enum DataKey {
     AppealWindowSeconds,
     // Issue #389: two-step admin rotation
     PendingAdmin,
+    PendingAdminProposedAt,
     // Issue #61: VIP tier policy verification for instant refund approval
     VipTierPolicy(Address, u32),
 }
@@ -453,6 +454,8 @@ pub enum ExtError {
     TooManyTriggerConditions = 70,
     // Slash amount exceeds the arbitrator's deposited stake
     InsufficientArbitratorStake = 71,
+    /// The admin rotation delay has not elapsed.
+    AdminRotationDelayNotElapsed = 72,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -777,6 +780,10 @@ pub const DEFAULT_REPUTATION_DECAY_BPS: u32 = 1_000;
 pub const DEFAULT_REPUTATION_INACTIVITY_SECS: u64 = 60 * 24 * 60 * 60;
 // Cap on compounded periods; after this many the score is effectively zero.
 const MAX_REPUTATION_DECAY_PERIODS: u64 = 64;
+// Ranking uses an 80% prior with the weight of 20 cases.
+const ARBITRATOR_PRIOR_CASES: u128 = 20;
+const ARBITRATOR_PRIOR_WINS: u128 = 16;
+pub const ADMIN_ROTATION_DELAY_SECS: u64 = 24 * 60 * 60;
 
 // Default protocol maintenance fee on arbitration awards: 2%.
 pub const DEFAULT_ARBITRATION_PROTOCOL_FEE_BPS: u32 = 200;
@@ -798,6 +805,7 @@ pub struct ArbitratorScoreUpdated {
     pub arbitrator: Address,
     pub old_score: i128,
     pub new_score: i128,
+    pub confidence_score: u32,
 }
 
 #[contractevent]
@@ -861,6 +869,14 @@ pub struct RefundVoucher {
     // Issue #60: tracks partial redemptions; starts equal to `amount` and is
     // decremented as the customer redeems partial amounts across purchases.
     pub remaining_balance: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherBackingReleased {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
 }
 
 // Issue #194: Tiered arbitration escalation
@@ -2146,6 +2162,9 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdminProposedAt, &env.ledger().timestamp());
 
         (AdminRotationProposed {
             current_admin: admin,
@@ -2159,12 +2178,13 @@ impl RefundContract {
     /// Accept a pending admin rotation, finalizing the transition (Issue #389).
     ///
     /// Must be called by the address previously proposed via
-    /// [`Self::propose_admin`]. Replaces `DataKey::Admin` with the caller and
-    /// clears the pending slot.
+    /// [`Self::propose_admin`], after [`ADMIN_ROTATION_DELAY_SECS`] has elapsed.
+    /// Replaces `DataKey::Admin` with the caller and clears the pending slot.
     ///
     /// # Errors
     /// Returns `NoPendingAdmin` if no rotation has been proposed.
     /// Returns `NotPendingAdmin` if the caller is not the proposed admin.
+    /// Returns `AdminRotationDelayNotElapsed` if the security delay is active.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         new_admin.require_auth();
 
@@ -2177,6 +2197,15 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::NotPendingAdmin));
         }
 
+        let proposed_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminProposedAt)
+            .unwrap_or(env.ledger().timestamp());
+        if env.ledger().timestamp().saturating_sub(proposed_at) < ADMIN_ROTATION_DELAY_SECS {
+            return Err(Error::Ext(ExtError::AdminRotationDelayNotElapsed));
+        }
+
         let previous_admin: Address = env
             .storage()
             .instance()
@@ -2185,6 +2214,9 @@ impl RefundContract {
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminProposedAt);
 
         (AdminRotationAccepted {
             previous_admin,
@@ -2224,6 +2256,9 @@ impl RefundContract {
             .get(&DataKey::PendingAdmin)
             .ok_or(Error::Ext(ExtError::NoPendingAdmin))?;
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminProposedAt);
 
         (AdminRotationCancelled {
             admin,
@@ -4187,6 +4222,7 @@ impl RefundContract {
                 arbitrator: voter.clone(),
                 old_score,
                 new_score: reputation.score,
+                confidence_score: Self::arbitrator_confidence_score(&reputation),
             }
             .publish(&env);
         }
@@ -4767,6 +4803,16 @@ impl RefundContract {
         rep
     }
 
+    /// Return a Bayesian-smoothed majority-vote rate in basis points.
+    fn arbitrator_confidence_score(reputation: &ArbitratorReputation) -> u32 {
+        let cases = reputation.total_cases as u128;
+        let majority_votes =
+            core::cmp::min(reputation.majority_votes, reputation.total_cases) as u128;
+        let numerator = ARBITRATOR_PRIOR_WINS + majority_votes;
+        let denominator = ARBITRATOR_PRIOR_CASES + cases;
+        ((numerator * 10_000) / denominator) as u32
+    }
+
     /// Get the top arbitrators sorted by score (highest first)
     /// Returns up to `limit` arbitrators
     pub fn get_top_arbitrators(env: Env, limit: u32) -> Vec<ArbitratorReputation> {
@@ -4806,7 +4852,11 @@ impl RefundContract {
                 let rep_j = reputations.get(j).unwrap();
                 let rep_j_plus_1 = reputations.get(j + 1).unwrap();
 
-                if rep_j.score < rep_j_plus_1.score {
+                let rank_j = Self::arbitrator_confidence_score(&rep_j);
+                let rank_j_plus_1 = Self::arbitrator_confidence_score(&rep_j_plus_1);
+                if rank_j < rank_j_plus_1
+                    || (rank_j == rank_j_plus_1 && rep_j.score < rep_j_plus_1.score)
+                {
                     // Swap
                     let temp = rep_j_plus_1.clone();
                     reputations.set(j + 1, rep_j.clone());
@@ -10682,6 +10732,60 @@ impl RefundContract {
         env.storage()
             .instance()
             .get(&VoucherKey::Voucher(voucher_id))
+    }
+
+    /// Release backing for expired vouchers with an unredeemed balance.
+    /// Anyone may call this bounded sweep; backing is returned to the merchant.
+    pub fn sweep_expired_vouchers(env: Env, start_id: u64, limit: u64) -> u32 {
+        if start_id == 0 || limit == 0 {
+            return 0;
+        }
+
+        let last_id: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::VoucherCounter)
+            .unwrap_or(0);
+        let page_size = Self::clamp_page_size(limit);
+        let end_id = core::cmp::min(last_id, start_id.saturating_add(page_size - 1));
+        let now = env.ledger().timestamp();
+        let mut released = 0u32;
+        let mut voucher_id = start_id;
+
+        while voucher_id <= end_id {
+            if let Some(mut voucher) = env
+                .storage()
+                .instance()
+                .get::<_, RefundVoucher>(&VoucherKey::Voucher(voucher_id))
+            {
+                if !voucher.redeemed && voucher.remaining_balance > 0 && now > voucher.expires_at {
+                    let amount = voucher.remaining_balance;
+                    token::Client::new(&env, &voucher.token).transfer(
+                        &env.current_contract_address(),
+                        &voucher.merchant,
+                        &amount,
+                    );
+                    voucher.remaining_balance = 0;
+                    voucher.redeemed = true;
+                    env.storage()
+                        .instance()
+                        .set(&VoucherKey::Voucher(voucher_id), &voucher);
+                    VoucherBackingReleased {
+                        voucher_id,
+                        merchant: voucher.merchant,
+                        amount,
+                    }
+                    .publish(&env);
+                    released += 1;
+                }
+            }
+            if voucher_id == end_id {
+                break;
+            }
+            voucher_id += 1;
+        }
+
+        released
     }
 
     /// Get a page of refund vouchers issued to a customer.
