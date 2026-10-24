@@ -1,128 +1,90 @@
 # Python SDK
 
-The Cypher GridPay Python SDK provides typed contract wrappers for querying and managing payments and escrows on the Stellar network.
+The Python SDK wraps Soroban with `SorobanServerAsync` through Stellar SDK's async contract client. Responses are converted from ScVal/XDR into native Python values and validated with Pydantic v2 models for `Payment`, `Escrow`, `Refund`, and `SystemStatus`.
 
 ## Installation
 
 ```bash
-# Generate the SDK
+pip install -e sdk/python
+
+# Optional: shared idempotency storage for FastAPI/Celery workers
+pip install -e 'sdk/python[redis]'
+
+# Generate the lower-level contract bindings when contract WASM is built
 ./scripts/generate-python-bindings.sh
-
-# Install the package
-cd python-sdk
-pip install -e .
 ```
 
-## Quickstart
+Generated bindings are placed under `sdk/python/cypher_gridpay_sdk/bindings`. The maintained async wrapper and models are not overwritten by regeneration.
 
-### Initialize the SDK
+## Async usage
 
 ```python
-from cypher_gridpay_sdk import PaymentContract, EscrowContract, RefundContract, AdminContract
+import asyncio
+import os
 
-rpc_url = "https://soroban-testnet.stellar.org"
-network_passphrase = "Test SDF Network ; September 2015"
+from stellar_sdk import Keypair
+from cypher_gridpay_sdk import Payment, SorobanContractAsyncClient
 
-payment = PaymentContract(
-    contract_id="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-    rpc_url=rpc_url,
-    network_passphrase=network_passphrase,
+async def main():
+    client = SorobanContractAsyncClient(
+        contract_id=os.environ["PAYMENT_CONTRACT_ID"],
+        rpc_url="https://soroban-testnet.stellar.org",
+        network_passphrase="Test SDF Network ; September 2015",
+        signer=Keypair.from_secret(os.environ["STELLAR_SECRET_KEY"]),
+    )
+    try:
+        payment = await client.call("get_payment", 42, result_model=Payment)
+        print(payment.status, payment.amount)
+
+        await client.submit(
+            "complete_payment",
+            client.signer.public_key,
+            payment.id,
+            idempotency_key="order-42-completion-v1",
+        )
+    finally:
+        await client.close()
+
+asyncio.run(main())
+```
+
+`call()` simulates the contract invocation and does not submit a transaction. `submit()` requires a signing key and an idempotency key. The SDK converts Python integers, addresses, bytes, enums, lists, dictionaries, and Pydantic models to Soroban ScVals; pass `argument_types` when an integer's XDR width cannot be inferred from its argument name.
+
+## FastAPI and Celery
+
+Use one Redis-backed store across worker processes so completed results are shared. The in-memory default is intended for local development and tests only.
+
+```python
+from redis.asyncio import Redis
+from stellar_sdk import Keypair
+from cypher_gridpay_sdk import RedisIdempotencyStore, SorobanContractAsyncClient
+
+redis = Redis.from_url("redis://localhost:6379/0")
+client = SorobanContractAsyncClient(
+    contract_id="C...",
+    rpc_url="https://soroban-testnet.stellar.org",
+    network_passphrase="Test SDF Network ; September 2015",
+    signer=Keypair.from_secret("S..."),
+    idempotency_store=RedisIdempotencyStore(redis),
 )
 
-escrow = EscrowContract(
-    contract_id="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-    rpc_url=rpc_url,
-    network_passphrase=network_passphrase,
-)
+async def complete_payment(payment_id: int, request_id: str):
+    return await client.submit(
+        "complete_payment",
+        client.signer.public_key,
+        payment_id,
+        idempotency_key=f"payment-complete:{request_id}",
+    )
 ```
 
-### Create a Payment
+Keep idempotency keys stable across retries and unique to one logical operation. Reusing a key with different function arguments raises `ValueError`. Retries resubmit the same signed transaction envelope; they do not construct a fresh transaction for each attempt.
 
-```python
-payment_id = payment.create_payment(
-    customer="GABC...",
-    merchant="GDEF...",
-    amount=10000,
-    token="CXYZ...",
-    currency="USDC",
-    expiration_duration=86400,
-    metadata="Order #12345",
-)
-print(f"Payment created with ID: {payment_id}")
-```
+## Models
 
-### Complete a Payment
+`Payment`, `Escrow`, and `Refund` mirror the corresponding contract records. `SystemStatus` combines the common pause state with optional refund circuit-breaker fields for service health endpoints. Contract enum variants are represented as strings in the Pydantic models.
 
-```python
-payment.complete_payment(
-    admin="GADMIN...",
-    payment_id=payment_id,
-)
-```
+For private invoices, use `new_invoice_secret()` and
+`ephemeral_invoice_commitment(vault_address, secret)` from the SDK. Keep the returned
+secret off-chain until `complete_private_payment` reveals it; never reuse a secret.
 
-### Query Payment Details
-
-```python
-info = payment.get_payment(payment_id=payment_id)
-print(f"Status: {info.status}")
-print(f"Amount: {info.amount}")
-print(f"Merchant: {info.merchant}")
-```
-
-### Create an Escrow
-
-```python
-escrow_id = escrow.create_escrow(
-    customer="GABC...",
-    merchant="GDEF...",
-    amount=50000,
-    token="CXYZ...",
-    expiration_duration=604800,
-)
-```
-
-### Request a Refund
-
-```python
-refund_id = refund.request_refund(
-    customer="GABC...",
-    payment_id=payment_id,
-    reason="Product not received",
-)
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `STELLAR_RPC_URL` | Soroban RPC endpoint | `https://soroban-testnet.stellar.org` |
-| `STELLAR_NETWORK_PASSPHRASE` | Network passphrase | `Test SDF Network ; September 2015` |
-| `STELLAR_SECRET_KEY` | Secret key for signing | None |
-
-## Error Handling
-
-```python
-from cypher_gridpay_sdk import PaymentContract
-
-try:
-    payment_id = payment.create_payment(...)
-except Exception as e:
-    error_code = getattr(e, 'code', None)
-    if error_code == 106:
-        print("Rate limit exceeded. Please wait and try again.")
-    elif error_code == 108:
-        print("Address flagged. Contact support.")
-    else:
-        print(f"Error: {e}")
-```
-
-## API Reference
-
-See the generated Python modules for full API documentation:
-
-- `python-sdk/payment.py` — Payment contract bindings
-- `python-sdk/escrow.py` — Escrow contract bindings
-- `python-sdk/refund.py` — Refund contract bindings
-- `python-sdk/admin.py` — Admin contract bindings
+See [examples/python/quickstart.py](../examples/python/quickstart.py) for a complete executable example.

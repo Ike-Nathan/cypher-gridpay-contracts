@@ -8,6 +8,21 @@ publish = false
 crate-type = ["lib", "cdylib"]
 doctest = false
 
+# Feature gates
+# --------------------------------------------------------------------------
+# `stable-abi`  (default: off)
+#   Reserved for future CI parity checks.  Enabling this feature must never
+#   alter the WASM-exported function names or XDR parameter signatures of
+#   EscrowContract — any change that would break @cypher-gridpay/contracts-sdk
+#   compatibility must be guarded here and verified in CI with:
+#
+#       cargo build -p escrow --features escrow/stable-abi
+#
+#   The feature is intentionally empty today; its presence ensures that CI
+#   jobs can grow ABI drift detection without touching Cargo.toml again.
+[features]
+stable-abi = []
+
 [dependencies]
 soroban-sdk = { workspace = true }
 

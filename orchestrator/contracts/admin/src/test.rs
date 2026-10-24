@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{storage::Instance as _, Address as _, Ledger};
+use soroban_sdk::testutils::{storage::Instance as _, Address as _, Events, Ledger};
 
 struct Setup {
     env: Env,
@@ -374,218 +374,254 @@ fn test_admin_calls_extend_instance_ttl() {
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
 }
 
-// ── Rotation handshake (Issue #237) ─────────────────────────────────────────
+// ── Canary upgrade verification (Issue #235) ────────────────────────────────
 
-mod peer {
-    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+mod canary {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 
     #[contracttype]
     enum Key {
-        Initialized,
-        Rejecting,
-        Peer(Symbol),
+        Version,
+        Paused,
+        Faulty,
+        Hash,
     }
 
-    /// Stand-in sibling contract exposing the rotation handshake entry points.
+    /// Stand-in upgrade target exposing the entry points `execute_upgrade`
+    /// drives. A faulty target ignores `migrate_schema`.
     #[contract]
-    pub struct MockPeer;
+    pub struct MockTarget;
 
     #[contractimpl]
-    impl MockPeer {
-        pub fn configure(env: Env, initialized: bool, rejecting: bool) {
-            env.storage()
-                .instance()
-                .set(&Key::Initialized, &initialized);
-            env.storage().instance().set(&Key::Rejecting, &rejecting);
+    impl MockTarget {
+        pub fn configure(env: Env, version: u32, paused: bool, faulty: bool) {
+            env.storage().instance().set(&Key::Version, &version);
+            env.storage().instance().set(&Key::Paused, &paused);
+            env.storage().instance().set(&Key::Faulty, &faulty);
         }
 
-        pub fn get_schema_version(_env: Env) -> u32 {
-            1
+        pub fn get_schema_version(env: Env) -> u32 {
+            env.storage().instance().get(&Key::Version).unwrap_or(1)
         }
 
-        pub fn is_initialized(env: Env) -> bool {
-            env.storage()
-                .instance()
-                .get(&Key::Initialized)
-                .unwrap_or(false)
-        }
-
-        pub fn set_payment_contract(env: Env, caller: Address, address: Address) {
-            let name = Symbol::new(&env, "payment");
-            Self::set_peer(env, caller, name, address);
-        }
-
-        pub fn set_escrow_contract(env: Env, caller: Address, address: Address) {
-            let name = Symbol::new(&env, "escrow");
-            Self::set_peer(env, caller, name, address);
-        }
-
-        pub fn set_refund_contract(env: Env, caller: Address, address: Address) {
-            let name = Symbol::new(&env, "refund");
-            Self::set_peer(env, caller, name, address);
-        }
-
-        pub fn peer(env: Env, name: Symbol) -> Option<Address> {
-            env.storage().instance().get(&Key::Peer(name))
-        }
-    }
-
-    impl MockPeer {
-        fn set_peer(env: Env, caller: Address, name: Symbol, address: Address) {
-            caller.require_auth();
-            let rejecting: bool = env
-                .storage()
-                .instance()
-                .get(&Key::Rejecting)
-                .unwrap_or(false);
-            if rejecting {
-                panic!("peer rejected address update");
+        pub fn get_pause_state(env: Env) -> payments::PauseState {
+            payments::PauseState {
+                globally_paused: env.storage().instance().get(&Key::Paused).unwrap_or(false),
+                paused_functions: Vec::new(&env),
+                paused_at: 0,
+                paused_by: env.current_contract_address(),
+                pause_reason: String::from_str(&env, ""),
             }
-            env.storage().instance().set(&Key::Peer(name), &address);
+        }
+
+        pub fn upgrade(env: Env, _caller: Address, new_wasm_hash: BytesN<32>) -> BytesN<32> {
+            env.storage().instance().set(&Key::Hash, &new_wasm_hash);
+            new_wasm_hash
+        }
+
+        pub fn migrate_schema(env: Env, _caller: Address, target_version: u32) {
+            let faulty: bool = env.storage().instance().get(&Key::Faulty).unwrap_or(false);
+            if !faulty {
+                env.storage().instance().set(&Key::Version, &target_version);
+            }
+        }
+
+        pub fn installed_hash(env: Env) -> Option<BytesN<32>> {
+            env.storage().instance().get(&Key::Hash)
         }
     }
 }
 
-fn setup_peer(env: &Env, initialized: bool, rejecting: bool) -> Address {
-    let id = env.register(peer::MockPeer, ());
-    peer::MockPeerClient::new(env, &id).configure(&initialized, &rejecting);
+fn setup_canary(s: &Setup, version: u32, paused: bool, faulty: bool) -> Address {
+    let id = s.env.register(canary::MockTarget, ());
+    canary::MockTargetClient::new(&s.env, &id).configure(&version, &paused, &faulty);
     id
 }
 
-/// Admin contract wired to three mock siblings.
-fn setup_with_peers(refund_rejects: bool) -> Setup {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(AdminContract, ());
-    let admin = Address::generate(&env);
-    let pauser = Address::generate(&env);
-    let payment = setup_peer(&env, true, false);
-    let escrow = setup_peer(&env, true, false);
-    let refund = setup_peer(&env, true, refund_rejects);
-    let s = Setup {
-        env,
-        contract_id,
-        admin,
-        pauser,
-        payment,
-        escrow,
-        refund,
-    };
-    s.client()
-        .initialize(&s.admin, &s.pauser, &s.payment, &s.escrow, &s.refund);
-    s
+fn wasm_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7u8; 32])
 }
 
-fn peer_of(s: &Setup, contract: &Address, name: &str) -> Option<Address> {
-    peer::MockPeerClient::new(&s.env, contract).peer(&Symbol::new(&s.env, name))
+#[test]
+fn test_upgrade_with_migration_verifies_post_schema_version() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, false);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    c.execute_upgrade(&s.admin, &id);
+
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.get_schema_version(), 2);
+    assert_eq!(mock.installed_hash(), Some(wasm_hash(&s.env)));
+    assert!(c.get_upgrade_proposal(&id).executed);
 }
 
-fn pass_rotation_timelock(s: &Setup) {
+#[test]
+fn test_upgrade_rolls_back_on_post_schema_mismatch() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, true, true);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::PostUpgradeVerificationFailed)));
+
+    // Upgrade, migration and the executed flag are all rolled back.
+    let mock = canary::MockTargetClient::new(&s.env, &target);
+    assert_eq!(mock.installed_hash(), None);
+    assert_eq!(mock.get_schema_version(), 1);
+    assert!(!c.get_upgrade_proposal(&id).executed);
+}
+
+#[test]
+fn test_migrating_upgrade_requires_paused_target() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &0, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &2, &Some(2));
+    c.approve_upgrade(&s.admin, &id);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::TargetNotPaused)));
+}
+
+#[test]
+fn test_expired_upgrade_proposal_cannot_execute() {
+    let s = setup();
+    let c = s.client();
+    c.configure_upgrade(&s.admin, &3_600, &1);
+    let target = setup_canary(&s, 1, false, false);
+
+    s.env.ledger().set_timestamp(1_000);
+    let id = c.propose_upgrade(&s.admin, &target, &wasm_hash(&s.env), &1, &None);
+    c.approve_upgrade(&s.admin, &id);
+
+    let expires_at = c.get_upgrade_proposal(&id).expires_at;
+    assert_eq!(expires_at, 1_000 + 3_600 + UPGRADE_PROPOSAL_VALIDITY);
+
+    s.env.ledger().set_timestamp(expires_at + 1);
+    let res = c.try_execute_upgrade(&s.admin, &id);
+    assert_eq!(res, Err(Ok(Error::UpgradeProposalExpired)));
+
+    // Still executable right up to the expiry.
+    s.env.ledger().set_timestamp(expires_at);
+    c.execute_upgrade(&s.admin, &id);
+}
+
+// ── Protocol parameter guardrails (Issue #240) ──────────────────────────────
+
+fn empty_patch() -> ProtocolParameterPatch {
+    ProtocolParameterPatch {
+        max_fee_bps: None,
+        min_finality_delay_secs: None,
+        max_slippage_bps: None,
+        min_escrow_hold_secs: None,
+    }
+}
+
+#[test]
+fn test_sync_parameters_rejects_out_of_bounds() {
+    let s = setup();
+    let c = s.client();
+
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(9_900);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
+    );
+
+    let mut patch = empty_patch();
+    patch.min_finality_delay_secs = Some(0);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterOutOfBounds))
+    );
+
+    // Nothing was applied.
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 100);
+}
+
+#[test]
+fn test_sync_parameters_rejects_large_step() {
+    let s = setup();
+    let c = s.client();
+
+    // Default fee is 100 bps; a 25% step allows at most 125.
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(126);
+    assert_eq!(
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterStepTooLarge))
+    );
+
+    patch.max_fee_bps = Some(125);
+    assert_eq!(
+        c.sync_protocol_parameters(&s.admin, &patch).max_fee_bps,
+        125
+    );
+}
+
+#[test]
+fn test_sync_parameters_enforces_cooldown() {
+    let s = setup();
+    let c = s.client();
+    s.env.ledger().set_timestamp(10_000);
+
+    let mut patch = empty_patch();
+    patch.max_slippage_bps = Some(110);
+    c.sync_protocol_parameters(&s.admin, &patch);
+
+    patch.max_slippage_bps = Some(120);
     s.env
         .ledger()
-        .with_mut(|l| l.timestamp += CONTRACT_ROTATION_TIMELOCK);
-}
-
-#[test]
-fn test_escrow_rotation_propagates_to_peers() {
-    let s = setup_with_peers(false);
-    let c = s.client();
-    let new_escrow = setup_peer(&s.env, true, false);
-
-    c.set_escrow_contract(&s.admin, &new_escrow);
-    pass_rotation_timelock(&s);
-    c.execute_escrow_rotation(&s.admin);
-
-    assert_eq!(peer_of(&s, &s.payment, "escrow"), Some(new_escrow.clone()));
-    assert_eq!(peer_of(&s, &s.refund, "escrow"), Some(new_escrow.clone()));
-    assert!(c.is_deprecated_contract(&ContractTarget::Escrow, &s.escrow));
-    assert!(!c.is_deprecated_contract(&ContractTarget::Escrow, &new_escrow));
-}
-
-#[test]
-fn test_payment_and_refund_rotations_propagate_to_peers() {
-    let s = setup_with_peers(false);
-    let c = s.client();
-    let new_payment = setup_peer(&s.env, true, false);
-    let new_refund = setup_peer(&s.env, true, false);
-
-    c.set_payment_contract(&s.admin, &new_payment);
-    c.set_refund_contract(&s.admin, &new_refund);
-    pass_rotation_timelock(&s);
-    c.execute_payment_rotation(&s.admin);
-    c.execute_refund_rotation(&s.admin);
-
-    assert_eq!(peer_of(&s, &s.escrow, "payment"), Some(new_payment.clone()));
-    assert_eq!(peer_of(&s, &s.refund, "payment"), Some(new_payment.clone()));
-    // The refund rotation reaches the already-rotated payment contract.
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS - 1);
     assert_eq!(
-        peer_of(&s, &new_payment, "refund"),
-        Some(new_refund.clone())
+        c.try_sync_protocol_parameters(&s.admin, &patch),
+        Err(Ok(Error::ParameterCooldownActive))
     );
-    assert_eq!(peer_of(&s, &s.escrow, "refund"), Some(new_refund));
+
+    // A different parameter is not affected by that cooldown.
+    let mut other = empty_patch();
+    other.min_escrow_hold_secs = Some(100_000);
+    c.sync_protocol_parameters(&s.admin, &other);
+
+    s.env
+        .ledger()
+        .set_timestamp(10_000 + GlobalParameterGuardrails::MIN_PARAMETER_COOLDOWN_SECS);
     assert_eq!(
-        c.get_deprecated_contracts(&ContractTarget::Payment),
-        Vec::from_array(&s.env, [s.payment.clone()])
+        c.sync_protocol_parameters(&s.admin, &patch)
+            .max_slippage_bps,
+        120
     );
 }
 
 #[test]
-fn test_rotation_rejects_uninitialized_target() {
-    let s = setup_with_peers(false);
+fn test_sync_parameters_requires_admin_and_broadcasts() {
+    let s = setup();
     let c = s.client();
-    let uninitialized = setup_peer(&s.env, false, false);
 
-    c.set_escrow_contract(&s.admin, &uninitialized);
-    pass_rotation_timelock(&s);
+    let mut patch = empty_patch();
+    patch.max_fee_bps = Some(110);
     assert_eq!(
-        c.try_execute_escrow_rotation(&s.admin),
-        Err(Ok(Error::RotationTargetNotReady))
-    );
-    assert!(c.get_pending_rotation(&ContractTarget::Escrow).is_some());
-    assert_eq!(peer_of(&s, &s.payment, "escrow"), None);
-}
-
-#[test]
-fn test_rotation_rejects_non_contract_target() {
-    let s = setup_with_peers(false);
-    let c = s.client();
-    c.set_payment_contract(&s.admin, &Address::generate(&s.env));
-    pass_rotation_timelock(&s);
-    assert_eq!(
-        c.try_execute_payment_rotation(&s.admin),
-        Err(Ok(Error::RotationTargetNotReady))
-    );
-}
-
-#[test]
-fn test_rotation_rejects_current_address() {
-    let s = setup_with_peers(false);
-    let c = s.client();
-    c.set_refund_contract(&s.admin, &s.refund);
-    pass_rotation_timelock(&s);
-    assert_eq!(
-        c.try_execute_refund_rotation(&s.admin),
-        Err(Ok(Error::RotationToCurrentAddress))
-    );
-}
-
-#[test]
-fn test_rotation_rolls_back_when_peer_rejects() {
-    let s = setup_with_peers(true);
-    let c = s.client();
-    let new_escrow = setup_peer(&s.env, true, false);
-
-    c.set_escrow_contract(&s.admin, &new_escrow);
-    pass_rotation_timelock(&s);
-    assert_eq!(
-        c.try_execute_escrow_rotation(&s.admin),
-        Err(Ok(Error::PeerSyncFailed))
+        c.try_sync_protocol_parameters(&s.pauser, &patch),
+        Err(Ok(Error::Unauthorized))
     );
 
-    // Payment's update, the deprecation entry and the address swap all roll back.
-    assert_eq!(peer_of(&s, &s.payment, "escrow"), None);
-    assert!(c
-        .get_deprecated_contracts(&ContractTarget::Escrow)
-        .is_empty());
-    assert!(c.get_pending_rotation(&ContractTarget::Escrow).is_some());
+    c.sync_protocol_parameters(&s.admin, &patch);
+    let synced = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract_id)
+        .count();
+    assert_eq!(synced, 3);
+    assert_eq!(c.get_protocol_parameters().max_fee_bps, 110);
 }
