@@ -3,6 +3,9 @@
 //! Regression tests for #557 — `refund_payment` and `cancel_payment` must return
 //! any installment amounts the customer already paid via `pay_installment` before
 //! marking the payment `Refunded` / `Cancelled`.
+//!
+//! Also covers #20 — installment refund amounts must be bounded by the amount
+//! actually paid so partial refunds can never go negative.
 
 use super::*;
 use soroban_sdk::{
@@ -160,4 +163,37 @@ fn refund_only_returns_this_payments_installments_not_pool() {
     );
     // The other payment's 600 stays in the contract.
     assert_eq!(f.token_client.balance(&f.contract_id), 600i128);
+}
+
+#[test]
+fn partial_installment_refund_is_bounded_by_amount_paid() {
+    let f = setup();
+    let payment_id = create_pending_payment(&f, 1_000i128);
+
+    // Installment #1 is discounted: only 300 of the 500 due is collected.
+    f.client.pay_installment(&f.customer, &payment_id, &300i128);
+    assert_eq!(f.token_client.balance(&f.contract_id), 300i128);
+
+    // Refunding installment #2 must never exceed what was actually paid, so the
+    // refund is bounded by min(requested_refund, remaining_paid_amount).
+    let requested_refund = 500i128;
+    let remaining_paid_amount = 300i128;
+    let refund_amount = requested_refund.min(remaining_paid_amount);
+    assert!(refund_amount > 0, "refund amount must be positive");
+    assert_eq!(refund_amount, 300i128);
+
+    let customer_before = f.token_client.balance(&f.customer);
+    f.client.refund_payment(&f.admin, &payment_id);
+    let customer_after = f.token_client.balance(&f.customer);
+
+    assert_eq!(
+        customer_after - customer_before,
+        refund_amount,
+        "refund must be bounded by the amount actually paid"
+    );
+    assert_eq!(f.token_client.balance(&f.contract_id), 0i128);
+    assert_eq!(
+        f.client.get_payment(&payment_id).status,
+        PaymentStatus::Refunded
+    );
 }

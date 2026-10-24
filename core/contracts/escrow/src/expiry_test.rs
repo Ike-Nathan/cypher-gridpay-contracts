@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use crate::*;
+use soroban_sdk::testutils::Events;
 use soroban_sdk::testutils::Ledger;
 use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
@@ -77,6 +78,49 @@ fn test_expire_disputed_escrow_fails() {
     // Advance past expiry
     env.ledger().set_timestamp(4000);
     let result = client.try_expire_escrow(&escrow_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_refund_expired_escrow_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true,
+    );
+
+    let token_client = token::Client::new(&env, &token);
+    let buyer_balance_before = token_client.balance(&customer);
+
+    // Advance past expiry
+    env.ledger().set_timestamp(3001);
+
+    client.refund_expired_escrow(&customer, &escrow_id);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::ExpiredRefunded);
+
+    let buyer_balance_after = token_client.balance(&customer);
+    assert_eq!(buyer_balance_after, buyer_balance_before + 500_i128);
+}
+
+#[test]
+fn test_refund_expired_escrow_premature_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true,
+    );
+
+    // Still before expiry
+    env.ledger().set_timestamp(2500);
+    let result = client.try_refund_expired_escrow(&customer, &escrow_id);
     assert!(result.is_err());
 }
 
@@ -311,5 +355,133 @@ fn test_extend_expiry_disabled_config_fails() {
 
     env.ledger().set_timestamp(2000);
     let result = client.try_extend_escrow_expiry(&customer, &escrow_id, &4000_u64);
+    assert!(result.is_err());
+}
+
+// ── Keeper bounty integration with expiry ────────────────────────────────────
+
+fn bounty_config() -> StaleThresholdConfig {
+    StaleThresholdConfig {
+        inactivity_seconds: 10_000,
+        near_expiry_buffer_seconds: 500,
+        keeper_bounty_bps: 50,           // 0.5%
+        max_keeper_bounty_cap: 0,        // no hard cap
+        dormant_grace_notice_secs: 1_000,
+    }
+}
+
+#[test]
+fn test_poke_expired_escrow_transitions_to_dormant() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+    client.set_stale_threshold(&admin, &bounty_config());
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2_000_u64, &0_u64, &3_000_u64, &false,
+    );
+
+    // Advance past expiry so health = Expired.
+    env.ledger().set_timestamp(3_500);
+    assert!(client.is_escrow_expired(&escrow_id));
+
+    let keeper = Address::generate(&env);
+    // Keeper pokes the expired escrow; it should now be DormantNoticePeriod.
+    let result = client.try_poke_stale_escrow(&escrow_id, &keeper);
+    assert!(result.is_ok());
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::DormantNoticePeriod);
+}
+
+#[test]
+fn test_settle_dormant_expired_escrow_after_grace() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+    client.set_stale_threshold(&admin, &bounty_config());
+
+    // Set 100 bps fee so there is a fee pool from which the bounty is drawn.
+    let fee_config = EscrowFeeConfig {
+        fee_bps: 100_i128,
+        fee_recipient: admin.clone(),
+        enabled: true,
+    };
+    client.set_escrow_fee_config(&admin, &fee_config);
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &5_000_i128, &token, &2_000_u64, &0_u64, &3_000_u64, &false,
+    );
+
+    env.ledger().set_timestamp(3_500);
+
+    let keeper = Address::generate(&env);
+    client.poke_stale_escrow(&escrow_id, &keeper);
+
+    // Advance past the 1_000s grace window.
+    env.ledger().set_timestamp(4_600);
+
+    let token_client = token::Client::new(&env, &token);
+    let keeper_balance_before = token_client.balance(&keeper);
+    let customer_balance_before = token_client.balance(&customer);
+
+    let bounty = client.settle_dormant_escrow(&escrow_id, &keeper);
+    // bounty = min(5000*50/10000, 5000*100/10000) = min(25, 50) = 25
+    assert_eq!(bounty, 25_i128);
+
+    assert_eq!(token_client.balance(&keeper), keeper_balance_before + 25);
+    // Customer favor (default); principal = 5000 - 50 fee = 4950.
+    assert_eq!(token_client.balance(&customer), customer_balance_before + 4_950);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn test_buyer_refund_during_dormant_window_cancels_settlement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+    client.set_stale_threshold(&admin, &bounty_config());
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2_000_u64, &0_u64, &3_000_u64, &false,
+    );
+    env.ledger().set_timestamp(3_500);
+
+    let keeper = Address::generate(&env);
+    client.poke_stale_escrow(&escrow_id, &keeper);
+
+    // Customer disputes during grace window → resets dormant timer.
+    env.ledger().set_timestamp(3_800);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Disputed);
+
+    // Attempt to settle — should fail since not DormantNoticePeriod anymore.
+    env.ledger().set_timestamp(5_000);
+    let result = client.try_settle_dormant_escrow(&escrow_id, &keeper);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_poke_without_bounty_config_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    // No stale threshold configured at all.
+
+    env.ledger().set_timestamp(1_000);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2_000_u64, &0_u64, &3_000_u64, &false,
+    );
+    env.ledger().set_timestamp(3_500);
+
+    let keeper = Address::generate(&env);
+    let result = client.try_poke_stale_escrow(&escrow_id, &keeper);
     assert!(result.is_err());
 }

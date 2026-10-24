@@ -2,7 +2,6 @@
 mod batch_release_tests {
     use crate::*;
     use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
-use crate::*;
 
     fn setup_test(env: &Env) -> (EscrowContractClient, Address) {
         env.mock_all_auths();
@@ -73,6 +72,52 @@ use crate::*;
 
         let mut ids = Vec::new(&env);
         for i in 1..=21 {
+            ids.push_back(i);
+        }
+
+        let request = BatchReleaseRequest {
+            escrow_ids: ids,
+            override_recipient: None,
+        };
+
+        let result = client.try_batch_release_escrows(&admin, &request);
+        assert_eq!(result, Err(Ok(Error::Action(ActionError::BatchReleaseSizeLimitExceeded))));
+    }
+
+    #[test]
+    fn test_batch_release_at_size_limit_succeeds() {
+        let env = Env::default();
+        let (client, admin) = setup_test(&env);
+        let customer = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Create exactly MAX_BATCH_RELEASE_SIZE releasable escrows.
+        let mut ids = Vec::new(&env);
+        for i in 1..=MAX_BATCH_RELEASE_SIZE {
+            client.create_escrow(&customer, &merchant, &1000_i128, &token, &0, &0, &false);
+            ids.push_back(i);
+        }
+
+        let request = BatchReleaseRequest {
+            escrow_ids: ids,
+            override_recipient: None,
+        };
+
+        let result = client.batch_release_escrows(&admin, &request);
+        assert_eq!(result.succeeded.len(), MAX_BATCH_RELEASE_SIZE);
+        assert_eq!(result.failed.len(), 0);
+        assert_eq!(result.errors.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_release_over_size_limit_reverts() {
+        let env = Env::default();
+        let (client, admin) = setup_test(&env);
+
+        // One past the maximum batch size must revert with BatchSizeExceeded.
+        let mut ids = Vec::new(&env);
+        for i in 1..=(MAX_BATCH_RELEASE_SIZE + 1) {
             ids.push_back(i);
         }
 

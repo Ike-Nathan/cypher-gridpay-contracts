@@ -38,6 +38,40 @@ Before you begin, ensure you have:
    ```bash
    cargo test --workspace
    ```
+
+### Local Development with Docker
+
+For a local Stellar test environment with standalone Soroban RPC, use the provided `docker-compose.yml`:
+
+```bash
+# Start the local Stellar Quickstart network
+docker-compose up -d
+
+# Check that the network is running
+curl -s http://localhost:8000/
+
+# Fund a test account using the friendbot/faucet
+curl "http://localhost:8000/friendbot?addr=<YOUR_ADDRESS>"
+
+# Deploy contracts using the deployment script
+./scripts/deploy-testnet.sh
+```
+
+The `docker-compose.yml` service uses `stellar/quickstart:testing` with Soroban RPC enabled, providing:
+- **Stellar Core** on port 8000 (standalone mode)
+- **Soroban RPC** on port 8001 for smart contract interaction
+- Automatic network passphrase: `Standalone Network ; February 2017`
+
+To stop the environment:
+```bash
+docker-compose down
+```
+
+To reset all data:
+```bash
+docker-compose down -v
+```
+
 ### Makefile Targets
 
 The root `Makefile` provides several helpful targets to streamline development. Run these using `make <target>`.
@@ -131,6 +165,22 @@ cargo fmt --all
 ### 5. Run All Checks
 
 Before committing, ensure:
+
+To run the configured checks automatically before each commit, install
+[`pre-commit`](https://pre-commit.com/) (for example, with `pipx install pre-commit`)
+and enable the repository hook:
+
+```bash
+pre-commit install
+```
+
+The hook checks formatting, runs Clippy, and checks both the `core` and
+`orchestrator` workspaces. To run it manually across all files:
+
+```bash
+pre-commit run --all-files
+```
+
 ```bash
 # Format check
 cargo fmt --all -- --check

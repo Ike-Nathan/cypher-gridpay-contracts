@@ -152,3 +152,116 @@ fn pause_function_is_idempotent_while_active() {
     assert_eq!(history.get(0).unwrap().reason, reason);
     assert_eq!(history.get(0).unwrap().paused_at, 2000);
 }
+
+#[test]
+fn pause_history_caps_retained_entries_at_limit() {
+    let (env, client, admin) = setup();
+    let reason = String::from_str(&env, "capacity");
+
+    let names = [
+        String::from_str(&env, "fn_00"),
+        String::from_str(&env, "fn_01"),
+        String::from_str(&env, "fn_02"),
+        String::from_str(&env, "fn_03"),
+        String::from_str(&env, "fn_04"),
+        String::from_str(&env, "fn_05"),
+        String::from_str(&env, "fn_06"),
+        String::from_str(&env, "fn_07"),
+        String::from_str(&env, "fn_08"),
+        String::from_str(&env, "fn_09"),
+        String::from_str(&env, "fn_10"),
+        String::from_str(&env, "fn_11"),
+        String::from_str(&env, "fn_12"),
+        String::from_str(&env, "fn_13"),
+        String::from_str(&env, "fn_14"),
+        String::from_str(&env, "fn_15"),
+        String::from_str(&env, "fn_16"),
+        String::from_str(&env, "fn_17"),
+        String::from_str(&env, "fn_18"),
+        String::from_str(&env, "fn_19"),
+        String::from_str(&env, "fn_20"),
+        String::from_str(&env, "fn_21"),
+        String::from_str(&env, "fn_22"),
+        String::from_str(&env, "fn_23"),
+        String::from_str(&env, "fn_24"),
+    ];
+
+    let mut ts = 1000u64;
+    for n in names.iter() {
+        ts += 100;
+        env.ledger().set_timestamp(ts);
+        client.pause_function(&admin, n, &reason);
+    }
+
+    // 25 pause events were recorded, but only the most recent 20 are retained.
+    let retained = client.get_pause_history(&25, &0);
+    assert_eq!(retained.len(), 20);
+    assert_eq!(retained.get(0).unwrap().function_name, names[5]);
+    assert_eq!(retained.get(19).unwrap().function_name, names[24]);
+
+    // The five oldest events have been pruned from storage.
+    for idx in 0..5 {
+        let pruned = client.get_function_pause_history(&names[idx]);
+        assert_eq!(pruned.len(), 0);
+    }
+
+    // Pagination is relative to the retained window and stops at the cap.
+    let newest = client.get_pause_history(&1, &19);
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest.get(0).unwrap().function_name, names[24]);
+
+    let past_window = client.get_pause_history(&5, &20);
+    assert_eq!(past_window.len(), 0);
+}
+
+#[test]
+fn unpause_of_pruned_entry_does_not_corrupt_recycled_slot() {
+    let (env, client, admin) = setup();
+    let reason = String::from_str(&env, "churn");
+    let oldest = String::from_str(&env, "fn_oldest");
+
+    env.ledger().set_timestamp(1000);
+    client.pause_function(&admin, &oldest, &reason);
+
+    let names = [
+        String::from_str(&env, "fn_01"),
+        String::from_str(&env, "fn_02"),
+        String::from_str(&env, "fn_03"),
+        String::from_str(&env, "fn_04"),
+        String::from_str(&env, "fn_05"),
+        String::from_str(&env, "fn_06"),
+        String::from_str(&env, "fn_07"),
+        String::from_str(&env, "fn_08"),
+        String::from_str(&env, "fn_09"),
+        String::from_str(&env, "fn_10"),
+        String::from_str(&env, "fn_11"),
+        String::from_str(&env, "fn_12"),
+        String::from_str(&env, "fn_13"),
+        String::from_str(&env, "fn_14"),
+        String::from_str(&env, "fn_15"),
+        String::from_str(&env, "fn_16"),
+        String::from_str(&env, "fn_17"),
+        String::from_str(&env, "fn_18"),
+        String::from_str(&env, "fn_19"),
+        String::from_str(&env, "fn_20"),
+    ];
+
+    let mut ts = 1000u64;
+    for n in names.iter() {
+        ts += 100;
+        env.ledger().set_timestamp(ts);
+        client.pause_function(&admin, n, &reason);
+    }
+
+    // The oldest entry's slot has been recycled by fn_20; unpausing the
+    // evicted function must not overwrite the newer entry's unpause fields.
+    env.ledger().set_timestamp(9000);
+    client.unpause_function(&admin, &oldest);
+
+    let retained = client.get_pause_history(&20, &0);
+    assert_eq!(retained.len(), 20);
+    let newest = retained.get(19).unwrap();
+    assert_eq!(newest.function_name, names[19]);
+    assert_eq!(newest.unpaused_by, None);
+    assert_eq!(newest.unpaused_at, None);
+}

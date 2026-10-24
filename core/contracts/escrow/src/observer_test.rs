@@ -251,3 +251,41 @@ fn observer_cannot_open_dispute() {
     let escrow = client.get_escrow_details(&observer, &escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Locked);
 }
+
+/// Regression test for dangling observer pointers: with three observers
+/// registered, removing one (via swap-remove against the last slot) must
+/// not corrupt or lose access for the remaining observers on the same
+/// escrow, and the removed observer must lose access immediately.
+#[test]
+fn test_remove_observer_does_not_leave_dangling_pointer_for_others() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    let observer_a = Address::generate(&env);
+    let observer_b = Address::generate(&env);
+    let observer_c = Address::generate(&env);
+
+    client.add_observer(&customer, &escrow_id, &observer_a, &1_000_u64);
+    client.add_observer(&customer, &escrow_id, &observer_b, &1_000_u64);
+    client.add_observer(&customer, &escrow_id, &observer_c, &1_000_u64);
+
+    // Remove the middle observer, which forces a swap-remove against the
+    // last slot internally.
+    client.remove_observer(&customer, &escrow_id, &observer_b);
+
+    // The removed observer must have no access.
+    assert!(!client.verify_observer_access(&escrow_id, &observer_b));
+
+    // The other two observers must still have intact, valid access.
+    assert!(client.verify_observer_access(&escrow_id, &observer_a));
+    assert!(client.verify_observer_access(&escrow_id, &observer_c));
+
+    // Escrow reads via the surviving observers must not panic.
+    let _ = client.get_escrow_details(&observer_a, &escrow_id);
+    let _ = client.get_escrow_details(&observer_c, &escrow_id);
+
+    // The observer list must reflect exactly the two survivors.
+    let remaining = client.get_observers(&escrow_id);
+    assert_eq!(remaining.len(), 2);
+}

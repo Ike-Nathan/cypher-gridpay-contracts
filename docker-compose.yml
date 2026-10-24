@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  stellar-quickstart:
+    image: stellar/quickstart:testing
+    container_name: stellar-quickstart
+    ports:
+      - "8000:8000"
+    command: >
+      --standalone
+      --enable-soroban-rpc
+      --protobuff-protocol
+    environment:
+      - ENABLE_SOROBAN_RPC=true
+    volumes:
+      - stellar-data:/data
+
+  soroban-rpc:
+    image: stellar/soroban-rpc:latest
+    container_name: soroban-rpc
+    ports:
+      - "8001:8000"
+    environment:
+      - STELLAR_CORE_URL=http://stellar-quickstart:8000
+      - NETWORK_PASSPHRASE="Standalone Network ; February 2017"
+    depends_on:
+      - stellar-quickstart
+
+volumes:
+  stellar-data:

@@ -188,7 +188,7 @@ fn test_get_merchant_pending_refunds_returns_only_requested() {
     client.approve_refund(&admin, &processed_one);
     client.process_refund(&admin, &processed_one);
 
-    let pending = client.get_merchant_pending_refunds(&merchant_a);
+    let pending = client.get_merchant_pending_refunds(&merchant_a, &10, &0);
     assert_eq!(pending.len(), 2);
     assert_eq!(pending.get(0).unwrap().id, pending_one);
     assert_eq!(pending.get(0).unwrap().status, RefundStatus::Requested);
@@ -241,4 +241,117 @@ fn test_get_merchant_refund_summary_counts_current_statuses_and_amounts() {
     assert_eq!(empty_summary.total_amount_refunded, 0);
     assert_eq!(empty_summary.pending_count, 0);
     assert_eq!(empty_summary.pending_amount, 0);
+}
+
+#[test]
+fn test_merchant_quota_enforced_across_multiple_approvals() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    disable_fraud_checks(&client, &admin);
+    client.set_merchant_refund_quota(&admin, &merchant, &1_000i128, &2_592_000u64);
+
+    // Several refunds requested before any is approved; together they exceed
+    // the quota, so approving all of them must not overshoot the allowance.
+    let r1 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 41, 400);
+    let r2 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 42, 400);
+    let r3 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 43, 400);
+    let r4 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 44, 200);
+
+    client.approve_refund(&admin, &r1);
+    client.approve_refund(&admin, &r2);
+    assert_eq!(client.get_merchant_refund_quota(&merchant).unwrap().used, 800);
+
+    // remaining (200) < amount (400) -> rejected, quota untouched
+    let result = client.try_approve_refund(&admin, &r3);
+    assert_eq!(result, Err(Ok(Error::Ext(ExtError::MerchantQuotaExceeded))));
+    assert_eq!(client.get_refund(&r3).status, RefundStatus::Requested);
+    assert_eq!(client.get_merchant_refund_quota(&merchant).unwrap().used, 800);
+
+    // remaining (200) == amount (200) -> exactly fills the quota
+    client.approve_refund(&admin, &r4);
+    assert_eq!(client.get_merchant_refund_quota(&merchant).unwrap().used, 1_000);
+}
+
+#[test]
+fn test_merchant_quota_enforced_within_approval_batch() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    disable_fraud_checks(&client, &admin);
+    client.set_merchant_refund_quota(&admin, &merchant, &1_000i128, &2_592_000u64);
+
+    let r1 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 51, 600);
+    let r2 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 52, 600);
+    let r3 = request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 53, 300);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(r1);
+    ids.push_back(r2);
+    ids.push_back(r3);
+    let results = client.approve_refund_batch(&admin, &ids);
+
+    assert!(results.get(0).unwrap().success);
+    let second = results.get(1).unwrap();
+    assert!(!second.success);
+    assert_eq!(
+        second.error_code,
+        Error::Ext(ExtError::MerchantQuotaExceeded).to_u32()
+    );
+    assert!(results.get(2).unwrap().success);
+
+    let quota = client.get_merchant_refund_quota(&merchant).unwrap();
+    assert_eq!(quota.used, 900);
+    assert!(quota.used <= quota.limit);
+    assert_eq!(client.get_refund(&r2).status, RefundStatus::Requested);
+}
+
+#[test]
+fn test_upheld_appeal_is_not_blocked_by_quota_but_counts_toward_it() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = crate::test_funded_token(&env, &contract_id);
+
+    env.mock_all_auths();
+    disable_fraud_checks(&client, &admin);
+    client.set_merchant_refund_quota(&admin, &merchant, &100i128, &2_592_000u64);
+
+    // A discretionary approval above the quota is refused...
+    let refund_id =
+        request_refund_for_merchant(&client, &env, &merchant, &customer, &token, 61, 400);
+    assert_eq!(
+        client.try_approve_refund(&admin, &refund_id),
+        Err(Ok(Error::Ext(ExtError::MerchantQuotaExceeded)))
+    );
+
+    // ...but an adjudicated outcome (upheld appeal) must still go through,
+    // and is recorded against the merchant's usage.
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "appeal"));
+    client.resolve_appeal(&admin, &appeal_id, &true);
+
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Processed);
+    assert_eq!(client.get_merchant_refund_quota(&merchant).unwrap().used, 400);
 }
