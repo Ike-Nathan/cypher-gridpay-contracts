@@ -31,30 +31,30 @@ fn test_multi_party_escrow_weight_governance() {
     let p3 = Address::generate(&env);
 
     let mut participants = Vec::new(&env);
-    // p1 has 60% share (6000 bps)
+    // p1 has 33% share — at or near the MAX_PARTICIPANT_WEIGHT_BPS cap (3334).
     participants.push_back(Participant {
         address: p1.clone(),
         role: ParticipantRole::Merchant,
-        share_bps: 6000,
-        weight_bps: 1000, // weight_bps is ignored now, initialized based on share_bps (6000)
+        share_bps: 3334,
+        weight_bps: 3334,
         approved: false,
         approved_at: None,
     });
-    // p2 has 30% share (3000 bps)
+    // p2 has 33% share.
     participants.push_back(Participant {
         address: p2.clone(),
         role: ParticipantRole::ServiceProvider,
-        share_bps: 3000,
-        weight_bps: 1000, // will be initialized to 3000
+        share_bps: 3333,
+        weight_bps: 3333,
         approved: false,
         approved_at: None,
     });
-    // p3 has 10% share (1000 bps)
+    // p3 has 33% share.
     participants.push_back(Participant {
         address: p3.clone(),
         role: ParticipantRole::Arbitrator,
-        share_bps: 1000,
-        weight_bps: 8000, // will be initialized to 1000
+        share_bps: 3333,
+        weight_bps: 3333,
         approved: false,
         approved_at: None,
     });
@@ -75,12 +75,12 @@ fn test_multi_party_escrow_weight_governance() {
     assert_eq!(approved_wt, 0);
     assert_eq!(threshold_bps, 10000);
 
-    // p1 approves (60% weight, i.e. 6000 bps)
+    // p1 approves (weight capped at 3334 bps).
     client.approve_release(&p1, &escrow_id);
     let (approved_wt, _) = client.get_approval_weight(&escrow_id);
-    assert_eq!(approved_wt, 6000);
+    assert_eq!(approved_wt, 3334);
 
-    // Trying to release at 60% (6000 < 10000) should fail
+    // At 3334 bps approved (threshold 10000) release must fail.
     env.ledger().set_timestamp(1001);
     let release_res = client.try_release_multi_party_escrow(&escrow_id);
     assert_eq!(
@@ -88,20 +88,25 @@ fn test_multi_party_escrow_weight_governance() {
         Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet)))
     );
 
-    // Update threshold to 60% (6000 bps)
-    client.update_approval_threshold_bps(&admin, &escrow_id, &6000);
-    let (_, threshold_bps) = client.get_approval_weight(&escrow_id);
-    assert_eq!(threshold_bps, 6000);
+    // p2 also approves: total = 3334 + 3333 = 6667 bps (>= 2/3 quorum).
+    client.approve_release(&p2, &escrow_id);
+    let (approved_wt, _) = client.get_approval_weight(&escrow_id);
+    assert_eq!(approved_wt, 6667);
 
-    // Now it should release successfully since approved weight (6000) >= threshold (6000)
+    // Update threshold to 6667 bps (≈2/3 majority).
+    client.update_approval_threshold_bps(&admin, &escrow_id, &6667);
+    let (_, threshold_bps) = client.get_approval_weight(&escrow_id);
+    assert_eq!(threshold_bps, 6667);
+
+    // Now release must succeed (6667 >= 6667).
     let release_res2 = client.try_release_multi_party_escrow(&escrow_id);
     assert!(release_res2.is_ok());
 
     let escrow = client.get_multi_party_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Released);
-    assert_eq!(token_user_client.balance(&p1), 6000);
-    assert_eq!(token_user_client.balance(&p2), 3000);
-    assert_eq!(token_user_client.balance(&p3), 1000);
+    assert_eq!(token_user_client.balance(&p1), 3334);
+    assert_eq!(token_user_client.balance(&p2), 3333);
+    assert_eq!(token_user_client.balance(&p3), 3333);
 }
 
 #[test]
@@ -154,20 +159,30 @@ fn test_multi_party_escrow_set_participant_weight() {
         &release_timestamp,
     );
 
-    // Initial weight of p1 = 5000, p2 = 5000.
-    // We update p1's weight to 5000, which keeps the total at 10000.
-    client.set_participant_weight(&admin, &escrow_id, &p1, &5000);
+    // Both participants are capped at 3334 bps (share_bps 5000 > cap 3334).
+    let (wt, _) = client.get_approval_weight(&escrow_id);
+    assert_eq!(wt, 0); // nothing approved yet
 
-    // Set threshold to 5000 bps
-    client.update_approval_threshold_bps(&admin, &escrow_id, &5000);
+    // Try to set p1's weight to the cap (3334): should succeed.
+    client.set_participant_weight(&admin, &escrow_id, &p1, &3334);
 
-    // p1 approves (has 5000 weight)
+    // Try to set p1's weight above the cap (3335): must fail.
+    let over_cap = client.try_set_participant_weight(&admin, &escrow_id, &p1, &3335);
+    assert_eq!(
+        over_cap,
+        Err(Ok(Error::Action(ActionError::ParticipantWeightExceedsCap)))
+    );
+
+    // Set threshold to 3334 bps and let p1 alone release.
+    client.update_approval_threshold_bps(&admin, &escrow_id, &3334);
+
+    // Approve from p1.
     client.approve_release(&p1, &escrow_id);
     let (approved_wt, threshold_bps) = client.get_approval_weight(&escrow_id);
-    assert_eq!(approved_wt, 5000);
-    assert_eq!(threshold_bps, 5000);
+    assert_eq!(approved_wt, 3334);
+    assert_eq!(threshold_bps, 3334);
 
-    // Advance time and release
+    // Advance time and release.
     env.ledger().set_timestamp(1001);
     let release_res = client.try_release_multi_party_escrow(&escrow_id);
     assert!(release_res.is_ok());
