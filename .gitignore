@@ -8,3 +8,6 @@ target
 .codex
 
 **/test_snapshots/**
+
+# Issue #52: scratch Jupyter notebooks should never land in contract src/ dirs
+*.ipynb

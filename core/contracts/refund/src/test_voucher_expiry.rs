@@ -130,3 +130,103 @@ fn test_already_redeemed_voucher_cannot_be_redeemed_again() {
     let result = client.try_redeem_refund_voucher(&customer, &voucher_id, &1_u64);
     assert!(result.is_err(), "a voucher can only be redeemed once");
 }
+
+/// Issue #60: Customers may partially redeem a voucher's balance across
+/// multiple purchases; the voucher tracks `remaining_balance` and is only
+/// marked fully redeemed once the balance reaches zero.
+#[test]
+fn test_partial_redemption_tracks_remaining_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, contract_id) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let (_, voucher_id) =
+        create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
+    let customer = client.get_voucher(&voucher_id).unwrap().customer;
+
+    // Voucher amount is 1000; redeem 400 first.
+    client.redeem_voucher(&customer, &voucher_id, &400i128);
+    let voucher = client.get_voucher(&voucher_id).unwrap();
+    assert_eq!(voucher.remaining_balance, 600);
+    assert!(
+        !voucher.redeemed,
+        "voucher with remaining balance must not be fully redeemed"
+    );
+
+    // Redeem remaining 600; voucher should now be fully redeemed.
+    client.redeem_voucher(&customer, &voucher_id, &600i128);
+    let voucher = client.get_voucher(&voucher_id).unwrap();
+    assert_eq!(voucher.remaining_balance, 0);
+    assert!(voucher.redeemed);
+
+    // Further redemption attempts must fail.
+    let result = client.try_redeem_voucher(&customer, &voucher_id, &1i128);
+    assert!(
+        result.is_err(),
+        "fully redeemed voucher cannot be redeemed further"
+    );
+}
+
+/// Issue #60: An expired voucher must reject partial redemption attempts.
+#[test]
+fn test_partial_redemption_rejects_expired_voucher() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, contract_id) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 500);
+    let customer = client.get_voucher(&voucher_id).unwrap().customer;
+
+    env.ledger().set_timestamp(1600);
+    let result = client.try_redeem_voucher(&customer, &voucher_id, &100i128);
+    assert!(result.is_err(), "redeeming an expired voucher should fail");
+}
+
+/// Issue #60: Attempting to redeem more than the remaining balance must fail.
+#[test]
+fn test_partial_redemption_rejects_amount_exceeding_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, contract_id) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let (_, voucher_id) =
+        create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
+    let customer = client.get_voucher(&voucher_id).unwrap().customer;
+
+    let result = client.try_redeem_voucher(&customer, &voucher_id, &5000i128);
+    assert!(
+        result.is_err(),
+        "redeeming more than the remaining balance should fail"
+    );
+}
+
+#[test]
+fn test_expired_voucher_sweep_releases_only_unredeemed_backing_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, contract_id) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 500);
+    let voucher = client.get_voucher(&voucher_id).unwrap();
+    let customer = voucher.customer.clone();
+    let token_client = token::Client::new(&env, &voucher.token);
+    let merchant_balance_before = token_client.balance(&voucher.merchant);
+
+    client.redeem_voucher(&customer, &voucher_id, &400);
+    env.ledger().set_timestamp(1501);
+
+    assert_eq!(client.sweep_expired_vouchers(&voucher_id, &10), 1);
+    assert_eq!(client.sweep_expired_vouchers(&voucher_id, &10), 0);
+    assert_eq!(
+        token_client.balance(&voucher.merchant) - merchant_balance_before,
+        600
+    );
+
+    let settled = client.get_voucher(&voucher_id).unwrap();
+    assert_eq!(settled.remaining_balance, 0);
+    assert!(settled.redeemed);
+}

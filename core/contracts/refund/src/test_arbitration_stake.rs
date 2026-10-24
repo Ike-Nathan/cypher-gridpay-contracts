@@ -479,3 +479,106 @@ fn test_escalation_with_disabled_stake() {
     let stake = client.get_arbitration_stake(&case_id);
     assert!(stake.is_none());
 }
+
+fn setup_staked_arbitrator<'a>(
+    env: &'a Env,
+    stake: i128,
+) -> (
+    RefundContractClient<'a>,
+    Address,
+    Address,
+    token::Client<'a>,
+) {
+    let admin = Address::generate(env);
+    let arbitrator = Address::generate(env);
+    let (stake_token_client, stake_token_admin) = create_token_contract(env, &admin);
+    stake_token_admin.mint(&arbitrator, &10_000);
+
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(env, &contract_id);
+    client.initialize(&admin);
+    client.register_arbitrator(&admin, &arbitrator);
+    client.set_arbitration_stake_config(
+        &admin,
+        &ArbitrationStakeConfig {
+            token: stake_token_client.address.clone(),
+            amount: 5000,
+            enabled: true,
+        },
+    );
+    assert_eq!(client.deposit_arbitrator_stake(&arbitrator, &stake), stake);
+
+    (client, admin, arbitrator, stake_token_client)
+}
+
+#[test]
+fn test_slash_arbitrator_stake_reduces_stake_and_pays_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, arbitrator, stake_token) = setup_staked_arbitrator(&env, 5000);
+    let customer = Address::generate(&env);
+
+    assert_eq!(client.get_arbitrator_stake(&arbitrator), 5000);
+    assert_eq!(stake_token.balance(&arbitrator), 5000);
+    assert_eq!(stake_token.balance(&client.address), 5000);
+
+    let remaining = client.slash_arbitrator_stake(&admin, &arbitrator, &2000, &customer);
+
+    assert_eq!(remaining, 3000);
+    assert_eq!(client.get_arbitrator_stake(&arbitrator), 3000);
+    assert_eq!(stake_token.balance(&customer), 2000);
+    assert_eq!(stake_token.balance(&client.address), 3000);
+    // The arbitrator's own wallet is not touched by slashing.
+    assert_eq!(stake_token.balance(&arbitrator), 5000);
+
+    // Remaining stake can be slashed to an insurance pool.
+    let insurance_pool = Address::generate(&env);
+    assert_eq!(
+        client.slash_arbitrator_stake(&admin, &arbitrator, &3000, &insurance_pool),
+        0
+    );
+    assert_eq!(stake_token.balance(&insurance_pool), 3000);
+    assert_eq!(client.get_arbitrator_stake(&arbitrator), 0);
+}
+
+#[test]
+fn test_slash_arbitrator_stake_rejects_amount_above_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, arbitrator, stake_token) = setup_staked_arbitrator(&env, 1000);
+    let customer = Address::generate(&env);
+
+    let result = client.try_slash_arbitrator_stake(&admin, &arbitrator, &1001, &customer);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::InsufficientArbitratorStake)))
+    );
+    let result = client.try_slash_arbitrator_stake(&admin, &arbitrator, &0, &customer);
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::InvalidAmount))));
+
+    assert_eq!(client.get_arbitrator_stake(&arbitrator), 1000);
+    assert_eq!(stake_token.balance(&customer), 0);
+}
+
+#[test]
+fn test_slash_arbitrator_stake_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, arbitrator, _) = setup_staked_arbitrator(&env, 1000);
+    let impostor = Address::generate(&env);
+
+    let result = client.try_slash_arbitrator_stake(&impostor, &arbitrator, &500, &impostor);
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::Unauthorized))));
+    assert_eq!(client.get_arbitrator_stake(&arbitrator), 1000);
+}
+
+#[test]
+fn test_deposit_arbitrator_stake_requires_registered_arbitrator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _arbitrator, _) = setup_staked_arbitrator(&env, 1000);
+    let outsider = Address::generate(&env);
+
+    let result = client.try_deposit_arbitrator_stake(&outsider, &100);
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::NotArbitrator))));
+}

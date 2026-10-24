@@ -1,123 +1,93 @@
+//! Cross-workspace end-to-end integration tests.
+//!
+//! This crate wires the payment, escrow, dispute, and emergency-pause
+//! contracts into a single test environment and exercises realistic flows:
+//! Payment -> Escrow -> Dispute -> Refund, plus emergency pause coverage.
+
 #![cfg(test)]
-#![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::{Address as _, Ledger},
-    Address, Bytes, BytesN, Env, String, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum AppealStatus {
-    Pending,
-    Upheld,
-    Overturned,
+/// Shared test environment registering all four contracts.
+struct E2eEnv {
+    env: Env,
+    payment: Address,
+    escrow: Address,
+    dispute: Address,
+    emergency_pause: Address,
+    admin: Address,
+    payer: Address,
+    payee: Address,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct ArbitratorStake {
-    pub arbitrator: Address,
-    pub staked_amount: i128,
-    pub slashed_amount: i128,
-}
+impl E2eEnv {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct MerchantReserve {
-    pub merchant: Address,
-    pub reserve_balance: i128,
-    pub volume_tier_score: u32,
-}
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
 
-#[contract]
-pub struct MockArbitrationAndReserveSettlement;
+        let payment = env.register_contract(None, payment::PaymentContract);
+        let escrow = env.register_contract(None, escrow::EscrowContract);
+        let dispute = env.register_contract(None, dispute::DisputeContract);
+        let emergency_pause =
+            env.register_contract(None, emergency_pause::EmergencyPauseContract);
 
-#[contractimpl]
-impl MockArbitrationAndReserveSettlement {
-    pub fn stake_arbitrator(arbitrator: Address, amount: i128) -> ArbitratorStake {
-        ArbitratorStake {
-            arbitrator,
-            staked_amount: amount,
-            slashed_amount: 0,
+        Self {
+            env,
+            payment,
+            escrow,
+            dispute,
+            emergency_pause,
+            admin,
+            payer,
+            payee,
         }
     }
-
-    pub fn slash_stake_on_overturn(
-        mut stake: ArbitratorStake,
-        slash_bps: u32,
-    ) -> (ArbitratorStake, i128) {
-        let slash = (stake.staked_amount * slash_bps as i128) / 10000;
-        stake.staked_amount -= slash;
-        stake.slashed_amount += slash;
-        (stake, slash)
-    }
-
-    pub fn deduct_merchant_reserve(
-        mut reserve: MerchantReserve,
-        deduction_amount: i128,
-    ) -> MerchantReserve {
-        assert!(reserve.reserve_balance >= deduction_amount);
-        reserve.reserve_balance -= deduction_amount;
-        reserve
-    }
-
-    pub fn restore_merchant_reserve_on_overturn(
-        mut reserve: MerchantReserve,
-        restoration_amount: i128,
-    ) -> MerchantReserve {
-        reserve.reserve_balance += restoration_amount;
-        reserve
-    }
 }
 
 #[test]
-fn test_arbitrator_stake_slashing_and_appeal_overturn_merchant_reserve_deduction() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn full_payment_escrow_dispute_refund_flow() {
+    let t = E2eEnv::new();
 
-    let arbitrator = Address::generate(&env);
-    let merchant = Address::generate(&env);
+    // 1. Payment: deposit funds from payer to payee.
+    let amount: i128 = 1_000;
+    let payment_client = payment::PaymentContractClient::new(&t.env, &t.payment);
+    payment_client.deposit(&t.payer, &t.payee, &amount);
 
-    // Initial arbitrator stake
-    let stake = MockArbitrationAndReserveSettlement::stake_arbitrator(arbitrator.clone(), 10000);
-    assert_eq!(stake.staked_amount, 10000);
+    // 2. Escrow: lock the deposited funds under an escrow agreement.
+    let escrow_client = escrow::EscrowContractClient::new(&t.env, &t.escrow);
+    let escrow_id = escrow_client.create_escrow(&t.payer, &t.payee, &amount);
+    escrow_client.fund_escrow(&escrow_id, &t.payer);
 
-    // Initial merchant reserve
-    let mut reserve = MerchantReserve {
-        merchant: merchant.clone(),
-        reserve_balance: 50000,
-        volume_tier_score: 9500,
-    };
+    // 3. Dispute: raise a dispute against the escrow.
+    let dispute_client = dispute::DisputeContractClient::new(&t.env, &t.dispute);
+    let dispute_id = dispute_client.create_dispute(&t.payer, &escrow_id);
+    dispute_client.resolve_dispute(&dispute_id, &t.admin, &true);
 
-    // Dispute initially ruled against merchant: reserve deducted
-    reserve = MockArbitrationAndReserveSettlement::deduct_merchant_reserve(reserve, 12000);
-    assert_eq!(reserve.reserve_balance, 38000);
+    // 4. Refund: execute the refund back to the payer.
+    escrow_client.refund(&escrow_id, &t.payer);
 
-    // Appeal overturned: arbitrator stake slashed by 2500 bps (25%)
-    let (slashed_stake, slashed_amount) =
-        MockArbitrationAndReserveSettlement::slash_stake_on_overturn(stake, 2500);
-    assert_eq!(slashed_stake.staked_amount, 7500);
-    assert_eq!(slashed_amount, 2500);
-
-    // Merchant reserve is restored after successful appeal overturn
-    reserve = MockArbitrationAndReserveSettlement::restore_merchant_reserve_on_overturn(reserve, 12000);
-    assert_eq!(reserve.reserve_balance, 50000);
+    let escrow_state = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(escrow_state.amount, amount);
+    assert!(escrow_state.refunded);
 }
 
 #[test]
-fn test_dynamic_batch_settlement_and_anti_wash_trading_guards() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn emergency_pause_blocks_escrow_flow() {
+    let t = E2eEnv::new();
 
-    let merchant = Address::generate(&env);
-    let customer = Address::generate(&env);
+    let pause_client =
+        emergency_pause::EmergencyPauseContractClient::new(&t.env, &t.emergency_pause);
+    pause_client.pause(&t.admin);
+    assert!(pause_client.is_paused());
 
-    // Anti-wash trading verification: transactions between same parties within rapid window
-    let window_span = 300_u64;
-    let initial_timestamp = 10000_u64;
-    let subsequent_timestamp = 10100_u64;
+    let escrow_client = escrow::EscrowContractClient::new(&t.env, &t.escrow);
+    let result = escrow_client.try_create_escrow(&t.payer, &t.payee, &500);
+    assert!(result.is_err());
 
-    let is_wash_trading = (subsequent_timestamp - initial_timestamp) < window_span && merchant == customer;
-    assert!(!is_wash_trading);
+    pause_client.unpause(&t.admin);
+    assert!(!pause_client.is_paused());
 }

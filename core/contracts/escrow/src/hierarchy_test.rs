@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, token, Address, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, token, Address, BytesN, Env};
 
 fn setup_token(env: &Env, admin: &Address, customer: &Address) -> Address {
     let token_addr = env.register_stellar_asset_contract(admin.clone());
@@ -173,4 +173,77 @@ fn test_create_child_escrow_validation() {
         res2,
         Err(Ok(Error::Escrow(EscrowError::ParentEscrowNotFound)))
     );
+}
+
+/// A parent-level liquidation must never touch the isolated ledgers of its
+/// child sub-account milestones: a completed milestone keeps its funds and can
+/// never be liquidated twice, while a pending milestone stays reserved and
+/// releasable after the parent has been settled.
+#[test]
+fn test_parent_liquidation_isolates_child_sub_accounts() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = setup_token(&env, &admin, &customer);
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(1000);
+
+    // Parent escrow of 1000, funded into the contract by the customer.
+    let parent_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64, &0_u64, &false,
+    );
+
+    // Child milestone A: completed (released) for 400.
+    let completed_id = client.create_sub_account(
+        &merchant,
+        &parent_id,
+        &BytesN::from_array(&env, &[7u8; 32]),
+        &400,
+        &None,
+    );
+    client.release_sub_account(&admin, &parent_id, &completed_id);
+
+    // Child milestone B: still pending for 300.
+    let pending_id = client.create_sub_account(
+        &merchant,
+        &parent_id,
+        &BytesN::from_array(&env, &[8u8; 32]),
+        &300,
+        &None,
+    );
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&merchant), 400);
+    assert_eq!(token_client.balance(&contract_id), 600);
+
+    // Partial parent dispute: only the parent's unallocated remainder
+    // (1000 - 400 - 300 = 300) may be liquidated, in favour of the customer.
+    client.dispute_escrow(&customer, &parent_id);
+    client.resolve_dispute(&admin, &parent_id, &false);
+
+    assert_eq!(token_client.balance(&customer), 1_000_000 - 1000 + 300);
+    assert_eq!(token_client.balance(&merchant), 400);
+    assert_eq!(token_client.balance(&contract_id), 300);
+
+    // The completed child ledger is intact after the parent liquidation.
+    let completed = client.get_sub_account(&parent_id, &completed_id).unwrap();
+    assert!(completed.released);
+    assert_eq!(completed.amount, 400);
+
+    // A completed child sub-account can never be liquidated again.
+    assert_eq!(
+        client.try_release_sub_account(&admin, &parent_id, &completed_id),
+        Err(Ok(Error::Escrow(EscrowError::SubAccountAlreadyReleased)))
+    );
+
+    // The pending child milestone stays isolated and is still releasable.
+    client.release_sub_account(&admin, &parent_id, &pending_id);
+    assert_eq!(token_client.balance(&merchant), 700);
+    assert_eq!(token_client.balance(&contract_id), 0);
 }
