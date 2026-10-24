@@ -143,6 +143,10 @@ pub enum DataKey {
     Dispute(DisputeKey),
     VoteWeight(u64, Address),
     ReleaseThresholdBps(u64),
+    /// Pending timelocked key rotation for a participant: (escrow_id, old_address) → PendingKeyRotation.
+    RotationRequest(u64, Address),
+    /// Optional social-recovery guardian registered by a participant: (escrow_id, participant) → guardian Address.
+    RecoveryGuardian(u64, Address),
 }
 
 /// Administrative, multi-sig, and protocol configuration errors for EscrowContract.
@@ -803,6 +807,37 @@ pub struct MultiPartyEscrowReleased {
     pub escrow_id: u64,
 }
 
+/// Emitted when a participant (or their recovery guardian) proposes a key rotation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyRotationProposed {
+    pub escrow_id: u64,
+    pub old_participant: Address,
+    pub new_participant: Address,
+    pub proposed_by: Address,
+    pub executable_after: u64,
+}
+
+/// Emitted when a participant or counterparty vetoes a pending key rotation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyRotationVetoed {
+    pub escrow_id: u64,
+    pub old_participant: Address,
+    pub vetoed_by: Address,
+    pub vetoed_at: u64,
+}
+
+/// Emitted when a timelocked key rotation is successfully executed.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyRotationExecuted {
+    pub escrow_id: u64,
+    pub old_participant: Address,
+    pub new_participant: Address,
+    pub executed_at: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiPartyEscrowAccepted {
@@ -1365,6 +1400,29 @@ pub struct MultiPartyEscrow {
     pub threshold_bps: u32, // cumulative approved weight needed for release
     pub created_at: u64,
     pub release_timestamp: u64,
+}
+
+/// A timelocked request to swap one participant's signing key for another.
+///
+/// Created by `propose_participant_key_rotation`. Executable by anyone once
+/// `executable_after` has passed and no veto was filed.
+#[derive(Clone)]
+#[contracttype]
+pub struct PendingKeyRotation {
+    /// Multi-party escrow this rotation belongs to.
+    pub escrow_id: u64,
+    /// The participant whose key is being rotated out.
+    pub old_address: Address,
+    /// The new address that will replace `old_address`.
+    pub new_address: Address,
+    /// The address that initiated the request (old_address or its recovery guardian).
+    pub proposed_by: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Earliest timestamp at which `execute_participant_key_rotation` may be called.
+    pub executable_after: u64,
+    /// Whether the rotation was vetoed (blocks execution).
+    pub vetoed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
