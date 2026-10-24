@@ -1135,15 +1135,13 @@ impl AdminContract {
         run_migration_target: Option<u32>,
     ) -> Result<u64, Error> {
         admin.require_auth();
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        // The stored admin, or an active UpgradeProposer scoped to this target.
+        Self::require_active_role(
+            &env,
+            &admin,
+            OperatorRole::UpgradeProposer,
+            Some(contract_address.clone()),
+        )?;
 
         // Validate wasm hash is not zero
         let zero_hash = BytesN::<32>::from_array(&env, &[0u8; 32]);

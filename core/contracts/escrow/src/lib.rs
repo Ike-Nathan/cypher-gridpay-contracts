@@ -10,7 +10,9 @@ use soroban_sdk::{
     Vec,
 };
 
+pub mod reentrancy;
 pub mod storage;
+use storage::StorageTier;
 pub mod fixed_math;
 
 #[derive(Clone)]
@@ -2176,6 +2178,8 @@ const DEFAULT_BENEFICIARY_SEASONING_SECS: u64 = 86_400;
 /// accepted only while `now < dispute_started_at + APPEAL_WINDOW_SECONDS`, so
 /// the boundary is deterministic rather than depending on `<` vs `≤` drift.
 const APPEAL_WINDOW_SECONDS: u64 = 259_200;
+/// Most ids `batch_bump_critical` accepts per call.
+pub const MAX_TTL_BUMP_BATCH: u32 = 50;
 
 /// Maximum voting weight any single participant may hold in a multi-party
 /// escrow (in basis points, out of 10,000).  Capping at 3,334 bps (≈33.34%)
@@ -2379,6 +2383,7 @@ impl EscrowContract {
         to: Address,
         amount: i128,
     ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "withdraw_escrow_fees")?;
         let multisig = Self::get_multisig_config(env.clone());
@@ -3132,6 +3137,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn execute_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "execute_clawback")?;
 
@@ -3405,6 +3411,7 @@ impl EscrowContract {
         expiry_timestamp: u64,
         auto_refund_on_expiry: bool,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
         Self::require_not_paused(&env, "create_escrow")?;
         Self::internal_create_escrow(
@@ -3452,6 +3459,7 @@ impl EscrowContract {
         auto_refund_on_expiry: bool,
         multisig: MultisigConfiguration,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
         Self::require_not_paused(&env, "create_escrow_with_multisig")?;
         Self::internal_create_escrow(
@@ -3655,6 +3663,9 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Funds are now locked: storage must outlive the escrow's deadlines.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
+
         Ok(escrow_id)
     }
 
@@ -3681,6 +3692,7 @@ impl EscrowContract {
         token: Address,
         release_timestamp: u64,
     ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
         Self::require_not_paused(&env, "create_multi_party_escrow")?;
 
@@ -3892,6 +3904,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn release_multi_party_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "release_multi_party_escrow")?;
         if !env
             .storage()
@@ -4460,6 +4473,9 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Funds are now locked: storage must outlive the escrow's deadlines.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
+
         Ok(escrow_id)
     }
 
@@ -4574,6 +4590,7 @@ impl EscrowContract {
         customer: Address,
         escrow_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
         Self::require_not_paused(&env, "cancel_multi_party_escrow")?;
 
@@ -4630,6 +4647,7 @@ impl EscrowContract {
         customer: Address,
         escrow_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         customer.require_auth();
         Self::require_not_paused(&env, "cancel_multi_token_escrow")?;
 
@@ -4762,6 +4780,7 @@ impl EscrowContract {
         escrow_id: u64,
         early_release: bool,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "release_escrow")?;
 
@@ -5011,6 +5030,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn refund_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         caller.require_auth();
         Self::require_not_paused(&env, "refund_escrow")?;
 
@@ -5097,6 +5117,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn dispute_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         caller.require_auth();
         Self::require_not_paused(&env, "dispute_escrow")?;
 
@@ -5241,7 +5262,85 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // A dispute extends the lock: keep storage alive through its grace.
+        Self::keep_escrow_alive(&env, &Self::get_escrow(&env, escrow_id));
+
         Ok(())
+    }
+
+    /// Keeper maintenance (the issue's `batch_bump_critical_escrows_and_payments`;
+    /// Soroban caps contract function names at 32 characters): extends
+    /// storage for every escrow in `ids` that
+    /// still locks funds (`Locked` or `Disputed`) so it outlives that
+    /// escrow's deadline plus its dispute grace period. Unknown and finished
+    /// escrows are skipped. Anyone may call it; it only extends TTLs.
+    ///
+    /// Returns how many escrows were critical and bumped.
+    ///
+    /// # Errors
+    /// `BatchTooLarge` for more than [`MAX_TTL_BUMP_BATCH`] ids.
+    pub fn batch_bump_critical(env: Env, ids: Vec<u64>) -> Result<u32, Error> {
+        if ids.len() > MAX_TTL_BUMP_BATCH {
+            return Err(Error::Escrow(EscrowError::BatchTooLarge));
+        }
+        let mut bumped = 0u32;
+        for escrow_id in ids.iter() {
+            if let Some(escrow) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            {
+                if Self::keep_escrow_alive(&env, &escrow) > 0 {
+                    bumped += 1;
+                }
+            }
+        }
+        Ok(bumped)
+    }
+
+    /// Storage tier of an escrow: funds-locking states are
+    /// `CriticalActiveLock`, finished ones `TerminalAuditRecord`.
+    fn escrow_storage_tier(status: &EscrowStatus) -> StorageTier {
+        match status {
+            EscrowStatus::Locked
+            | EscrowStatus::Disputed
+            | EscrowStatus::DormantNoticePeriod => StorageTier::CriticalActiveLock,
+            EscrowStatus::Released
+            | EscrowStatus::Resolved
+            | EscrowStatus::Cancelled
+            | EscrowStatus::ExpiredRefunded => StorageTier::TerminalAuditRecord,
+        }
+    }
+
+    /// Latest business deadline of an escrow: release, expiry or hold end.
+    fn escrow_deadline(escrow: &Escrow) -> u64 {
+        escrow
+            .release_timestamp
+            .max(escrow.expiry_timestamp)
+            .max(escrow.hold_period_until)
+    }
+
+    /// Time after the deadline during which the escrow can still be
+    /// disputed, escalated or appealed.
+    fn escrow_dispute_grace(escrow: &Escrow) -> u64 {
+        escrow.escalation_timeout.max(APPEAL_WINDOW_SECONDS)
+    }
+
+    /// Escrows are kept in instance storage, which shares one TTL. For a
+    /// funds-locking escrow, extend that TTL so it outlives the escrow's
+    /// deadline plus dispute grace. Returns the TTL target, or 0 for a
+    /// finished escrow (left to the normal instance bump).
+    fn keep_escrow_alive(env: &Env, escrow: &Escrow) -> u32 {
+        let tier = Self::escrow_storage_tier(&escrow.status);
+        if tier != StorageTier::CriticalActiveLock {
+            return 0;
+        }
+        storage::extend_instance_until(
+            env,
+            tier,
+            Self::escrow_deadline(escrow),
+            Self::escrow_dispute_grace(escrow),
+        )
     }
 
     /// Submits evidence.
@@ -6147,6 +6246,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn trigger_timeout_resolution(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "trigger_timeout_resolution")?;
         if !env
             .storage()
@@ -6340,6 +6440,7 @@ impl EscrowContract {
         escrow_id: u64,
         release_to_merchant: bool,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "resolve_dispute")?;
 
@@ -6500,6 +6601,7 @@ impl EscrowContract {
         liquidator: Address,
         escrow_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         liquidator.require_auth();
         Self::require_not_paused(&env, "liquidate_collateral")?;
 
@@ -7166,6 +7268,7 @@ impl EscrowContract {
         appeal_id: u64,
         in_favour_of: Address,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "resolve_appeal")?;
 
@@ -8927,6 +9030,7 @@ impl EscrowContract {
     /// * CliffPeriodNotPassed - If called before the cliff timestamp
     /// * InsufficientVestedAmount - If there's no vested amount to release
     pub fn release_vested_amount(env: Env, admin: Address, escrow_id: u64) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "release_vested_amount")?;
         if env
@@ -9204,6 +9308,7 @@ impl EscrowContract {
     /// * `MilestoneAlreadyReleased` - Milestone was already released
     /// * `MilestoneOverflow` - Release would exceed the escrow's locked amount
     pub fn release_milestone(env: Env, escrow_id: u64, milestone_id: u64) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "release_milestone")?;
         let mut vesting_schedule = env
             .storage()
@@ -9314,6 +9419,7 @@ impl EscrowContract {
         escrow_id: u64,
         milestone: VestingMilestone,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "add_milestone")?;
 
@@ -11212,6 +11318,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn approve_claim(env: Env, admin: Address, claim_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "approve_claim")?;
         let multisig = Self::get_multisig_config(env.clone());
@@ -11324,6 +11431,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn trigger_watchdog_release(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "trigger_watchdog_release")?;
         if !Self::is_watchdog_eligible(env.clone(), escrow_id) {
             return Err(Error::Action(ActionError::NotReady));
@@ -11882,6 +11990,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn evaluate_and_release(env: Env, escrow_id: u64) -> Result<bool, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "evaluate_and_release")?;
         let mut conditional: ConditionalEscrow = env
             .storage()
@@ -12733,6 +12842,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn resolve_multi_party_dispute(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "resolve_multi_party_dispute")?;
         let mut escrow: MultiPartyEscrow = env
             .storage()
@@ -13243,6 +13353,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn expire_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         Self::require_not_paused(&env, "expire_escrow")?;
         if !env
             .storage()
@@ -14580,6 +14691,7 @@ impl EscrowContract {
         escrow_id: u64,
         sub_id: u64,
     ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env).map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
         admin.require_auth();
         Self::require_not_paused(&env, "release_sub_account")?;
 
