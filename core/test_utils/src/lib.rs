@@ -1,1 +1,1 @@
-pub fn placeholder() {}
+#![no_std]

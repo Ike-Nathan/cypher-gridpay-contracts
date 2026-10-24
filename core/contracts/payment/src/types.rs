@@ -104,6 +104,14 @@ pub struct SubscriptionTrialData {
     pub period_seconds: u64,
     pub ends_at: u64,
     pub converted: bool,
+    pub locked_conversion_amount: i128,
+    pub notice_emitted_at: Option<u64>,
+    pub min_notice_lead_secs: u64,
+    pub post_trial_cancel_grace_secs: u64,
+    pub conversion_charge_amount: Option<i128>,
+    pub conversion_charged_at: Option<u64>,
+    pub post_conversion_usage_units: u64,
+    pub conversion_charge_reversed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -527,6 +535,17 @@ pub struct MerchantFeeRecord {
 pub struct FeeWaiver {
     pub merchant: Address,
     pub waiver_bps: u32, // reduction in basis points
+    /// Identifier of the promotional campaign this waiver belongs to.
+    pub campaign_id: u64,
+    /// Aggregate ceiling on fees the campaign may waive.
+    pub max_total_waived_fee: i128,
+    /// Fees waived so far under this campaign.
+    pub accumulated_waived_fee: i128,
+    /// Maximum number of waived transactions per customer address.
+    pub max_uses_per_address: u32,
+    /// Timestamp from which the waiver becomes active.
+    pub valid_from: u64,
+    /// Timestamp at which the waiver expires.
     pub valid_until: u64,
     pub reason: String,
     pub granted_by: Address,

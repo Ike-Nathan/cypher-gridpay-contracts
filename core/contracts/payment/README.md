@@ -13,6 +13,8 @@ The payment contract is the core of the Cypher GridPay platform. It handles the 
 - **Subscriptions** — fixed-interval recurring payments with dunning, trials, pause/resume, and proration
 - **Metered billing** — usage-based subscriptions billed per reported unit
 - **Payment channels** — off-chain micro-payments settled on-chain in a single transaction
+- **Streaming channels** — continuously accruing token streams bounded by start and stop timestamps
+- **Private invoice routes** — one-time commitments reveal the merchant vault only at settlement
 - **Split payments** — distribute a payment to multiple recipients by share percentage
 - **Payment forwarding** — automatically forward a portion of a payment to a third address
 - **Batch payments** — create or complete many payments in one call
@@ -39,6 +41,8 @@ The payment contract is the core of the Cypher GridPay platform. It handles the 
 | Function                                                                                     | Description                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. |
+| `create_private_payment(customer, ephemeral_invoice_commitment, amount, token, currency, expiration_duration, metadata)` | Create a payment that stores the contract address instead of the merchant vault. The commitment is SHA-256 of vault-address XDR followed by the 32-byte secret XDR. |
+| `complete_private_payment(vault, secret, payment_id)` | Require vault authorization, verify the one-time commitment, then settle through the regular fee and finality flow to the revealed vault. |
 | `complete_payment(admin, payment_id)`                                                        | Admin releases a `Pending` payment to the merchant. For amounts above the configured large-payment threshold a multi-sig proposal is auto-created instead.   |
 | `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment, marking it `Refunded` and returning any installments already collected via `pay_installment` to the customer.             |
 | `partial_refund(admin, payment_id, refund_amount)`                                           | Admin issues a partial refund on a `Completed` payment, returning only `refund_amount` to the customer.                                                      |
@@ -183,6 +187,9 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `pause_subscription(admin, subscription_id)`                                                                                        | Pause a subscription, pausing the billing clock.                                                                |
 | `resume_subscription(admin, subscription_id, proration_enabled)`                                                                    | Resume a paused subscription, optionally prorating the next billing date.                                       |
 | `extend_trial(admin, subscription_id, extension_seconds)`                                                                           | Extend the trial period of a subscription.                                                                      |
+| `emit_trial_conversion_notice(subscription_id)`                                                                                     | Merchant emits the required conversion notice during the permitted lead-time window.                             |
+| `authorize_trial_conversion_amount(customer, subscription_id, amount)`                                                             | Customer explicitly consents to a new conversion amount and invalidates any prior notice.                       |
+| `report_trial_conversion_usage(merchant, subscription_id, units)`                                                                   | Merchant records usage during the post-conversion cancellation grace period.                                     |
 | `get_subscription(subscription_id)`                                                                                                 | Retrieve the `Subscription` record.                                                                             |
 | `get_subscriptions_by_customer(customer, page)`                                                                                     | Paginated list of subscription IDs for a customer.                                                              |
 | `get_subscriptions_by_merchant(merchant, page)`                                                                                     | Paginated list of subscription IDs for a merchant.                                                              |
@@ -230,22 +237,41 @@ record as `trial_data` (`period_seconds`, `ends_at`, `converted`).
 
 **The trial-to-paid transition**
 
-- The transition is driven by `execute_recurring_payment`, which an off-chain
-  keeper / cron calls once a cycle is due. There is **no separate "convert" call**,
-  and the customer does **not** need to take any action to convert to a paid
-  subscription.
+- The merchant must call `emit_trial_conversion_notice(subscription_id)` between
+  30 days and the subscription's `min_notice_lead_secs` before `trial_data.ends_at`.
+  The minimum lead is at most 24 hours and is shortened for trials shorter than
+  48 hours. A notice cannot be emitted at the trial's creation timestamp.
+- The notice publishes the locked conversion amount in the
+  `TrialConversionNoticeEmitted` event. Extending a trial or obtaining new customer
+  consent for a changed amount invalidates the existing notice.
+- The first post-trial charge is driven by `execute_recurring_payment`, which an
+  off-chain keeper / cron calls once a cycle is due. It is rejected unless the
+  notice exists and `subscription.amount <= trial_data.locked_conversion_amount`.
+  The customer can explicitly approve a different amount during the trial using
+  `authorize_trial_conversion_amount`; a new notice is then required.
 - While `now < trial_data.ends_at`, a due `execute_recurring_payment` performs
   **no token transfer**, does **not** increment `payment_count`, advances
   `next_payment_at` by one `interval`, and returns `Ok`. Repeated due cycles
   during the trial are each skipped this way.
-- On the first `execute_recurring_payment` where `now >= trial_data.ends_at` and a
-  payment is due, the customer is charged normally (running through the usual
-  merchant-not-paused, not-expired, spend-limit and discount checks). If that
-  transfer succeeds, `trial_data.converted` is set to `true` and a
-  `TrialConverted { subscription_id, converted_at }` event is emitted. Later
-  charges behave like any recurring payment.
+- Once the notice and locked-price checks pass, the first post-trial charge runs
+  through the usual merchant-not-paused, not-expired, spend-limit and discount
+  checks. If the transfer succeeds, `trial_data.converted` is set to `true`, the
+  charge and timestamp are retained for the grace period, and a `TrialConverted`
+  event is emitted. Later charges behave like any recurring payment.
 - If the first post-trial charge fails, the subscription follows the standard
   retry / dunning path and `converted` stays `false` until a charge succeeds.
+
+**Post-conversion cancellation**
+
+- For 24 hours after the first conversion charge, a customer cancellation with
+  zero reported usage and no subsequent recurring charge attempts to transfer
+  the entire initial charge back from the merchant to the customer. A
+  `TrialConversionChargeReversed` event is emitted on success.
+- Because the first charge is paid to the merchant immediately, the merchant
+  must have approved the payment contract to pull back the charge. If the
+  merchant's balance or allowance is insufficient, cancellation fails with
+  `TransferFailed`; the contract does not record a successful cancellation or
+  refund. Reported usage during the grace period prevents the automatic reversal.
 
 **Cancelling during a trial**
 
@@ -458,6 +484,17 @@ client.cancel_subscription(&customer, &sub_id_1);
 | `close_channel_expired(caller, channel_id)`                                | Anyone can close an expired channel, refunding the deposited balance to the customer.      |
 | `get_channel(channel_id)`                                                  | Retrieve the `PaymentChannel` record.                                                      |
 
+Streaming channels use a separate record schema so existing discrete `PaymentChannel`
+records remain compatible:
+
+| Function | Description |
+| --- | --- |
+| `open_streaming_channel(customer, merchant, token, deposit, flow_rate_per_sec, start_ts, stop_ts)` | Deposit funds into a linear stream. Entitlement is `min(deposit, flow_rate_per_sec * elapsed_seconds)` within the configured interval. |
+| `get_streaming_claimable(channel_id)` | Return the currently vested, unclaimed amount. |
+| `claim_streaming_channel(merchant, channel_id)` | Transfer the newly vested amount to the merchant. |
+| `close_streaming_channel(customer, channel_id)` | Stop the stream, pay any newly vested amount, and refund the unearned deposit. |
+| `get_streaming_channel(channel_id)` | Retrieve the streaming schedule and accounting state. |
+
 ### Split Payments
 
 | Function                                                                              | Description                                                                                         |
@@ -616,7 +653,7 @@ completion — integrators do not need to do anything special when calling `comp
 | `set_tier_thresholds(admin, thresholds)`            | Set the volume thresholds for fee tier promotions.                                 |
 | `get_accumulated_fees()`                            | Return the total platform fees accumulated in the contract.                        |
 | `withdraw_fees(admin, amount)`                      | Withdraw accumulated platform fees.                                                |
-| `grant_fee_waiver(admin, merchant, config)`         | Grant a merchant a temporary or permanent fee waiver.                              |
+| `grant_fee_waiver(admin, merchant, waiver_bps, campaign_id, max_total_waived_fee, max_uses_per_address, valid_from, valid_until, reason)` | Grant a merchant a budget-capped, time-windowed fee waiver for a promotional campaign. |
 | `revoke_fee_waiver(admin, merchant)`                | Revoke a merchant's fee waiver.                                                    |
 | `get_fee_waiver(merchant)`                          | Return a merchant's `FeeWaiver` record if one exists.                              |
 | `get_effective_fee_bps(merchant)`                   | Return the effective fee in basis points for a merchant after applying any waiver. |
@@ -988,6 +1025,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `FeeWaiverGranted`     | `FeeWaiverGranted`     | `merchant`, `waiver_bps`, `valid_until`                             | `grant_fee_waiver()` creates waiver record                    |
 | `FeeWaiverRevoked`     | `FeeWaiverRevoked`     | `merchant`, `revoked_by`                                            | `revoke_fee_waiver()` removes waiver                          |
 | `FeeWaiverExpired`     | `FeeWaiverExpired`     | `merchant`                                                          | Fee waiver validity period expires                            |
+| `FeeWaiverApplied`     | `FeeWaiverApplied`     | `payment_id`, `campaign_id`, `waived_amount`, `remaining_budget`    | `complete_payment()` applies a campaign fee waiver            |
 | `FeeConfigUpdated`     | `FeeConfigUpdated`     | `fee_bps`, `treasury`                                               | `set_fee_config()` updates fee structure                      |
 | `RiskFeeApplied`       | `RiskFeeApplied`       | `payment_id`, `base_fee_bps`, `risk_surcharge_bps`, `total_fee_bps` | `create_payment()` applies dynamic risk surcharge             |
 
