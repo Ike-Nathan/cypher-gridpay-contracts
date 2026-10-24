@@ -13,6 +13,8 @@ The payment contract is the core of the Cypher GridPay platform. It handles the 
 - **Subscriptions** — fixed-interval recurring payments with dunning, trials, pause/resume, and proration
 - **Metered billing** — usage-based subscriptions billed per reported unit
 - **Payment channels** — off-chain micro-payments settled on-chain in a single transaction
+- **Streaming channels** — continuously accruing token streams bounded by start and stop timestamps
+- **Private invoice routes** — one-time commitments reveal the merchant vault only at settlement
 - **Split payments** — distribute a payment to multiple recipients by share percentage
 - **Payment forwarding** — automatically forward a portion of a payment to a third address
 - **Batch payments** — create or complete many payments in one call
@@ -39,6 +41,8 @@ The payment contract is the core of the Cypher GridPay platform. It handles the 
 | Function                                                                                     | Description                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. |
+| `create_private_payment(customer, ephemeral_invoice_commitment, amount, token, currency, expiration_duration, metadata)` | Create a payment that stores the contract address instead of the merchant vault. The commitment is SHA-256 of vault-address XDR followed by the 32-byte secret XDR. |
+| `complete_private_payment(vault, secret, payment_id)` | Require vault authorization, verify the one-time commitment, then settle through the regular fee and finality flow to the revealed vault. |
 | `complete_payment(admin, payment_id)`                                                        | Admin releases a `Pending` payment to the merchant. For amounts above the configured large-payment threshold a multi-sig proposal is auto-created instead.   |
 | `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment, marking it `Refunded` and returning any installments already collected via `pay_installment` to the customer.             |
 | `partial_refund(admin, payment_id, refund_amount)`                                           | Admin issues a partial refund on a `Completed` payment, returning only `refund_amount` to the customer.                                                      |
@@ -479,6 +483,17 @@ client.cancel_subscription(&customer, &sub_id_1);
 | `settle_channel(caller, channel_id, merchant_amount, nonce, signature)`    | Merchant submits the final signed balance proof to settle the channel on-chain.            |
 | `close_channel_expired(caller, channel_id)`                                | Anyone can close an expired channel, refunding the deposited balance to the customer.      |
 | `get_channel(channel_id)`                                                  | Retrieve the `PaymentChannel` record.                                                      |
+
+Streaming channels use a separate record schema so existing discrete `PaymentChannel`
+records remain compatible:
+
+| Function | Description |
+| --- | --- |
+| `open_streaming_channel(customer, merchant, token, deposit, flow_rate_per_sec, start_ts, stop_ts)` | Deposit funds into a linear stream. Entitlement is `min(deposit, flow_rate_per_sec * elapsed_seconds)` within the configured interval. |
+| `get_streaming_claimable(channel_id)` | Return the currently vested, unclaimed amount. |
+| `claim_streaming_channel(merchant, channel_id)` | Transfer the newly vested amount to the merchant. |
+| `close_streaming_channel(customer, channel_id)` | Stop the stream, pay any newly vested amount, and refund the unearned deposit. |
+| `get_streaming_channel(channel_id)` | Retrieve the streaming schedule and accounting state. |
 
 ### Split Payments
 
